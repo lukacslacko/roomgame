@@ -146,10 +146,24 @@ class VoxelRoom:
     # overlap with the existing surface but a large median nearest-neighbour
     # distance, the frame's pose has drifted and we reject it.
 
-    DRIFT_MATCH_RADIUS_M = 0.20      # max search radius for "near existing"
+    # Tight kd-tree match radius. With a wider radius (e.g. 20 cm) every
+    # point finds *some* match in the grid, even when the actual nearest
+    # surface is a ghost wall, and ICP-SVD ends up "aligning" to noise.
+    # Keeping it tight means only points with a clean correspondence
+    # contribute to the rigid-transform estimate — when there's drift
+    # inside this radius, ICP fixes it; when there isn't, no spurious
+    # rotation gets cooked up.
+    DRIFT_MATCH_RADIUS_M = 0.05
     DRIFT_MIN_MATCH_FRACTION = 0.30  # need this much overlap to correct/check
+    DRIFT_MIN_MATCHES_FOR_ICP = 500  # min correspondences for stable SVD
     DRIFT_REJECT_DIST_M = 0.10       # median displacement that's beyond ICP
     DRIFT_MIN_VOXELS_FOR_CHECK = 1500  # grid needs to be populated enough
+    # ICP gets to nudge per frame, not relocate. ARCore's gradual drift is
+    # bounded by a few cm and a fraction of a degree per frame; anything
+    # the SVD proposes outside these caps is much more likely a noisy
+    # estimate from bad correspondences than a real correction.
+    ICP_MAX_TRANSLATION_M = 0.05
+    ICP_MAX_ROTATION_DEG = 2.0
     # Pose-jump rejection: ARCore re-localisations cause the camera to
     # teleport between consecutive frames. At streaming cadence (≈5–15 fps)
     # honest motion is bounded by walking pace; anything past 30 cm in a
@@ -188,13 +202,17 @@ class VoxelRoom:
         self._kdtree_built_at_voxels = n
 
     def _check_drift(self, world_points: np.ndarray) -> dict | None:
-        """Return None if no judgement (tree empty / no overlap), otherwise
-        median nearest-neighbour distance + overlap fraction + the median
-        displacement vector (so callers can apply it as a translation
-        correction). Distance is the magnitude of the per-point vector;
-        the median vector itself isn't necessarily of magnitude
-        median_dist (medians don't commute), but it's the right ICP-step-1
-        translation."""
+        """Run a single Procrustes-ICP iteration of new world-points against
+        the existing voxel-centre kd-tree. Returns None if the tree is empty
+        or there's not enough overlap to estimate a rigid transform; otherwise
+        the rigid (R, t) plus diagnostic stats. Caller decides whether to
+        apply the transform based on overlap and residual.
+
+        Algorithm: Kabsch / Umeyama. For matched pairs (src_i, dst_i),
+            R = V · U^T  (with reflection fix from det)
+            t = centroid_dst − R · centroid_src
+        minimises Σ‖R·src_i + t − dst_i‖² in closed form.
+        """
         tree = self._kdtree
         if tree is None or world_points.size == 0:
             return None
@@ -202,17 +220,42 @@ class VoxelRoom:
                                  distance_upper_bound=self.DRIFT_MATCH_RADIUS_M)
         finite = np.isfinite(dists)
         n_match = int(finite.sum())
-        if n_match == 0:
+        if n_match < self.DRIFT_MIN_MATCHES_FOR_ICP:
+            # Below this the SVD-rotation estimate is too noisy.
             return None
-        # Per-point displacement: existing voxel centre minus new point.
-        matched_centers = tree.data[idxs[finite]]            # (n_match, 3)
-        displacements = matched_centers - world_points[finite]
-        median_disp = np.median(displacements, axis=0).astype(np.float32)
+
+        src = world_points[finite].astype(np.float64)
+        dst = tree.data[idxs[finite]].astype(np.float64)
+        median_dist_before = float(np.median(np.linalg.norm(src - dst, axis=1)))
+
+        centroid_src = src.mean(axis=0)
+        centroid_dst = dst.mean(axis=0)
+        H = (src - centroid_src).T @ (dst - centroid_dst)
+        U, _S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            # Pure-reflection solution; flip the smallest-singular-value
+            # axis to land back in SO(3).
+            Vt[-1] *= -1
+            R = Vt.T @ U.T
+        t = centroid_dst - R @ centroid_src
+
+        # Residual after applying the transform (how well does ICP align?).
+        src_transformed = src @ R.T + t
+        median_dist_after = float(np.median(np.linalg.norm(src_transformed - dst, axis=1)))
+
+        # Rotation magnitude in degrees, for diagnostics.
+        cos_angle = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
+        rot_deg = float(np.degrees(np.arccos(cos_angle)))
+
         return {
-            "median_dist": float(np.median(dists[finite])),
+            "R": R.astype(np.float32),
+            "t": t.astype(np.float32),
+            "median_dist": median_dist_before,
+            "median_dist_after": median_dist_after,
+            "rot_deg": rot_deg,
             "match_fraction": float(n_match / world_points.shape[0]),
             "matches": n_match,
-            "median_disp": median_disp,
         }
 
     def ingest_frame(self, frame: dict[str, Any]) -> tuple[int, dict | None]:
@@ -251,31 +294,47 @@ class VoxelRoom:
             self._maybe_rebuild_kdtree()
             check = self._check_drift(points)
 
-            # ICP-step-1 translation correction. When the new frame
-            # substantially overlaps existing scan content but its points
-            # are systematically offset, snap the WHOLE frame by the
-            # median displacement before integrating. This is what keeps
-            # gradual ARCore drift from accumulating into ghost walls:
-            # each frame anchors itself to the existing surface instead
-            # of trusting ARCore's drifting world frame absolutely.
+            # Procrustes ICP correction (rotation + translation). When the
+            # new frame substantially overlaps existing scan content but
+            # its points are systematically offset OR rotated, snap the
+            # WHOLE frame to the existing surface before integrating. This
+            # is what keeps gradual ARCore drift — translation AND
+            # orientation — from accumulating into the fan-of-sheets that
+            # builds up otherwise: each frame anchors itself to the
+            # existing surface instead of trusting ARCore's drifting world
+            # frame absolutely.
             #
             # Only correct when (a) we have enough overlap to trust the
-            # measurement and (b) the residual is in ICP's reach (≤ 10 cm).
-            # Larger residuals indicate something worse than gradual drift
-            # — reject those.
+            # measurement and (b) the residual is in single-iteration
+            # ICP's reach (≤ 10 cm). Larger residuals indicate something
+            # worse than gradual drift — reject those.
             if (check is not None
                 and check["match_fraction"] >= self.DRIFT_MIN_MATCH_FRACTION):
                 if check["median_dist"] >= self.DRIFT_REJECT_DIST_M:
                     self._frames_rejected_drift += 1
                     self._frames_ingested += 1
                     return -1, check
-                # Apply correction. Only the points (and our local cam
-                # copy, for diagnostic completeness) get shifted; the
-                # raw_cam used as next-frame's jump-anchor is left alone.
-                disp = check["median_disp"]
-                if np.linalg.norm(disp) > 1e-4:  # don't bother for sub-mm
-                    points = (points + disp).astype(np.float32)
-                    self._frames_corrected += 1
+                # Apply rigid transform. Sanity caps: anything outside
+                # ARCore's plausible per-frame drift (a few cm + a
+                # fraction of a degree) is almost certainly the SVD
+                # fitting to bad correspondences, not real drift. Drop
+                # the correction in that case rather than baking in a
+                # large spurious motion. Pose-jump rejection earlier
+                # already handles the "honest, big" case.
+                R = check["R"]
+                t = check["t"]
+                t_mag = float((t * t).sum() ** 0.5)
+                rot_deg = check["rot_deg"]
+                if (t_mag > self.ICP_MAX_TRANSLATION_M
+                    or rot_deg > self.ICP_MAX_ROTATION_DEG):
+                    check["correction_applied"] = False
+                else:
+                    if rot_deg > 0.05 or t_mag > 0.0005:
+                        points = (points @ R.T + t).astype(np.float32)
+                        self._frames_corrected += 1
+                        check["correction_applied"] = True
+                    else:
+                        check["correction_applied"] = False
 
         n = self.insert_points(points, colors)
         with self._lock:

@@ -467,13 +467,22 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     drift_tag = ""
                     if drift is not None and "median_dist" in drift:
-                        disp = drift.get("median_disp")
-                        applied = (disp is not None
-                                   and drift["match_fraction"] >= voxel_room.DRIFT_MIN_MATCH_FRACTION)
-                        drift_tag = f" drift={drift['median_dist']*100:.1f}cm@{drift['match_fraction']*100:.0f}%"
-                        if applied:
-                            disp_norm = float((disp * disp).sum() ** 0.5)
-                            drift_tag += f" corr={disp_norm*100:.1f}cm"
+                        drift_tag = (
+                            f" drift={drift['median_dist']*100:.1f}cm@{drift['match_fraction']*100:.0f}%"
+                        )
+                        if drift.get("correction_applied"):
+                            t_mag = float((drift['t'] * drift['t']).sum() ** 0.5)
+                            drift_tag += (
+                                f" corr=t{t_mag*100:.1f}cm/r{drift['rot_deg']:.2f}°"
+                                f" → {drift['median_dist_after']*100:.1f}cm"
+                            )
+                        elif drift["match_fraction"] >= voxel_room.DRIFT_MIN_MATCH_FRACTION:
+                            # Correction was proposed but capped as too large
+                            # — likely bad correspondences, not real drift.
+                            t_mag = float((drift['t'] * drift['t']).sum() ** 0.5)
+                            drift_tag += (
+                                f" corr-skipped(t{t_mag*100:.1f}cm/r{drift['rot_deg']:.2f}°)"
+                            )
                     ingest_summary = f" → wrote {n_written}pts{drift_tag}, total={stats['voxels']}vox in {stats['chunks']}ch"
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
