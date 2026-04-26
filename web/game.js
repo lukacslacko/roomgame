@@ -5,6 +5,7 @@
 //
 //   W / A / S / D     forward / strafe-left / back / strafe-right (planar)
 //   Space / Shift     world up / world down
+//   Arrow keys        yaw / pitch (alternative to mouse drag)
 //   Click + drag      look around (yaw + pitch)
 //   Mouse wheel       dolly along the camera's forward direction
 //   Hold Shift+W etc  ~3× speed
@@ -200,6 +201,7 @@ renderer.domElement.addEventListener("wheel", (e) => {
 
 const BASE_SPEED_M_PER_S = 1.6;   // a comfortable walking pace
 const SPRINT_MULT = 3.0;
+const LOOK_RATE_RAD_PER_S = Math.PI / 2;  // arrow-key look = 90°/s
 let lastTime = performance.now();
 
 const _fwdHorizontal = new THREE.Vector3();
@@ -207,6 +209,14 @@ const _rightHorizontal = new THREE.Vector3();
 const _move = new THREE.Vector3();
 
 function updateCamera(dtSec) {
+  // Arrow-key look: yaw left/right, pitch up/down.
+  if (keys.has("ArrowLeft"))  yaw   += LOOK_RATE_RAD_PER_S * dtSec;
+  if (keys.has("ArrowRight")) yaw   -= LOOK_RATE_RAD_PER_S * dtSec;
+  if (keys.has("ArrowUp"))    pitch += LOOK_RATE_RAD_PER_S * dtSec;
+  if (keys.has("ArrowDown"))  pitch -= LOOK_RATE_RAD_PER_S * dtSec;
+  if (pitch >  PITCH_LIMIT) pitch =  PITCH_LIMIT;
+  if (pitch < -PITCH_LIMIT) pitch = -PITCH_LIMIT;
+
   // Apply yaw + pitch as Euler (YXZ), then read off the planar basis.
   camera.rotation.set(pitch, yaw, 0, "YXZ");
 
@@ -217,11 +227,11 @@ function updateCamera(dtSec) {
   _rightHorizontal.set(Math.cos(yaw), 0, -Math.sin(yaw));
 
   _move.set(0, 0, 0);
-  if (keys.has("KeyW") || keys.has("ArrowUp"))    _move.add(_fwdHorizontal);
-  if (keys.has("KeyS") || keys.has("ArrowDown"))  _move.sub(_fwdHorizontal);
-  if (keys.has("KeyD") || keys.has("ArrowRight")) _move.add(_rightHorizontal);
-  if (keys.has("KeyA") || keys.has("ArrowLeft"))  _move.sub(_rightHorizontal);
-  if (keys.has("Space"))                           _move.y += 1;
+  if (keys.has("KeyW")) _move.add(_fwdHorizontal);
+  if (keys.has("KeyS")) _move.sub(_fwdHorizontal);
+  if (keys.has("KeyD")) _move.add(_rightHorizontal);
+  if (keys.has("KeyA")) _move.sub(_rightHorizontal);
+  if (keys.has("Space")) _move.y += 1;
   if (keys.has("ShiftLeft") || keys.has("ShiftRight")) _move.y -= 1;
 
   if (_move.lengthSq() > 0) {
