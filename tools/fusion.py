@@ -62,7 +62,8 @@ def frame_to_world_points(
     frame: dict[str, Any],
     *,
     near_m: float = 0.05,
-    far_m: float = 6.0,
+    far_m: float = 4.0,
+    floor_y_m: float = -0.3,
     stride: int = 1,
     with_colors: bool = False,
 ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -136,8 +137,17 @@ def frame_to_world_points(
     t = -depth / near_z_safe  # scale factor (broadcasts H×W against H×W)
 
     view_pts = view3 * t[..., None]  # (H, W, 3)
-    # Mask: drop unobserved (depth==0) and out-of-range pixels.
-    mask = (depth > near_m) & (depth < far_m) & np.isfinite(depth)
+    # Mask: drop unobserved (depth==0), out-of-range pixels, and — crucially —
+    # buffer pixels that don't correspond to any visible view ray. The
+    # `normDepthBufferFromNormView` matrix maps view coords [0,1]² to a
+    # sub-rectangle of the depth buffer; the strip outside that sub-rectangle
+    # has Uv/Vv outside [0,1] and unprojecting those produces ghost points at
+    # huge view angles (~17% of the buffer on a real Pixel scan).
+    mask = (
+        (depth > near_m) & (depth < far_m) & np.isfinite(depth)
+        & (Uv >= 0.0) & (Uv <= 1.0)
+        & (Vv >= 0.0) & (Vv <= 1.0)
+    )
     view_pts_kept = view_pts[mask]  # (N, 3)
 
     # Lift to homogeneous, transform to world.
@@ -148,30 +158,36 @@ def frame_to_world_points(
     # Camera origin in world space = V @ (0, 0, 0, 1).
     cam_origin = V[:3, 3].astype(np.float32)
 
+    # Snapshot the per-point view coords so we can keep them aligned with
+    # `world` through the floor filter (used below for colour sampling).
+    Uv_kept = Uv[mask]
+    Vv_kept = Vv[mask]
+
+    # Drop world points below `floor_y_m`. ARCore can return implausibly
+    # large depth values (5–6 m) at extreme view angles which then project
+    # well below the actual floor. The local-floor reference space puts y=0
+    # at the floor, so a small negative tolerance handles depth noise.
+    keep = world[:, 1] >= floor_y_m
+    world = world[keep]
+    Uv_kept = Uv_kept[keep]
+    Vv_kept = Vv_kept[keep]
+
     if not with_colors:
         return world, cam_origin
 
-    # Sample the colour image at the same (Uv, Vv) normalised view coords as
-    # the surviving depth pixels. The colour image (RGBA8 from scan.js) was
-    # rendered into normalised view-space directly (fullscreen quad of the
-    # camera texture), so output pixel (i_c, j_c) at sub-pixel center
-    # ((i_c+0.5)/W_c, (j_c+0.5)/H_c) corresponds to the same view coord.
+    # Sample colour at the same normalised view coords as the surviving
+    # points. scan.js renders the camera texture into a fullscreen quad in
+    # view space, so output pixel (i, j) at center ((i+0.5)/W, (j+0.5)/H)
+    # corresponds to the matching view coord directly.
     color_payload = frame.get("color")
     cw = int(frame.get("color_width") or 0)
     ch = int(frame.get("color_height") or 0)
     if color_payload is None or cw <= 0 or ch <= 0:
-        # No colour available — fall back to neutral grey so downstream code
-        # doesn't have to special-case missing colour.
         rgb = np.full((world.shape[0], 3), 128, dtype=np.uint8)
         return world, cam_origin, rgb
 
     color_img = np.frombuffer(color_payload, dtype=np.uint8).reshape(ch, cw, 4)
-    Uv_kept = Uv[mask]  # (N,) — already in [0, 1]
-    Vv_kept = Vv[mask]
-    # Pixel-centre indexing: floor(coord * size) clamped to valid range.
     cx = np.clip(np.floor(Uv_kept * cw).astype(np.int32), 0, cw - 1)
-    # GL framebuffer Y origin is bottom-left; readPixels gives row 0 = bottom.
-    # Our normalised view convention also has v=0 at bottom. So no Y flip.
     cy = np.clip(np.floor(Vv_kept * ch).astype(np.int32), 0, ch - 1)
-    rgb = color_img[cy, cx, :3].copy()  # drop alpha
+    rgb = color_img[cy, cx, :3].copy()
     return world, cam_origin, rgb
