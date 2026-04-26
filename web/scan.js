@@ -303,9 +303,11 @@ function captureCameraRGBA(view, width, height) {
 //   ... etc.
 //   d ≥ overlayMaxM  → black (clamped, treated as "far")
 //   pixel outside buffer → fully transparent
-const OVERLAY_W = 120;        // canvas pixel grid; 120×210 ≈ 25k pixels, fast.
-const OVERLAY_H = 210;
-const OVERLAY_MAX_M = 8.0;
+const OVERLAY_W = 80;          // canvas pixel grid; 80×140 ≈ 11k pixels.
+const OVERLAY_H = 140;         // smaller after a tap-induced Aw-Snap, in case
+const OVERLAY_MAX_M = 8.0;     // the per-frame JS work was the trigger.
+const OVERLAY_RENDER_EVERY = 3; // throttle to every Nth XR frame.
+let overlayFrameTick = 0;
 function renderDepthOverlay(depthInfo) {
   const W = depthInfo.width;
   const H = depthInfo.height;
@@ -358,13 +360,14 @@ function renderDepthOverlay(depthInfo) {
         continue;
       }
 
-      // The matrix's v_d uses Y-up (origin bottom-left, per W3C spec) but
-      // the underlying array is stored row-0-at-top (the conventional image
-      // layout), so we flip the row index when sampling. This is the only
-      // way the user's empirical "left-right correct, up-down inverted"
-      // observation hangs together: u stays direct, v gets flipped.
-      const bx = Math.min(W - 1, Math.max(0, Math.floor(u_d * W)));
-      const by = Math.min(H - 1, Math.max(0, Math.floor((1.0 - v_d) * H)));
+      // Empirical orientation of Chrome's buffer storage: column index goes
+      // RIGHT-to-LEFT relative to the matrix's u_d direction (so we flip
+      // bx), and row index follows v_d directly (no flip on by). The
+      // matrix has u_d ↔ v_v and v_d ↔ u_v (90° rotation block), so the
+      // bx flip corrects the *vertical* view axis that was inverted, and
+      // leaving by alone keeps the horizontal axis correct.
+      const bx = Math.min(W - 1, Math.max(0, Math.floor((1.0 - u_d) * W)));
+      const by = Math.min(H - 1, Math.max(0, Math.floor(v_d * H)));
       const d = u16[by * W + bx] * r2m;
 
       let r, g, b, a;
@@ -414,7 +417,10 @@ function onXRFrame(time, frame, formatCode, bytesPerPixel) {
 
   hudDepth.textContent = `${depthInfo.width}×${depthInfo.height}`;
 
-  if (depthOverlayVisible) renderDepthOverlay(depthInfo);
+  if (depthOverlayVisible) {
+    overlayFrameTick = (overlayFrameTick + 1) % OVERLAY_RENDER_EVERY;
+    if (overlayFrameTick === 0) renderDepthOverlay(depthInfo);
+  }
 
   if (!depthBufferLogged) {
     depthBufferLogged = true;

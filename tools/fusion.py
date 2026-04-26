@@ -100,13 +100,13 @@ def frame_to_world_points(
         height, width = depth.shape
 
     # Pixel grid → normalized depth-buffer coords (pixel centres).
-    # The W3C Depth Sensing spec puts buffer (0,0) at the bottom-left (Y up),
-    # but Chrome's actual array storage is row-0-at-top. So row index `j` of
-    # the array sits at v_buffer = 1 − (j+0.5)/H, not (j+0.5)/H.
-    # Confirmed empirically: with the naive (j+0.5)/H mapping the live
-    # depth-overlay's vertical axis was inverted relative to the camera image.
-    js = 1.0 - (np.arange(height, dtype=np.float64) + 0.5) / height
-    is_ = (np.arange(width, dtype=np.float64) + 0.5) / width
+    # Chrome's array storage has its column direction flipped relative to
+    # the matrix's u_d, so we flip the column index. (Row index follows
+    # v_d directly.) The matrix has u_d ↔ v_v and v_d ↔ u_v (90° rotation
+    # block), so flipping the column corrects the world *vertical* axis
+    # that was otherwise sending all the points into the basement.
+    js = (np.arange(height, dtype=np.float64) + 0.5) / height
+    is_ = 1.0 - (np.arange(width, dtype=np.float64) + 0.5) / width
     Ud, Vd = np.meshgrid(is_, js, indexing="xy")  # both shape (H, W)
 
     # Map [0,1]² → normalized view coords [0,1]² via inverse of B.
