@@ -16,6 +16,10 @@
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { SSAOPass } from "three/addons/postprocessing/SSAOPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 
 const stage = document.getElementById("stage");
 const reloadBtn = document.getElementById("reloadBtn");
@@ -32,19 +36,55 @@ const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 200);
 camera.rotation.order = "YXZ";   // yaw then pitch — keeps "world up" stable
 camera.position.set(0, 1.6, 2);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: false }); // SSAO supplies the AA-feel
 renderer.setPixelRatio(window.devicePixelRatio);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.appendChild(renderer.domElement);
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-const sun = new THREE.DirectionalLight(0xffffff, 1.0);
-sun.position.set(3, 5, 4);
+// A slightly off-white ambient + warm directional + cool hemisphere; keeps
+// the room readable without being either a sunny outdoor scene or a flat
+// matte. Sun casts soft shadows so geometry crevices get visible darkening.
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const sun = new THREE.DirectionalLight(0xfff1d6, 1.4);
+sun.position.set(2.5, 4.0, 2.0);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 0.1;
+sun.shadow.camera.far = 30;
+sun.shadow.camera.left = -6;
+sun.shadow.camera.right = 6;
+sun.shadow.camera.top = 6;
+sun.shadow.camera.bottom = -6;
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.01;
 scene.add(sun);
-scene.add(new THREE.HemisphereLight(0xb8d6ff, 0x202020, 0.4));
+scene.add(new THREE.HemisphereLight(0xc6d8ff, 0x202028, 0.4));
 
 const grid = new THREE.GridHelper(10, 20, 0x444466, 0x222234);
 scene.add(grid);
 scene.add(new THREE.AxesHelper(0.5));
+
+// Post-processing chain: render scene → SSAO darkens contact areas
+// (under furniture, in corners) → output pass tonemaps + sRGB-encodes.
+// MSAA on the composer's internal render targets so polygon edges still
+// look clean even though the renderer's own antialias is off.
+const composer = new EffectComposer(renderer);
+composer.renderTarget1.samples = 4;
+composer.renderTarget2.samples = 4;
+const renderPass = new RenderPass(scene, camera);
+composer.addPass(renderPass);
+
+const ssao = new SSAOPass(scene, camera, 0, 0);     // size set via onResize
+ssao.kernelRadius = 0.12;                            // ~12 cm; matches indoor scale
+ssao.minDistance = 0.0008;
+ssao.maxDistance = 0.08;
+composer.addPass(ssao);
+
+composer.addPass(new OutputPass());
 
 const loader = new GLTFLoader();
 let currentMesh = null;
@@ -80,14 +120,28 @@ async function loadMesh(forceRemesh) {
     currentMesh = gltf.scene;
     currentMesh.traverse((o) => {
       if (o.isMesh) {
-        const hasVertexColors = !!o.geometry?.attributes?.color;
+        // Marching-cubes output from skimage doesn't carry vertex normals,
+        // and trimesh's GLB writer doesn't always include them. Shading
+        // requires them, so compute on load if missing.
+        if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+
+        const colorAttr = o.geometry?.attributes?.color;
+        const hasVertexColors = !!colorAttr;
+        if (hasVertexColors && colorAttr.colorSpace !== THREE.SRGBColorSpace) {
+          // Camera bytes are sRGB; tell three.js to convert to linear when
+          // shading. Without this the colours look washed out under ACES.
+          colorAttr.colorSpace = THREE.SRGBColorSpace;
+        }
+
         o.material = new THREE.MeshStandardMaterial({
           color: hasVertexColors ? 0xffffff : 0xc0c8d8,
           vertexColors: hasVertexColors,
           metalness: 0.0,
-          roughness: 0.85,
+          roughness: 0.9,
           side: THREE.DoubleSide,
         });
+        o.castShadow = true;
+        o.receiveShadow = true;
       }
     });
     scene.add(currentMesh);
@@ -129,6 +183,8 @@ function onResize() {
   const w = stage.clientWidth || 1;
   const h = stage.clientHeight || 1;
   renderer.setSize(w, h, false);
+  composer.setSize(w, h);
+  ssao.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }
@@ -251,5 +307,5 @@ renderer.setAnimationLoop((time) => {
   const dtSec = Math.min(0.1, (now - lastTime) / 1000);
   lastTime = now;
   updateCamera(dtSec);
-  renderer.render(scene, camera);
+  composer.render();
 });

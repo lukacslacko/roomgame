@@ -532,8 +532,8 @@ def main() -> None:
                     help="port to listen on (default: 8080 for HTTP, 8443 for HTTPS)")
     ap.add_argument("--cert-dir", default=str(DEFAULT_CERT_DIR),
                     help="where to store the generated cert/key (HTTPS only)")
-    ap.add_argument("--voxel-size", type=float, default=0.03,
-                    help="voxel edge length in metres (default: 0.03 = 3 cm)")
+    ap.add_argument("--voxel-size", type=float, default=0.02,
+                    help="voxel edge length in metres (default: 0.02 = 2 cm)")
     args = ap.parse_args()
     port = args.port if args.port is not None else (8443 if args.https else 8080)
     cert_dir = Path(args.cert_dir).expanduser()

@@ -52,7 +52,7 @@ def is_available() -> bool:
 class VoxelRoom:
     """Chunked sparse RGB+hits grid."""
 
-    def __init__(self, voxel_size_m: float = 0.03) -> None:
+    def __init__(self, voxel_size_m: float = 0.02) -> None:
         self.voxel_size = float(voxel_size_m)
         self.chunks: dict[tuple[int, int, int], np.ndarray] = {}
         self._lock = Lock()

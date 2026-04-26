@@ -466,15 +466,25 @@ async function captureAndSend(view, depthInfo, formatCode, bytesPerPixel) {
   }
 }
 
+// Camera image is rendered at this multiple of the depth buffer's
+// resolution (per axis). 2× = 4× as many colour pixels per depth pixel,
+// which gives noticeably sharper-feeling per-voxel colours since
+// neighbouring voxels can sample distinctly different colour pixels.
+// Bigger payload (~230 KB at 2×) but still trivial on Wi-Fi.
+const COLOR_OVERSAMPLE = 2;
+
 async function captureAndSendInner(view, depthInfo, formatCode, bytesPerPixel) {
   const w = depthInfo.width;
   const h = depthInfo.height;
   const depthBytes = w * h * bytesPerPixel;
 
-  // Capture colour at depth resolution. If camera-access isn't usable,
-  // colorPixels is null and we send a NONE-format colour record.
-  const colorPixels = captureCameraRGBA(view, w, h);
-  const colorBytes = colorPixels ? w * h * 4 : 0;
+  // Capture colour at COLOR_OVERSAMPLE × the depth resolution. If
+  // camera-access isn't usable, colorPixels is null and we send a
+  // NONE-format colour record.
+  const cw = w * COLOR_OVERSAMPLE;
+  const ch = h * COLOR_OVERSAMPLE;
+  const colorPixels = captureCameraRGBA(view, cw, ch);
+  const colorBytes = colorPixels ? cw * ch * 4 : 0;
   const colorFormat = colorPixels ? COLOR_RGBA8 : COLOR_NONE;
   const total = FRAME_HEADER_SIZE + depthBytes + colorBytes;
 
@@ -490,8 +500,8 @@ async function captureAndSendInner(view, depthInfo, formatCode, bytesPerPixel) {
   dv.setUint32(off, h, true); off += 4;                                  // depth_height
   dv.setFloat32(off, depthInfo.rawValueToMeters, true); off += 4;         // rawValueToMeters
   dv.setUint32(off, formatCode, true); off += 4;                          // depth_format
-  dv.setUint32(off, colorPixels ? w : 0, true); off += 4;                 // color_width
-  dv.setUint32(off, colorPixels ? h : 0, true); off += 4;                 // color_height
+  dv.setUint32(off, colorPixels ? cw : 0, true); off += 4;                // color_width
+  dv.setUint32(off, colorPixels ? ch : 0, true); off += 4;                // color_height
   dv.setUint32(off, colorFormat, true); off += 4;                         // color_format
   dv.setUint32(off, colorBytes, true); off += 4;                          // color_byte_length
   if (off !== FRAME_HEADER_SIZE) {
