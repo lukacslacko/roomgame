@@ -156,10 +156,10 @@ def project_to_image_px(world_pts: np.ndarray, V: np.ndarray, P: np.ndarray,
 
 
 def render_cube_in_frame(frame: dict, cube_flat_idx: int, grid: cubes_mod.CubeGrid,
-                        cell_size: int) -> Image.Image | None:
+                        cell_w: int, cell_h: int) -> Image.Image | None:
     """Crop the colour image of `frame` around the projected cube and draw
-    its 12 edges + 8 corners. Returns a PIL RGB Image of (cell_size, cell_size),
-    or None if the frame can't be rendered (no colour, corners behind camera)."""
+    its 12 edges + 8 corners. Returns a PIL RGB Image of (cell_w, cell_h),
+    or None if the frame can't be rendered."""
     color_payload = frame["color"]
     cw = int(frame["color_width"])
     ch = int(frame["color_height"])
@@ -182,48 +182,79 @@ def render_cube_in_frame(frame: dict, cube_flat_idx: int, grid: cubes_mod.CubeGr
     max_x, max_y = np.max(px, axis=0)
     bw = max_x - min_x
     bh = max_y - min_y
-    pad = max(8.0, 0.3 * max(bw, bh))
+    # Generous padding so we get plenty of context around the cube — the
+    # raw camera image is only 320×180 so we want most of the cell area to
+    # be real pixels and most of those pixels to be the cube + immediate
+    # surroundings.
+    pad = max(12.0, 0.6 * max(bw, bh))
     cx_lo = float(min_x - pad)
     cy_lo = float(min_y - pad)
     cx_hi = float(max_x + pad)
     cy_hi = float(max_y + pad)
-    # Pad whichever axis is shorter so the crop is square. Keeps each tile
-    # using its full cell area instead of black-barring the short axis.
-    cw_box = cx_hi - cx_lo
-    ch_box = cy_hi - cy_lo
-    if cw_box < ch_box:
-        extra = (ch_box - cw_box) * 0.5
+
+    # Match the cell's aspect ratio by expanding the shorter axis. This
+    # avoids the "wide thin crop in a square cell" letterboxing that wastes
+    # most of the cell as dark grey.
+    target_aspect = cell_w / cell_h
+    crop_w = cx_hi - cx_lo
+    crop_h = cy_hi - cy_lo
+    if crop_w / crop_h < target_aspect:
+        needed = crop_h * target_aspect
+        extra = (needed - crop_w) * 0.5
         cx_lo -= extra
         cx_hi += extra
-    elif ch_box < cw_box:
-        extra = (cw_box - ch_box) * 0.5
+    else:
+        needed = crop_w / target_aspect
+        extra = (needed - crop_h) * 0.5
         cy_lo -= extra
         cy_hi += extra
-    cx_lo = int(np.clip(cx_lo, 0, cw - 1))
-    cy_lo = int(np.clip(cy_lo, 0, ch - 1))
-    cx_hi = int(np.clip(cx_hi, 1, cw))
-    cy_hi = int(np.clip(cy_hi, 1, ch))
-    if cx_hi <= cx_lo or cy_hi <= cy_lo:
+
+    cx_lo_i = int(np.clip(np.floor(cx_lo), 0, cw - 1))
+    cy_lo_i = int(np.clip(np.floor(cy_lo), 0, ch - 1))
+    cx_hi_i = int(np.clip(np.ceil(cx_hi), 1, cw))
+    cy_hi_i = int(np.clip(np.ceil(cy_hi), 1, ch))
+    if cx_hi_i <= cx_lo_i or cy_hi_i <= cy_lo_i:
         return None
 
-    crop = img.crop((cx_lo, cy_lo, cx_hi, cy_hi)).convert("RGB")
+    crop = img.crop((cx_lo_i, cy_lo_i, cx_hi_i, cy_hi_i)).convert("RGB")
 
-    # Edges in crop-local coords.
-    draw = ImageDraw.Draw(crop)
-    local = px - np.array([[cx_lo, cy_lo]])
+    # Resize to cell, preserving aspect (small letterbox only when the bbox
+    # extension hit an image edge and we couldn't keep the requested aspect).
+    crop_aspect = crop.width / crop.height
+    if abs(crop_aspect - target_aspect) < 1e-3:
+        scaled = crop.resize((cell_w, cell_h), Image.LANCZOS)
+    elif crop_aspect > target_aspect:
+        new_w = cell_w
+        new_h = max(1, int(round(cell_w / crop_aspect)))
+        scaled = crop.resize((new_w, new_h), Image.LANCZOS)
+    else:
+        new_h = cell_h
+        new_w = max(1, int(round(cell_h * crop_aspect)))
+        scaled = crop.resize((new_w, new_h), Image.LANCZOS)
+
+    cell = Image.new("RGB", (cell_w, cell_h), (28, 28, 32))
+    ox = (cell_w - scaled.width) // 2
+    oy = (cell_h - scaled.height) // 2
+    cell.paste(scaled, (ox, oy))
+
+    # Draw the cube edges/corners *after* resizing, scaling pixel coords from
+    # the original crop into the resized image. Drawing post-resize keeps
+    # the lines crisp at one-pixel-aliased width regardless of zoom factor.
+    draw = ImageDraw.Draw(cell)
+    sx = scaled.width / (cx_hi_i - cx_lo_i)
+    sy = scaled.height / (cy_hi_i - cy_lo_i)
+    local = (px - np.array([[cx_lo_i, cy_lo_i]])) * np.array([[sx, sy]])
+    local = local + np.array([[ox, oy]])
+    line_w = max(1, cell_h // 90)
     for a, b in CUBE_EDGES:
         x0, y0 = local[a]
         x1, y1 = local[b]
-        draw.line([(x0, y0), (x1, y1)], fill=(255, 220, 0), width=2)
+        draw.line([(x0, y0), (x1, y1)], fill=(255, 220, 0), width=line_w)
+    r = max(2, cell_h // 60)
     for k in range(8):
         x, y = local[k]
-        draw.ellipse([(x - 3, y - 3), (x + 3, y + 3)], outline=(255, 80, 80), width=1)
+        draw.ellipse([(x - r, y - r), (x + r, y + r)], outline=(255, 80, 80), width=1)
 
-    # Fit into a square cell, padding with dark grey so non-square crops still
-    # tile cleanly.
-    crop.thumbnail((cell_size, cell_size), Image.LANCZOS)
-    cell = Image.new("RGB", (cell_size, cell_size), (28, 28, 32))
-    cell.paste(crop, ((cell_size - crop.width) // 2, (cell_size - crop.height) // 2))
     return cell
 
 
@@ -247,8 +278,11 @@ def main() -> None:
                     help="number of cubes to inspect (= rows in PNG)")
     ap.add_argument("--frames-per-cube", type=int, default=10,
                     help="number of frames per cube (= columns in PNG)")
-    ap.add_argument("--cell-size", type=int, default=160,
-                    help="pixel size of each cell in the output PNG")
+    ap.add_argument("--cell-width", type=int, default=320,
+                    help="pixel width of each cell in the output PNG")
+    ap.add_argument("--cell-aspect", type=float, default=4.0/3.0,
+                    help="aspect ratio (w/h) of each cell. Default 4:3 fits "
+                         "the typical cube projection without letterboxing.")
     ap.add_argument("--out", default="cube_inspection.png",
                     help="output PNG path")
     ap.add_argument("--limit-frames", type=int, default=None,
@@ -303,21 +337,22 @@ def main() -> None:
 
     K = len(top)
     M = args.frames_per_cube
-    cell = args.cell_size
-    margin = 110
+    cell_w = args.cell_width
+    cell_h = max(1, int(round(cell_w / max(0.5, args.cell_aspect))))
+    margin = 130
 
-    canvas = Image.new("RGB", (margin + M * cell, K * cell), (16, 16, 20))
+    canvas = Image.new("RGB", (margin + M * cell_w, K * cell_h), (16, 16, 20))
     draw = ImageDraw.Draw(canvas)
 
     for row, (ci, fis) in enumerate(top):
         picked = pick_evenly(fis, M)
         for col, fi in enumerate(picked[:M]):
-            tile = render_cube_in_frame(parsed_cache[fi], ci, grid, cell)
+            tile = render_cube_in_frame(parsed_cache[fi], ci, grid, cell_w, cell_h)
             if tile is None:
-                tile = Image.new("RGB", (cell, cell), (60, 30, 30))
+                tile = Image.new("RGB", (cell_w, cell_h), (60, 30, 30))
                 d = ImageDraw.Draw(tile)
                 d.text((6, 6), "no img", fill=(220, 200, 200))
-            canvas.paste(tile, (margin + col * cell, row * cell))
+            canvas.paste(tile, (margin + col * cell_w, row * cell_h))
 
         idx = grid._cube_index_flat[ci]
         center = grid.world_min + (idx + 0.5) * grid.cube_size
@@ -326,10 +361,11 @@ def main() -> None:
                  f"({center[0]:+.2f},\n"
                  f" {center[1]:+.2f},\n"
                  f" {center[2]:+.2f})")
-        draw.multiline_text((6, row * cell + 6), label, fill=(220, 220, 220), spacing=2)
+        draw.multiline_text((6, row * cell_h + 6), label, fill=(220, 220, 220), spacing=2)
 
     canvas.save(args.out)
-    print(f"\nWrote {args.out} ({canvas.width}x{canvas.height})")
+    print(f"\nWrote {args.out} ({canvas.width}x{canvas.height}) "
+          f"cell={cell_w}x{cell_h}")
 
 
 if __name__ == "__main__":
