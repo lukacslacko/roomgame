@@ -675,7 +675,10 @@ async function pollCubeState() {
 }
 
 // ----- /frame submissions (mirror of scan.js's path) ----------------------
-const COLOR_OVERSAMPLE = 2;
+// Fallback when view.camera doesn't expose dimensions (camera-access denied);
+// otherwise we use the WebXR camera's native resolution so the offline
+// voxel-reconstruction tool has the sharpest possible per-pixel rays.
+const COLOR_OVERSAMPLE_FALLBACK = 2;
 
 async function captureAndSend(view, depthInfo, formatCode, bytesPerPixel) {
   fetchInFlight = true;
@@ -687,7 +690,16 @@ async function captureAndSendInner(view, depthInfo, formatCode, bytesPerPixel) {
   const w = depthInfo.width, h = depthInfo.height;
   const depthBytes = w * h * bytesPerPixel;
 
-  const cw = w * COLOR_OVERSAMPLE, ch = h * COLOR_OVERSAMPLE;
+  // Native camera resolution when WebXR exposes it; else 2× depth as a
+  // sane default. Pixel phones report 1920×1080 here on a typical session.
+  let cw, ch;
+  if (view.camera && view.camera.width > 0 && view.camera.height > 0) {
+    cw = view.camera.width;
+    ch = view.camera.height;
+  } else {
+    cw = w * COLOR_OVERSAMPLE_FALLBACK;
+    ch = h * COLOR_OVERSAMPLE_FALLBACK;
+  }
   const colorPixels = captureCameraRGBA(view, cw, ch);
   const colorBytes = colorPixels ? cw * ch * 4 : 0;
   const colorFormat = colorPixels ? COLOR_RGBA8 : COLOR_NONE;
