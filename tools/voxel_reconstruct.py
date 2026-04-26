@@ -25,10 +25,22 @@ np.bincount on 1M-element grids.
 """
 from __future__ import annotations
 
+# Cap BLAS thread pools to 1 *before* numpy gets imported. With multiprocessing
+# we already have W workers; OpenBLAS spawning T threads per worker yields
+# W × T contending threads and cratery throughput on Apple Silicon. Single-
+# process runs (workers=1) are unaffected because all the heavy work is in
+# np.bincount, which is single-threaded anyway.
+import os as _os
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    _os.environ.setdefault(_v, "1")
+
 import argparse
 import json
+import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +65,7 @@ def reconstruct(
     subsample: int = 4,
     chunk_size: int = 200_000,
     max_frames: int | None = None,
+    workers: int = 1,
 ) -> None:
     wmin = np.asarray(world_min, dtype=np.float64)
     wmax = np.asarray(world_max, dtype=np.float64)
@@ -72,35 +85,79 @@ def reconstruct(
     if not frame_paths:
         print(f"No frames found in {frames_dir}")
         return
-    print(f"Processing {len(frame_paths)} frames from {frames_dir}")
+    print(f"Processing {len(frame_paths)} frames from {frames_dir} (workers={workers})")
 
-    step = voxel_size * 0.5
+    # Sampling at voxel_size (rather than half) gives ~1 sample per voxel
+    # along each ray — quite enough for an occupancy/free counter, and roughly
+    # halves the per-frame bincount work. Sub-voxel jitter is irrelevant
+    # because the masks aggregate over many frames.
+    step = voxel_size
+    n_steps = int(np.ceil((far + tol - near) / step)) + 1
     t0_total = time.time()
 
-    for fi, fp in enumerate(frame_paths):
-        body = fp.read_bytes()
-        try:
-            frame = serve.parse_frame(body)
-        except Exception as e:  # noqa: BLE001
-            print(f"  frame {fi}: parse error {e}")
-            continue
-        if frame["color"] is None:
-            continue
+    # Bundle every per-frame parameter into one picklable dict so we can ship
+    # it to subprocesses without re-deriving anything.
+    grid_params = {
+        "world_min": wmin,
+        "voxel_size": voxel_size,
+        "shape": shape,
+        "Ntot": Ntot,
+        "near": near, "far": far, "tol": tol,
+        "step": step, "n_steps": n_steps,
+        "subsample": subsample,
+        "chunk_size": chunk_size,
+    }
 
-        t_frame = time.time()
-        rays_processed = process_frame(
-            frame, air_count, color_count, color_sum,
-            wmin, voxel_size, shape, step,
-            near=near, far=far, tol=tol,
-            subsample=subsample, chunk_size=chunk_size,
-        )
-        dt = time.time() - t_frame
-        if (fi + 1) % 5 == 0 or fi == 0 or fi == len(frame_paths) - 1:
-            tot_color = int(color_count.sum())
-            tot_air = int(air_count.sum())
-            print(f"  frame {fi+1:4d}/{len(frame_paths)}: "
-                  f"{rays_processed:7d} rays in {dt*1000:.0f} ms; "
-                  f"running totals: color {tot_color:,}, air {tot_air:,}")
+    if workers <= 1:
+        for fi, fp in enumerate(frame_paths):
+            body = fp.read_bytes()
+            try:
+                frame = serve.parse_frame(body)
+            except Exception as e:  # noqa: BLE001
+                print(f"  frame {fi}: parse error {e}")
+                continue
+            if frame["color"] is None:
+                continue
+            t_frame = time.time()
+            rays_processed = process_frame(
+                frame, air_count, color_count, color_sum,
+                wmin, voxel_size, shape, step,
+                near=near, far=far, tol=tol,
+                subsample=subsample, chunk_size=chunk_size,
+                n_steps=n_steps,
+            )
+            dt = time.time() - t_frame
+            if (fi + 1) % 5 == 0 or fi == 0 or fi == len(frame_paths) - 1:
+                print(f"  frame {fi+1:4d}/{len(frame_paths)}: "
+                      f"{rays_processed:7d} rays in {dt*1000:.0f} ms; "
+                      f"running totals: color {int(color_count.sum()):,}, "
+                      f"air {int(air_count.sum()):,}")
+    else:
+        # Multiprocess path: each worker gets a contiguous slice of the
+        # frame list, accumulates its own counter buffers in numpy, and
+        # ships them back. Counters are summed in the parent.
+        batches = np.array_split(np.array(frame_paths, dtype=object), workers)
+        batches = [list(b) for b in batches if len(b) > 0]
+        print(f"  splitting into {len(batches)} batches "
+              f"(~{len(batches[0])} frames/worker)")
+
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(_worker_process_batch,
+                          [str(p) for p in batch], grid_params): bi
+                for bi, batch in enumerate(batches)
+            }
+            done = 0
+            for fut in as_completed(futures):
+                bi = futures[fut]
+                a, c, s, n_ok, dt_w = fut.result()
+                air_count += a
+                color_count += c
+                color_sum += s
+                done += 1
+                print(f"  batch {bi+1:2d}/{len(batches)} merged "
+                      f"({n_ok} frames in {dt_w:.1f} s; "
+                      f"merged {done}/{len(batches)})")
 
     print(f"\nAll frames processed in {time.time()-t0_total:.1f} s")
 
@@ -142,9 +199,11 @@ def reconstruct(
     print(f"Wrote {out_path}  ({out_path.stat().st_size/1e6:.1f} MB)")
 
 
-def process_frame(frame, air_count, color_count, color_sum,
-                 grid_origin, voxel_size, shape, step,
-                 *, near, far, tol, subsample, chunk_size) -> int:
+def _frame_rays(frame, *, near, far, subsample):
+    """Decode a captured frame body into per-pixel rays + depth + RGB.
+    Pure numpy; no GPU yet. Returns (rays, depths, rgbs, cam_origin, M_valid)
+    where rays/depths/rgbs only contain valid pixels (in-buf, depth in range).
+    """
     width = int(frame["width"])
     height = int(frame["height"])
     depth = fusion.decode_depth(
@@ -156,34 +215,28 @@ def process_frame(frame, air_count, color_count, color_sum,
     ch = int(frame["color_height"])
     color_payload = frame["color"]
     if color_payload is None or cw == 0 or ch == 0:
-        return 0
+        return None
 
     color_arr = np.frombuffer(color_payload, dtype=np.uint8).reshape(ch, cw, 4)
-    # gl.readPixels rows are bottom-up: color_arr[0] is the bottom row, which
-    # corresponds to GL view-V at v=0. Keep that convention here so projection
-    # math (y_ndc = 2v − 1 with bottom-up v) lines up with sampling.
 
-    V  = fusion._mat4_from_column_major(frame["viewMatrix"])              # world_from_view
+    V  = fusion._mat4_from_column_major(frame["viewMatrix"])
     P  = fusion._mat4_from_column_major(frame["projectionMatrix"])
     Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
     P_inv = np.linalg.inv(P)
 
     cam_origin = V[:3, 3].astype(np.float64)
 
-    # Subsample the colour image in pixel space; preserve original UV coords
-    # so the projection math is unchanged.
     color_sub = color_arr[::subsample, ::subsample]
     sh, sw = color_sub.shape[:2]
 
     j_grid, i_grid = np.meshgrid(np.arange(sh), np.arange(sw), indexing="ij")
-    u = (i_grid * subsample + 0.5 * subsample) / cw   # GL u  ∈ [0, 1]
+    u = (i_grid * subsample + 0.5 * subsample) / cw
     v = (j_grid * subsample + 0.5 * subsample) / ch
 
-    # NDC for the pixel centre, on the near plane.
     x_ndc = 2.0 * u - 1.0
     y_ndc = 2.0 * v - 1.0
     clip = np.stack(
-        [x_ndc, y_ndc, -np.ones_like(x_ndc), np.ones_like(x_ndc)], axis=-1
+        [x_ndc, y_ndc, -np.ones_like(x_ndc), np.ones_like(x_ndc)], axis=-1,
     )
     view4 = clip @ P_inv.T
     view3 = view4[..., :3] / np.where(np.abs(view4[..., 3:4]) < 1e-12, 1.0, view4[..., 3:4])
@@ -194,12 +247,11 @@ def process_frame(frame, air_count, color_count, color_sum,
     ray_lens = np.linalg.norm(ray_dirs, axis=-1, keepdims=True)
     ray_dirs = ray_dirs / np.maximum(ray_lens, 1e-9)
 
-    # Look up depth at each pixel through the depth-buffer mapping.
     nv_h = np.stack([u, v, np.zeros_like(u), np.ones_like(u)], axis=-1)
     nd_h = nv_h @ Bd.T
     u_d = nd_h[..., 0] / np.where(np.abs(nd_h[..., 3]) < 1e-12, 1.0, nd_h[..., 3])
     v_d = nd_h[..., 1] / np.where(np.abs(nd_h[..., 3]) < 1e-12, 1.0, nd_h[..., 3])
-    bx = np.floor((1.0 - u_d) * width).astype(np.int32)   # column-flip per scan.js
+    bx = np.floor((1.0 - u_d) * width).astype(np.int32)
     by = np.floor(v_d * height).astype(np.int32)
     in_buf = (bx >= 0) & (bx < width) & (by >= 0) & (by < height)
     bx_c = np.clip(bx, 0, width - 1)
@@ -208,61 +260,124 @@ def process_frame(frame, air_count, color_count, color_sum,
 
     valid = in_buf & (depth_est > near) & (depth_est < far)
 
-    rgb = color_sub[..., :3]                              # (sh, sw, 3) uint8
+    rgb = color_sub[..., :3]
 
     rays_flat = ray_dirs.reshape(-1, 3)
     depth_flat = depth_est.reshape(-1)
     valid_flat = valid.reshape(-1)
     rgb_flat = rgb.reshape(-1, 3)
 
-    rays_v = rays_flat[valid_flat]
-    depth_v = depth_flat[valid_flat]
-    rgb_v = rgb_flat[valid_flat]
+    return (
+        rays_flat[valid_flat].astype(np.float32),
+        depth_flat[valid_flat].astype(np.float32),
+        rgb_flat[valid_flat].astype(np.float32),
+        cam_origin.astype(np.float32),
+    )
+
+
+def process_frame(frame, air_count, color_count, color_sum,
+                 grid_origin, voxel_size, shape, step,
+                 *, near, far, tol, subsample, chunk_size, n_steps) -> int:
+    """Vectorised numpy backend.
+
+    For each chunk of pixels, builds (chunk × n_steps) sample arrays in one
+    shot and runs five np.bincount calls over the masked indices — one for
+    air, one for colour count, three (R/G/B) for the colour sum. That's far
+    fewer Python-level loop iterations than the per-step variant, and lets
+    numpy's internal C loops do the heavy lifting.
+    """
+    rays_data = _frame_rays(frame, near=near, far=far, subsample=subsample)
+    if rays_data is None:
+        return 0
+    rays_v, depth_v, rgb_v, cam_origin = rays_data
     M = rays_v.shape[0]
     if M == 0:
         return 0
 
     Nx, Ny, Nz = shape
     Ntot = Nx * Ny * Nz
+    Ny_Nz = Ny * Nz
+
+    t_vals = (near + (np.arange(n_steps, dtype=np.float32) + 0.5) * step).astype(np.float32)
 
     for cs in range(0, M, chunk_size):
         ce = min(cs + chunk_size, M)
-        rays_c = rays_v[cs:ce]
-        depth_c = depth_v[cs:ce]
-        rgb_c = rgb_v[cs:ce]
+        rays_c = rays_v[cs:ce]                                    # (N, 3) f32
+        depth_c = depth_v[cs:ce]                                  # (N,)   f32
+        rgb_c = rgb_v[cs:ce]                                      # (N, 3) f32
+        N = ce - cs
 
-        max_t_chunk = depth_c.max() + tol
-        n_steps = int(np.ceil((max_t_chunk - near) / step)) + 1
+        # Sample positions: (N, S, 3) world, (N, S, 3) voxel index.
+        wp = cam_origin[None, None, :] + t_vals[None, :, None] * rays_c[:, None, :]
+        vp = (wp - grid_origin[None, None, :].astype(np.float32)) / np.float32(voxel_size)
+        vidx = np.floor(vp).astype(np.int32)                      # (N, S, 3)
+        vx = vidx[..., 0]; vy = vidx[..., 1]; vz = vidx[..., 2]
+        in_grid = (
+            (vx >= 0) & (vx < Nx) &
+            (vy >= 0) & (vy < Ny) &
+            (vz >= 0) & (vz < Nz)
+        )
 
-        for s in range(n_steps):
-            t = near + (s + 0.5) * step
-            if t > max_t_chunk:
-                break
+        d = depth_c[:, None]
+        t = t_vals[None, :]
+        air_mask = (t < d - tol) & in_grid
+        col_mask = (np.abs(t - d) <= tol) & in_grid
 
-            wp = cam_origin[None, :] + t * rays_c
-            vp = (wp - grid_origin[None, :]) / voxel_size
-            vx = np.floor(vp[:, 0]).astype(np.int32)
-            vy = np.floor(vp[:, 1]).astype(np.int32)
-            vz = np.floor(vp[:, 2]).astype(np.int32)
-            in_grid = (vx >= 0) & (vx < Nx) & (vy >= 0) & (vy < Ny) & (vz >= 0) & (vz < Nz)
+        flat = vx * Ny_Nz + vy * Nz + vz                          # (N, S) int32
 
-            d_band = depth_c
-            air_mask = (t < d_band - tol) & in_grid
-            col_mask = (np.abs(t - d_band) <= tol) & in_grid
+        # Air: one bincount over all (chunk × steps) air samples.
+        if air_mask.any():
+            idx_air = flat[air_mask]
+            air_count[:] += np.bincount(idx_air, minlength=Ntot).astype(np.uint32)
 
-            if np.any(air_mask):
-                idx = vx[air_mask] * (Ny * Nz) + vy[air_mask] * Nz + vz[air_mask]
-                air_count[:] += np.bincount(idx, minlength=Ntot).astype(np.uint32)
-
-            if np.any(col_mask):
-                idx = vx[col_mask] * (Ny * Nz) + vy[col_mask] * Nz + vz[col_mask]
-                color_count[:] += np.bincount(idx, minlength=Ntot).astype(np.uint32)
-                cols = rgb_c[col_mask].astype(np.float64)
-                color_sum[:, 0] += np.bincount(idx, weights=cols[:, 0], minlength=Ntot)
-                color_sum[:, 1] += np.bincount(idx, weights=cols[:, 1], minlength=Ntot)
-                color_sum[:, 2] += np.bincount(idx, weights=cols[:, 2], minlength=Ntot)
+        if col_mask.any():
+            idx_col = flat[col_mask]
+            color_count[:] += np.bincount(idx_col, minlength=Ntot).astype(np.uint32)
+            # rgb_b shape (N, S, 3); pick rows by col_mask.
+            # Index trick: broadcast rgb_c (N, 3) to (N, S, 3) implicitly via
+            # repeat with col_mask masking. Cheaper to repeat then index.
+            mi, si = np.nonzero(col_mask)                          # both (N_col,)
+            cols = rgb_c[mi]                                       # (N_col, 3) f32
+            color_sum[:, 0] += np.bincount(idx_col, weights=cols[:, 0], minlength=Ntot)
+            color_sum[:, 1] += np.bincount(idx_col, weights=cols[:, 1], minlength=Ntot)
+            color_sum[:, 2] += np.bincount(idx_col, weights=cols[:, 2], minlength=Ntot)
 
     return M
+
+
+# ----- multiprocessing worker --------------------------------------------
+
+def _worker_process_batch(frame_paths: list[str], grid_params: dict):
+    """Run in a subprocess. Accumulate counters across `frame_paths` using
+    the same vectorised numpy `process_frame` and return the buffers."""
+    Ntot = grid_params["Ntot"]
+    air = np.zeros(Ntot, dtype=np.uint32)
+    cc  = np.zeros(Ntot, dtype=np.uint32)
+    cs  = np.zeros((Ntot, 3), dtype=np.float64)
+
+    t0 = time.time()
+    n_ok = 0
+    for fp in frame_paths:
+        try:
+            body = Path(fp).read_bytes()
+            frame = serve.parse_frame(body)
+        except Exception:
+            continue
+        if frame["color"] is None:
+            continue
+        rays_done = process_frame(
+            frame, air, cc, cs,
+            grid_params["world_min"], grid_params["voxel_size"],
+            grid_params["shape"], grid_params["step"],
+            near=grid_params["near"], far=grid_params["far"],
+            tol=grid_params["tol"],
+            subsample=grid_params["subsample"],
+            chunk_size=grid_params["chunk_size"],
+            n_steps=grid_params["n_steps"],
+        )
+        if rays_done > 0:
+            n_ok += 1
+    return air, cc, cs, n_ok, time.time() - t0
 
 
 def main() -> None:
@@ -288,6 +403,9 @@ def main() -> None:
                     help="pixels processed per inner-loop chunk")
     ap.add_argument("--max-frames", type=int, default=None,
                     help="process only the first N frames (debug)")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2),
+                    help="number of worker processes (1 disables multiprocessing). "
+                         "Default = cpu_count − 2.")
     args = ap.parse_args()
 
     reconstruct(
@@ -300,6 +418,7 @@ def main() -> None:
         subsample=args.subsample,
         chunk_size=args.chunk_size,
         max_frames=args.max_frames,
+        workers=args.workers,
     )
 
 
