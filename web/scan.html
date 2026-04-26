@@ -27,9 +27,14 @@
        overlay is click-through except for buttons; tapping anywhere else on
        screen fires an XR select event we use to capture a frame. -->
   <div id="xrOverlay" class="xr-overlay">
+    <!-- Depth visualisation. Bands alternate dark/light per 1 m of depth so
+         we can sanity-check what ARCore is reporting. Drawn rotated 90°
+         (buffer is landscape-oriented; phone is held portrait). -->
+    <canvas id="depthOverlay" class="depth-overlay"></canvas>
     <div class="hud-row top">
       <button id="exitBtn" class="hud-btn" aria-label="Exit AR">×</button>
       <div id="hudStatus" class="hud-status">starting…</div>
+      <button id="depthToggleBtn" class="hud-btn" aria-label="Toggle depth overlay">D</button>
     </div>
     <div class="hud-row bottom">
       <div class="hud-stat">

@@ -164,3 +164,25 @@ a { color: #6ec4ff; }
   opacity: 0.85;
   pointer-events: none;
 }
+
+/* Depth visualisation: covers most of the screen at low opacity so camera
+   passthrough remains visible. The internal pixels are pixelated (no smoothing)
+   so individual depth pixels and band boundaries are crisp. The canvas
+   itself is sized to match the depth buffer's *rotated* orientation
+   (portrait), so we can paint depth pixels with a transposed map. */
+.depth-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(80vw, 56vh);   /* pick whichever is smaller so it fits without scrolling */
+  height: min(142vw, 100vh);
+  max-width: 90vw;
+  max-height: 90vh;
+  opacity: 0.55;
+  pointer-events: none;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  z-index: 0;
+}
+.depth-overlay.hidden { display: none; }

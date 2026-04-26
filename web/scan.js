@@ -32,6 +32,15 @@ const hudFrames = $("hudFrames");
 const hudLast = $("hudLast");
 const hudTap = $("hudTap");
 const exitBtn = $("exitBtn");
+const depthOverlay = $("depthOverlay");
+const depthToggleBtn = $("depthToggleBtn");
+let depthOverlayCtx = null;
+let depthOverlayImageData = null;
+let depthOverlayVisible = true;
+depthToggleBtn?.addEventListener("click", () => {
+  depthOverlayVisible = !depthOverlayVisible;
+  depthOverlay.classList.toggle("hidden", !depthOverlayVisible);
+});
 
 let session = null;
 let xrRefSpace = null;
@@ -276,6 +285,73 @@ function captureCameraRGBA(view, width, height) {
   return camPixels;
 }
 
+// ----- depth overlay ------------------------------------------------------
+//
+// Paints the raw cpu-depth buffer onto a 2D canvas with bands alternating
+// dark/light per 1 m of depth. Because the depth buffer is in landscape
+// sensor orientation but the phone is held portrait, we transpose while
+// drawing so the overlay roughly aligns with the camera passthrough behind it
+// (assumes a 90° rotation between buffer u and view v, which is what we see
+// in practice on Pixels — the normDepthBufferFromNormView matrix had a
+// `(0, 1, -0.82, 0)` rotation block when we inspected it).
+//
+// Colours:
+//   depth == 0       → magenta (no measurement / out of confidence range)
+//   d ∈ [0, 1) m     → dark
+//   d ∈ [1, 2) m     → light
+//   d ∈ [2, 3) m     → dark
+//   ...
+//   d ≥ overlayMaxM  → black (clamped, treated as "far")
+function renderDepthOverlay(depthInfo) {
+  const W = depthInfo.width;
+  const H = depthInfo.height;
+  // Canvas size is the *rotated* depth-buffer shape so 1 buffer pixel = 1
+  // canvas pixel after the transpose, with no resampling.
+  if (depthOverlay.width !== H || depthOverlay.height !== W) {
+    depthOverlay.width = H;
+    depthOverlay.height = W;
+    depthOverlayCtx = depthOverlay.getContext("2d");
+    depthOverlayImageData = depthOverlayCtx.createImageData(H, W);
+  }
+  const ctx = depthOverlayCtx;
+  const imgData = depthOverlayImageData;
+  const px = imgData.data;
+
+  const xrData = depthInfo.data;
+  const buf = xrData instanceof ArrayBuffer ? xrData : xrData.buffer;
+  const off = xrData instanceof ArrayBuffer ? 0 : xrData.byteOffset;
+  // We only handle the luminance-alpha format here (the only one Chrome
+  // returns in practice). Float32 would need a Float32Array source.
+  const u16 = new Uint16Array(buf, off, W * H);
+  const r2m = depthInfo.rawValueToMeters;
+
+  const overlayMaxM = 8.0;
+  for (let by = 0; by < H; by++) {
+    for (let bx = 0; bx < W; bx++) {
+      const d = u16[by * W + bx] * r2m;
+      // Counter-clockwise 90° rotation: buffer (bx, by) → output (by, W-1-bx).
+      const ox = by;
+      const oy = W - 1 - bx;
+      const dst = (oy * H + ox) * 4;
+      let r, g, b, a;
+      if (d <= 0.0) {
+        r = 220; g = 0; b = 220; a = 200;        // no measurement
+      } else if (d >= overlayMaxM) {
+        r = 0; g = 0; b = 0; a = 200;            // far / out of range
+      } else {
+        const band = Math.floor(d);
+        const v = (band & 1) === 0 ? 35 : 220;   // alternate dark/light
+        r = v; g = v; b = v; a = 220;
+      }
+      px[dst]     = r;
+      px[dst + 1] = g;
+      px[dst + 2] = b;
+      px[dst + 3] = a;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+}
+
 // ----- main per-frame loop ------------------------------------------------
 
 function onXRFrame(time, frame, formatCode, bytesPerPixel) {
@@ -303,6 +379,8 @@ function onXRFrame(time, frame, formatCode, bytesPerPixel) {
   }
 
   hudDepth.textContent = `${depthInfo.width}×${depthInfo.height}`;
+
+  if (depthOverlayVisible) renderDepthOverlay(depthInfo);
 
   if (!depthBufferLogged) {
     depthBufferLogged = true;
