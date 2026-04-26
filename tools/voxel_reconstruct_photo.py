@@ -38,9 +38,12 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
 import argparse
 import json
 import os
+import pickle
 import sys
+import tempfile
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -88,8 +91,11 @@ def load_frame(frame_path: Path, *, near: float, far: float, subsample: int):
     if cw == 0 or ch == 0:
         return None
     color_arr = np.frombuffer(frame["color"], dtype=np.uint8).reshape(ch, cw, 4)
+    # Store grayscale as uint8 (1 byte/px) — keeps the pickle that gets shipped
+    # to refinement workers small. We only convert to float32 inside patch
+    # extraction (5×5 patches, negligible cost).
     gray = (color_arr[..., :3].astype(np.float32) @
-            np.array([0.299, 0.587, 0.114], dtype=np.float32)).astype(np.float32)
+            np.array([0.299, 0.587, 0.114], dtype=np.float32)).clip(0, 255).astype(np.uint8)
 
     V = fusion._mat4_from_column_major(frame["viewMatrix"])
     P = fusion._mat4_from_column_major(frame["projectionMatrix"])
@@ -309,17 +315,150 @@ def normalised_patch(p: np.ndarray) -> np.ndarray | None:
     return (p - m) / s
 
 
+# ----- worker-global state for ProcessPoolExecutor ------------------------
+_W_FRAMES: list | None = None  # populated by _worker_init in each subprocess
+
+
+def _frames_for_pickle(frames):
+    """Strip everything workers don't need so the temp pickle stays compact."""
+    keep_keys = ("pixel_xy", "rays_dirs", "depths_current", "cam_origin",
+                 "V", "P", "V_inv", "cw", "ch", "gray")
+    return [
+        {k: f[k] for k in keep_keys} if f is not None else None
+        for f in frames
+    ]
+
+
+def _worker_init(pickle_path: str) -> None:
+    global _W_FRAMES
+    with open(pickle_path, "rb") as fh:
+        _W_FRAMES = pickle.load(fh)
+
+
+def _process_one_ray(ray_list, ai, params, cos_thresh):
+    """Single-ray refinement against its peers. Returns (fi_a, ri_a, dt) or
+    None. Uses the worker-global _W_FRAMES list."""
+    frames = _W_FRAMES
+    fi_a, ri_a = ray_list[ai]
+    frame_a = frames[fi_a]
+    if frame_a is None:
+        return None, 0
+
+    d_a = frame_a["rays_dirs"][ri_a]
+    o_a = frame_a["cam_origin"]
+    t_a = float(frame_a["depths_current"][ri_a])
+    p_a_xy = frame_a["pixel_xy"][ri_a]
+
+    patch_a = extract_patch(frame_a["gray"], p_a_xy[0], p_a_xy[1], params["patch_half"])
+    if patch_a is None:
+        return None, 0
+    patch_a_n = normalised_patch(patch_a.astype(np.float32))
+    if patch_a_n is None:
+        return None, 0
+
+    n_search = params["n_search"]
+    tol = params["tol"]
+    ts = t_a + np.linspace(-tol, tol, n_search, dtype=np.float32)
+    P_candidates = (o_a[None, :] + ts[:, None] * d_a[None, :]).astype(np.float64)
+
+    K = len(ray_list)
+    peer_indices = list(range(K))
+    peer_indices.remove(ai)
+    max_peers = params["max_peers_per_ray"]
+    if len(peer_indices) > max_peers:
+        peer_indices = list(np.random.default_rng(ai).choice(
+            peer_indices, size=max_peers, replace=False))
+
+    patch_half = params["patch_half"]
+    ph = 2 * patch_half + 1
+    min_ncc = params["min_ncc"]
+
+    best_dts = []
+    n_pairs_eval = 0
+    for bi in peer_indices:
+        fi_b, ri_b = ray_list[bi]
+        if fi_b == fi_a:
+            continue
+        frame_b = frames[fi_b]
+        if frame_b is None:
+            continue
+        d_b = frame_b["rays_dirs"][ri_b]
+        cos_ang = abs(float(np.dot(d_a, d_b)))
+        if cos_ang < cos_thresh:
+            continue
+
+        qs = project_to_pixel(P_candidates, frame_b)
+        if qs is None:
+            continue
+
+        gray_b = frame_b["gray"]
+        cw_b = frame_b["cw"]; ch_b = frame_b["ch"]
+        ix = np.round(qs[:, 0])
+        iy = np.round(qs[:, 1])
+        in_b = (
+            np.isfinite(ix) & np.isfinite(iy)
+            & (ix - patch_half >= 0) & (ix + patch_half < cw_b)
+            & (iy - patch_half >= 0) & (iy + patch_half < ch_b)
+        )
+        n_pairs_eval += 1
+        if not in_b.any():
+            continue
+        ix_i = np.where(in_b, ix, 0).astype(np.int32)
+        iy_i = np.where(in_b, iy, 0).astype(np.int32)
+        rr = (np.arange(ph) - patch_half)[None, :, None] + iy_i[:, None, None]
+        cc_ = (np.arange(ph) - patch_half)[None, None, :] + ix_i[:, None, None]
+        patches_b = gray_b[rr, cc_].astype(np.float32)
+
+        m = patches_b.mean(axis=(1, 2), keepdims=True)
+        d_ = patches_b - m
+        s = np.sqrt((d_ * d_).mean(axis=(1, 2), keepdims=True))
+        ok = (s.squeeze((1, 2)) > 1e-3) & in_b
+        if not ok.any():
+            continue
+        norm = d_ / np.where(s > 1e-3, s, 1.0)
+        scores = (norm * patch_a_n[None, :, :]).mean(axis=(1, 2))
+        scores = np.where(ok, scores, -np.inf)
+        best_s = int(np.argmax(scores))
+        best_score = float(scores[best_s])
+        if np.isfinite(best_score) and best_score >= min_ncc:
+            best_dts.append(float(ts[best_s] - t_a))
+
+    if not best_dts:
+        return None, n_pairs_eval
+
+    dt = float(np.median(best_dts))
+    dt = max(-tol, min(tol, dt))
+    return (fi_a, ri_a, dt), n_pairs_eval
+
+
+def _worker_process_voxels(chunk_with_id):
+    """Run in a subprocess. `chunk_with_id` is (chunk_id, voxel_chunk, params)
+    where voxel_chunk is a list of (voxel_id, [(fi, ri), ...]) tuples."""
+    chunk_id, voxel_chunk, params = chunk_with_id
+    cos_thresh = np.cos(np.radians(params["max_angle_deg"]))
+    results = []
+    n_pairs = 0
+    for _voxel_id, ray_list in voxel_chunk:
+        K = len(ray_list)
+        if K < 2:
+            continue
+        for ai in range(K):
+            res, npe = _process_one_ray(ray_list, ai, params, cos_thresh)
+            n_pairs += npe
+            if res is not None:
+                results.append(res)
+    return chunk_id, results, n_pairs
+
+
 def photometric_refine_pass(frames, *, tol: float, max_angle_deg: float,
                             patch_half: int, n_search: int,
                             min_ncc: float,
-                            max_peers_per_ray: int) -> tuple[int, int]:
+                            max_peers_per_ray: int,
+                            workers: int = 1) -> tuple[int, int]:
     """Update each frame's `depths_current` based on photo-consistency
     with peer rays sharing the same kept voxel. Returns (n_rays_updated,
     n_peer_pairs_evaluated)."""
-    Nx, Ny, Nz = frames[0]["_shape"]
-    cos_thresh = np.cos(np.radians(max_angle_deg))
 
-    # Build voxel -> [(frame_idx, ray_idx), ...] map.
     voxel_to_rays: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for fi, frame in enumerate(frames):
         if frame is None or "hit_voxel" not in frame:
@@ -329,111 +468,99 @@ def photometric_refine_pass(frames, *, tol: float, max_angle_deg: float,
         for ri in nz:
             voxel_to_rays[int(hits[ri])].append((fi, int(ri)))
 
-    n_voxels_with_peers = sum(1 for ray_list in voxel_to_rays.values() if len(ray_list) >= 2)
-    print(f"    {n_voxels_with_peers:,} voxels have ≥2 ray observations "
+    voxels_with_peers = [(v, rl) for v, rl in voxel_to_rays.items() if len(rl) >= 2]
+    print(f"    {len(voxels_with_peers):,} voxels have ≥2 ray observations "
           f"(out of {len(voxel_to_rays):,} hit voxels)")
 
-    dt_sums = [np.zeros(len(f["rays_dirs"]), dtype=np.float64) if f is not None else None
-               for f in frames]
-    dt_counts = [np.zeros(len(f["rays_dirs"]), dtype=np.int32) if f is not None else None
-                 for f in frames]
+    n_rays_per_frame = [len(f["rays_dirs"]) if f is not None else 0 for f in frames]
+    dt_sums = [np.zeros(n, dtype=np.float64) for n in n_rays_per_frame]
+    dt_counts = [np.zeros(n, dtype=np.int32) for n in n_rays_per_frame]
 
-    rng = np.random.default_rng(0)
+    params = {
+        "tol": tol, "max_angle_deg": max_angle_deg,
+        "patch_half": patch_half, "n_search": n_search,
+        "min_ncc": min_ncc, "max_peers_per_ray": max_peers_per_ray,
+    }
+    cos_thresh = np.cos(np.radians(max_angle_deg))
+
     n_pairs_eval = 0
+    t0 = time.time()
 
-    for ray_list in voxel_to_rays.values():
-        K = len(ray_list)
-        if K < 2:
-            continue
+    if workers <= 1:
+        # Single-process path. Keep it for parity with the parallel one.
+        global _W_FRAMES
+        prev_W = _W_FRAMES
+        _W_FRAMES = frames
+        try:
+            n_voxels = len(voxels_with_peers)
+            report_every = max(1, n_voxels // 20)
+            for vi, (_voxel_id, ray_list) in enumerate(voxels_with_peers):
+                K = len(ray_list)
+                for ai in range(K):
+                    res, npe = _process_one_ray(ray_list, ai, params, cos_thresh)
+                    n_pairs_eval += npe
+                    if res is not None:
+                        fi_a, ri_a, dt = res
+                        dt_sums[fi_a][ri_a] += dt
+                        dt_counts[fi_a][ri_a] += 1
+                if (vi + 1) % report_every == 0 or vi == n_voxels - 1:
+                    elapsed = time.time() - t0
+                    eta = (elapsed / (vi + 1)) * (n_voxels - vi - 1)
+                    print(f"      voxels {vi+1:,}/{n_voxels:,} "
+                          f"({100*(vi+1)/n_voxels:.0f}%); "
+                          f"{n_pairs_eval:,} pairs; "
+                          f"elapsed {elapsed:.0f}s; ETA {eta:.0f}s")
+        finally:
+            _W_FRAMES = prev_W
+    else:
+        # Multiprocess: pickle the (stripped) frames once, ship pickle path
+        # to workers via initializer, then dispatch chunks of voxels.
+        n_voxels = len(voxels_with_peers)
+        # Aim for ~6 chunks per worker so progress is reported smoothly
+        # while keeping per-task overhead low.
+        target_chunks = workers * 6
+        chunk_size = max(1, (n_voxels + target_chunks - 1) // target_chunks)
+        chunks = [
+            voxels_with_peers[i:i + chunk_size]
+            for i in range(0, n_voxels, chunk_size)
+        ]
+        print(f"    splitting {n_voxels:,} voxels into {len(chunks)} chunks "
+              f"(~{chunk_size}/chunk) for {workers} workers")
 
-        for ai, (fi_a, ri_a) in enumerate(ray_list):
-            frame_a = frames[fi_a]
-            if frame_a is None:
-                continue
-            d_a = frame_a["rays_dirs"][ri_a]
-            o_a = frame_a["cam_origin"]
-            t_a = float(frame_a["depths_current"][ri_a])
-            p_a_xy = frame_a["pixel_xy"][ri_a]
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".pkl", delete=False, prefix="voxphoto_"
+        ) as tf:
+            pickle_path = tf.name
+            t_pickle = time.time()
+            pickle.dump(_frames_for_pickle(frames), tf, protocol=pickle.HIGHEST_PROTOCOL)
+            tf.flush()
+            print(f"    pickled frames ({Path(pickle_path).stat().st_size/1e6:.0f} MB) "
+                  f"in {time.time()-t_pickle:.1f} s → {pickle_path}")
 
-            patch_a = extract_patch(frame_a["gray"], p_a_xy[0], p_a_xy[1], patch_half)
-            if patch_a is None:
-                continue
-            patch_a_n = normalised_patch(patch_a)
-            if patch_a_n is None:
-                continue
-
-            ts = t_a + np.linspace(-tol, tol, n_search, dtype=np.float32)
-            P_candidates = o_a[None, :] + ts[:, None] * d_a[None, :]   # (S, 3)
-
-            peer_indices = list(range(K))
-            peer_indices.remove(ai)
-            if len(peer_indices) > max_peers_per_ray:
-                peer_indices = list(rng.choice(peer_indices, size=max_peers_per_ray, replace=False))
-
-            best_dts = []
-            for bi in peer_indices:
-                fi_b, ri_b = ray_list[bi]
-                frame_b = frames[fi_b]
-                if frame_b is None or fi_b == fi_a:
-                    continue
-                d_b = frame_b["rays_dirs"][ri_b]
-                cos_ang = abs(float(np.dot(d_a, d_b)))
-                if cos_ang < cos_thresh:
-                    continue
-
-                qs = project_to_pixel(P_candidates.astype(np.float64), frame_b)
-                if qs is None:
-                    continue
-
-                # Vectorise across the n_search candidates for this peer:
-                # extract S patches into one (S, ph, ph) array, normalise,
-                # and dot against the (already-normalised) source patch.
-                gray_b = frame_b["gray"]
-                cw_b = frame_b["cw"]; ch_b = frame_b["ch"]
-                ph = 2 * patch_half + 1
-
-                ix = np.round(qs[:, 0])
-                iy = np.round(qs[:, 1])
-                # Treat NaNs (behind-camera) as out-of-bounds.
-                in_b = (
-                    np.isfinite(ix) & np.isfinite(iy)
-                    & (ix - patch_half >= 0) & (ix + patch_half < cw_b)
-                    & (iy - patch_half >= 0) & (iy + patch_half < ch_b)
-                )
-                if not in_b.any():
-                    n_pairs_eval += 1
-                    continue
-                ix_i = np.where(in_b, ix, 0).astype(np.int32)
-                iy_i = np.where(in_b, iy, 0).astype(np.int32)
-
-                # Gather all S patches with one fancy-indexing call.
-                # Build (S, ph, ph) row/col offset grid.
-                rr = (np.arange(ph) - patch_half)[None, :, None] + iy_i[:, None, None]
-                cc_ = (np.arange(ph) - patch_half)[None, None, :] + ix_i[:, None, None]
-                patches_b = gray_b[rr, cc_].astype(np.float32)         # (S, ph, ph)
-                m = patches_b.mean(axis=(1, 2), keepdims=True)
-                d = patches_b - m
-                s = np.sqrt((d * d).mean(axis=(1, 2), keepdims=True))
-                ok = (s.squeeze((1, 2)) > 1e-3) & in_b
-                if not ok.any():
-                    n_pairs_eval += 1
-                    continue
-                norm = d / np.where(s > 1e-3, s, 1.0)                  # (S, ph, ph)
-                # NCC = mean of element-wise product against normalised source.
-                scores = (norm * patch_a_n[None, :, :]).mean(axis=(1, 2))
-                # Mask out invalid candidates with -inf.
-                scores = np.where(ok, scores, -np.inf)
-                best_s = int(np.argmax(scores))
-                best_score = float(scores[best_s])
-                n_pairs_eval += 1
-                if np.isfinite(best_score) and best_score >= min_ncc:
-                    best_dts.append(float(ts[best_s] - t_a))
-
-            if best_dts:
-                dt = float(np.median(best_dts))
-                dt = max(-tol, min(tol, dt))
-                dt_sums[fi_a][ri_a] += dt
-                dt_counts[fi_a][ri_a] += 1
+        try:
+            args_iter = [(ci, ch, params) for ci, ch in enumerate(chunks)]
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_worker_init, initargs=(pickle_path,),
+            ) as ex:
+                done = 0
+                for chunk_id, results, n_pairs in ex.map(_worker_process_voxels, args_iter):
+                    for fi_a, ri_a, dt in results:
+                        dt_sums[fi_a][ri_a] += dt
+                        dt_counts[fi_a][ri_a] += 1
+                    n_pairs_eval += n_pairs
+                    done += 1
+                    elapsed = time.time() - t0
+                    eta = (elapsed / done) * (len(chunks) - done) if done else 0.0
+                    print(f"      chunk {done:3d}/{len(chunks)} "
+                          f"({100*done/len(chunks):.0f}%); "
+                          f"{n_pairs_eval:,} pairs total; "
+                          f"elapsed {elapsed:.0f}s; ETA {eta:.0f}s")
+        finally:
+            try:
+                os.unlink(pickle_path)
+            except OSError:
+                pass
 
     n_updated = 0
     for fi, frame in enumerate(frames):
@@ -444,11 +571,11 @@ def photometric_refine_pass(frames, *, tol: float, max_angle_deg: float,
         if not nz.any():
             continue
         delta = np.where(nz, dt_sums[fi] / np.maximum(c, 1), 0.0).astype(np.float32)
-        # Don't drift further from the original depth than `tol` over the whole run.
-        new_depth = frame["depths_current"] + delta
-        max_drift = tol  # cumulative drift bound from the initial sensor depth
+        # Cumulative drift from the captured sensor depth is bounded by tol so
+        # a runaway match can't push the depth far from the original reading.
         original = frame["depths_init"]
-        new_depth = np.clip(new_depth, original - max_drift, original + max_drift)
+        new_depth = np.clip(frame["depths_current"] + delta,
+                            original - tol, original + tol)
         frame["depths_current"] = new_depth
         n_updated += int(nz.sum())
 
@@ -476,7 +603,8 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
                 patch_half: int = 2,
                 n_search: int = 5,
                 min_ncc: float = 0.6,
-                max_peers_per_ray: int = 6) -> None:
+                max_peers_per_ray: int = 6,
+                workers: int = 1) -> None:
     wmin = np.asarray(world_min, dtype=np.float64)
     wmax = np.asarray(world_max, dtype=np.float64)
     shape = tuple(int(np.ceil((wmax[i] - wmin[i]) / voxel_size)) for i in range(3))
@@ -555,6 +683,7 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
                     frames, tol=tol, max_angle_deg=max_angle_deg,
                     patch_half=patch_half, n_search=n_search,
                     min_ncc=min_ncc, max_peers_per_ray=max_peers_per_ray,
+                    workers=workers,
                 )
                 print(f"    photo sub-pass {sub+1}/{photo_iterations}: "
                       f"{n_upd:,} rays updated, {n_pairs:,} ray-pair NCCs "
@@ -629,6 +758,10 @@ def main() -> None:
                     help="reject peer matches with NCC below this")
     ap.add_argument("--max-peers-per-ray", type=int, default=6,
                     help="cap on peer rays evaluated per source ray")
+    ap.add_argument("--workers", type=int,
+                    default=max(1, (os.cpu_count() or 2) - 2),
+                    help="worker processes for the photometric refinement "
+                         "(1 disables multiprocessing). Default cpu_count − 2.")
     args = ap.parse_args()
 
     reconstruct(
@@ -648,6 +781,7 @@ def main() -> None:
         n_search=args.n_search,
         min_ncc=args.min_ncc,
         max_peers_per_ray=args.max_peers_per_ray,
+        workers=args.workers,
     )
 
 
