@@ -59,6 +59,7 @@ class VoxelRoom:
         self._frames_ingested = 0
         self._frames_rejected_drift = 0
         self._frames_rejected_jump = 0
+        self._frames_corrected = 0
         # kd-tree over occupied voxel centres (world m). Rebuilt lazily as
         # the grid grows so we can detect frames whose ARCore pose drifted.
         self._kdtree = None
@@ -146,8 +147,8 @@ class VoxelRoom:
     # distance, the frame's pose has drifted and we reject it.
 
     DRIFT_MATCH_RADIUS_M = 0.20      # max search radius for "near existing"
-    DRIFT_MIN_MATCH_FRACTION = 0.30  # need this much overlap to invoke check
-    DRIFT_REJECT_DIST_M = 0.04       # median displacement that's too far
+    DRIFT_MIN_MATCH_FRACTION = 0.30  # need this much overlap to correct/check
+    DRIFT_REJECT_DIST_M = 0.10       # median displacement that's beyond ICP
     DRIFT_MIN_VOXELS_FOR_CHECK = 1500  # grid needs to be populated enough
     # Pose-jump rejection: ARCore re-localisations cause the camera to
     # teleport between consecutive frames. At streaming cadence (≈5–15 fps)
@@ -188,20 +189,30 @@ class VoxelRoom:
 
     def _check_drift(self, world_points: np.ndarray) -> dict | None:
         """Return None if no judgement (tree empty / no overlap), otherwise
-        median nearest-neighbour distance + overlap fraction."""
+        median nearest-neighbour distance + overlap fraction + the median
+        displacement vector (so callers can apply it as a translation
+        correction). Distance is the magnitude of the per-point vector;
+        the median vector itself isn't necessarily of magnitude
+        median_dist (medians don't commute), but it's the right ICP-step-1
+        translation."""
         tree = self._kdtree
         if tree is None or world_points.size == 0:
             return None
-        dists, _ = tree.query(world_points, k=1,
-                              distance_upper_bound=self.DRIFT_MATCH_RADIUS_M)
+        dists, idxs = tree.query(world_points, k=1,
+                                 distance_upper_bound=self.DRIFT_MATCH_RADIUS_M)
         finite = np.isfinite(dists)
         n_match = int(finite.sum())
         if n_match == 0:
             return None
+        # Per-point displacement: existing voxel centre minus new point.
+        matched_centers = tree.data[idxs[finite]]            # (n_match, 3)
+        displacements = matched_centers - world_points[finite]
+        median_disp = np.median(displacements, axis=0).astype(np.float32)
         return {
             "median_dist": float(np.median(dists[finite])),
             "match_fraction": float(n_match / world_points.shape[0]),
             "matches": n_match,
+            "median_disp": median_disp,
         }
 
     def ingest_frame(self, frame: dict[str, Any]) -> tuple[int, dict | None]:
@@ -219,32 +230,56 @@ class VoxelRoom:
                 self._frames_ingested += 1
             return 0, None
 
+        raw_cam = cam.astype(np.float32)   # before ICP correction; used for
+                                            # frame-to-frame jump detection.
+
         with self._lock:
-            # Pose-jump rejection: compare camera position to last accepted
-            # frame's pose. A big jump in a single inter-frame interval is
-            # ARCore re-localising, not the user moving. Update the anchor
-            # only on accept so a streak of rejections doesn't drift the
-            # reference.
+            # Pose-jump rejection: compare RAW camera position to the
+            # previous RAW pose. ARCore re-localisations show up as a
+            # sudden jump between consecutive raw poses. Update the anchor
+            # on EVERY frame (accept or reject) so we re-sync to the new
+            # world frame instead of rejecting in a loop.
             if self._last_cam_origin is not None:
-                jump = float(np.linalg.norm(cam - self._last_cam_origin))
+                jump = float(np.linalg.norm(raw_cam - self._last_cam_origin))
                 if jump >= self.POSE_JUMP_REJECT_M:
                     self._frames_rejected_jump += 1
                     self._frames_ingested += 1
+                    self._last_cam_origin = raw_cam
                     return -1, {"jump_m": jump}
+            self._last_cam_origin = raw_cam
 
             self._maybe_rebuild_kdtree()
             check = self._check_drift(points)
+
+            # ICP-step-1 translation correction. When the new frame
+            # substantially overlaps existing scan content but its points
+            # are systematically offset, snap the WHOLE frame by the
+            # median displacement before integrating. This is what keeps
+            # gradual ARCore drift from accumulating into ghost walls:
+            # each frame anchors itself to the existing surface instead
+            # of trusting ARCore's drifting world frame absolutely.
+            #
+            # Only correct when (a) we have enough overlap to trust the
+            # measurement and (b) the residual is in ICP's reach (≤ 10 cm).
+            # Larger residuals indicate something worse than gradual drift
+            # — reject those.
             if (check is not None
-                and check["match_fraction"] >= self.DRIFT_MIN_MATCH_FRACTION
-                and check["median_dist"]    >= self.DRIFT_REJECT_DIST_M):
-                self._frames_rejected_drift += 1
-                self._frames_ingested += 1
-                return -1, check
+                and check["match_fraction"] >= self.DRIFT_MIN_MATCH_FRACTION):
+                if check["median_dist"] >= self.DRIFT_REJECT_DIST_M:
+                    self._frames_rejected_drift += 1
+                    self._frames_ingested += 1
+                    return -1, check
+                # Apply correction. Only the points (and our local cam
+                # copy, for diagnostic completeness) get shifted; the
+                # raw_cam used as next-frame's jump-anchor is left alone.
+                disp = check["median_disp"]
+                if np.linalg.norm(disp) > 1e-4:  # don't bother for sub-mm
+                    points = (points + disp).astype(np.float32)
+                    self._frames_corrected += 1
 
         n = self.insert_points(points, colors)
         with self._lock:
             self._frames_ingested += 1
-            self._last_cam_origin = cam.astype(np.float32)
         return n, check
 
     # ---- persistence -----------------------------------------------------
@@ -325,6 +360,7 @@ class VoxelRoom:
                 "frames_ingested": self._frames_ingested,
                 "frames_rejected_drift": self._frames_rejected_drift,
                 "frames_rejected_jump": self._frames_rejected_jump,
+                "frames_corrected": self._frames_corrected,
                 "bbox": bbox,
             }
 

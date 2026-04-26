@@ -467,7 +467,13 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     drift_tag = ""
                     if drift is not None and "median_dist" in drift:
+                        disp = drift.get("median_disp")
+                        applied = (disp is not None
+                                   and drift["match_fraction"] >= voxel_room.DRIFT_MIN_MATCH_FRACTION)
                         drift_tag = f" drift={drift['median_dist']*100:.1f}cm@{drift['match_fraction']*100:.0f}%"
+                        if applied:
+                            disp_norm = float((disp * disp).sum() ** 0.5)
+                            drift_tag += f" corr={disp_norm*100:.1f}cm"
                     ingest_summary = f" → wrote {n_written}pts{drift_tag}, total={stats['voxels']}vox in {stats['chunks']}ch"
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
