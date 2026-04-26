@@ -62,9 +62,9 @@ def frame_to_world_points(
     frame: dict[str, Any],
     *,
     near_m: float = 0.05,
-    far_m: float = 4.0,
-    floor_y_m: float = -0.3,
-    stride: int = 1,
+    far_m: float = 6.0,
+    floor_y_m: float = -100.0,   # disabled by default; flip the buffer Y axis
+    stride: int = 1,             # was the actual cause of sub-floor points.
     with_colors: bool = False,
 ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Unproject a parsed /frame dict to world-space points.
@@ -100,7 +100,12 @@ def frame_to_world_points(
         height, width = depth.shape
 
     # Pixel grid → normalized depth-buffer coords (pixel centres).
-    js = (np.arange(height, dtype=np.float64) + 0.5) / height
+    # The W3C Depth Sensing spec puts buffer (0,0) at the bottom-left (Y up),
+    # but Chrome's actual array storage is row-0-at-top. So row index `j` of
+    # the array sits at v_buffer = 1 − (j+0.5)/H, not (j+0.5)/H.
+    # Confirmed empirically: with the naive (j+0.5)/H mapping the live
+    # depth-overlay's vertical axis was inverted relative to the camera image.
+    js = 1.0 - (np.arange(height, dtype=np.float64) + 0.5) / height
     is_ = (np.arange(width, dtype=np.float64) + 0.5) / width
     Ud, Vd = np.meshgrid(is_, js, indexing="xy")  # both shape (H, W)
 

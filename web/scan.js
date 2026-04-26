@@ -358,9 +358,13 @@ function renderDepthOverlay(depthInfo) {
         continue;
       }
 
-      // Buffer Y-down: by=0 = top row of the array. v_d is also Y-down.
+      // The matrix's v_d uses Y-up (origin bottom-left, per W3C spec) but
+      // the underlying array is stored row-0-at-top (the conventional image
+      // layout), so we flip the row index when sampling. This is the only
+      // way the user's empirical "left-right correct, up-down inverted"
+      // observation hangs together: u stays direct, v gets flipped.
       const bx = Math.min(W - 1, Math.max(0, Math.floor(u_d * W)));
-      const by = Math.min(H - 1, Math.max(0, Math.floor(v_d * H)));
+      const by = Math.min(H - 1, Math.max(0, Math.floor((1.0 - v_d) * H)));
       const d = u16[by * W + bx] * r2m;
 
       let r, g, b, a;

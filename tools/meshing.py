@@ -108,7 +108,7 @@ def _trilinear_colors(block: np.ndarray, verts: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def extract_mesh(voxel_room: VoxelRoom, *, iso: float = 1.0, smooth_kernel: int = 3):
+def extract_mesh(voxel_room: VoxelRoom, *, iso: float = 0.5, smooth_kernel: int = 1):
     """Return (verts, faces, colors) in world metres / RGB uint8, or
     (None, None, None) if there's no surface to mesh."""
     from skimage.measure import marching_cubes
@@ -158,7 +158,7 @@ def write_glb(verts: np.ndarray, faces: np.ndarray, colors: np.ndarray | None, p
 
 
 def remesh_to_glb(
-    voxel_room: VoxelRoom, path: Path | str, *, iso: float = 1.0
+    voxel_room: VoxelRoom, path: Path | str, *, iso: float = 0.5
 ) -> Optional[dict]:
     verts, faces, colors = extract_mesh(voxel_room, iso=iso)
     if verts is None:
