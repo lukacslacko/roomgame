@@ -682,11 +682,12 @@ def run_server(port: int, use_https: bool, cert_dir: Path, voxel_size_m: float) 
     if host:
         say(f"  On the same Wi-Fi:       {scheme}://{host}:{port}/")
     say(f"  On the same Wi-Fi (IP):  {phone_url}")
-    say(f"  Phone scanner:           {phone_url}scan.html")
+    say(f"  Phone landing:           {phone_url}")
     say(f"  Laptop game/viewer:      {scheme}://localhost:{port}/game.html")
+    say(f"  Laptop cube viewer:      {scheme}://localhost:{port}/cubeview.html")
 
-    say("\nScan this QR code on your phone (open scan.html):\n")
-    print_qr_to_stderr(phone_url + "scan.html")
+    say("\nScan this QR code on your phone (opens the landing page):\n")
+    print_qr_to_stderr(phone_url)
 
     if use_https:
         sans = ["localhost", "127.0.0.1", ip]

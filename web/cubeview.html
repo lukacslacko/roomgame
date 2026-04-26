@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomgame · Cube viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+    }
+  }
+  </script>
+  <style>
+    html, body.viewer {
+      height: 100vh;
+      max-height: 100vh;
+      overflow: hidden;
+    }
+    body.viewer { display: flex; flex-direction: column; }
+    #stage { flex: 1 1 0; min-height: 0; position: relative; overflow: hidden; }
+    #stage canvas { display: block; width: 100% !important; height: 100% !important; }
+    .toolbar {
+      display: flex;
+      gap: 0.6rem;
+      align-items: center;
+      padding: 0.6rem 1rem;
+      background: #111;
+      border-bottom: 1px solid #222;
+      font-size: 0.9rem;
+      flex-wrap: wrap;
+    }
+    .toolbar button {
+      background: #2563eb;
+      color: white;
+      border: 0;
+      border-radius: 0.4rem;
+      padding: 0.4rem 0.85rem;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    .toolbar button.toggle.on { background: #4caf50; }
+    .toolbar button:disabled { background: #333; cursor: not-allowed; }
+    .toolbar .spacer { flex: 1; }
+    .toolbar .stat { opacity: 0.75; font-variant-numeric: tabular-nums; }
+    .toolbar .stat b { color: #6ec4ff; font-weight: 500; }
+    .toolbar label {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      opacity: 0.85;
+    }
+    .toolbar input[type="range"] { width: 9rem; accent-color: #6ec4ff; }
+    .toolbar input[type="number"] {
+      background: #1a1a1a; color: #eaeaea; border: 1px solid #333;
+      border-radius: 0.3rem; padding: 0.2rem 0.4rem; font-size: 0.85rem; width: 4rem;
+    }
+    .keys { display: flex; align-items: center; gap: 0.25rem; opacity: 0.85; }
+    .keys kbd {
+      background: #1f1f24;
+      border: 1px solid #353541;
+      border-bottom-color: #15151b;
+      border-radius: 0.25rem;
+      padding: 0.05rem 0.4rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      color: #d8e1ff;
+    }
+    .keys-hint { margin-left: 0.4rem; opacity: 0.6; font-size: 0.82rem; }
+  </style>
+</head>
+<body class="viewer">
+  <div class="toolbar">
+    <button id="reloadBtn">Reload</button>
+    <button id="autoBtn" class="toggle on" title="Toggle 1 Hz polling">Auto-refresh</button>
+    <button id="recenterBtn" title="Frame the camera on the cube cloud">Recenter</button>
+    <label>thr <input id="thr" type="range" min="0" max="1" step="0.01" value="0.25"><span id="thrVal">0.25</span></label>
+    <label>min obs <input id="minObs" type="number" min="1" max="50" step="1" value="2"></label>
+    <span class="spacer"></span>
+    <span class="keys">
+      <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>
+      <kbd>Space</kbd>/<kbd>Shift</kbd>
+      <span class="keys-hint">move ·</span>
+      <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd>
+      <span class="keys-hint">or drag to look</span>
+    </span>
+    <span class="spacer"></span>
+    <span class="stat">cubes <b id="stCubes">—</b></span>
+    <span class="stat">size <b id="stSize">—</b></span>
+    <span class="stat">frames <b id="stFrames">—</b></span>
+    <span class="stat" id="stMsg"></span>
+  </div>
+  <div id="stage"></div>
+  <script type="module" src="./cubeview.js"></script>
+</body>
+</html>

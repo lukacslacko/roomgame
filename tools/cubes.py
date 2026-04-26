@@ -36,10 +36,10 @@ import fusion
 class CubeGrid:
     """Dense occupancy-cube grid populated from WebXR depth frames."""
 
-    # Defaults sized for a typical room: 6 m east-west, 6 m north-south,
-    # 3.2 m floor-to-ceiling (with a small headroom below floor for noise).
-    DEFAULT_WORLD_MIN = (-3.0, -0.3, -3.0)
-    DEFAULT_WORLD_MAX = ( 3.0,  2.9,  3.0)
+    # Defaults sized for a multi-room walk: 20 m east-west × 20 m north-south
+    # × 5 m floor-to-ceiling, with a small headroom below floor for noise.
+    DEFAULT_WORLD_MIN = (-10.0, -0.3, -10.0)
+    DEFAULT_WORLD_MAX = ( 10.0,  4.7,  10.0)
     DEFAULT_CUBE_SIZE = 0.25
 
     def __init__(
@@ -81,9 +81,15 @@ class CubeGrid:
         )
         self._cube_index_flat = np.stack([ix.ravel(), iy.ravel(), iz.ravel()], axis=1).astype(np.int32)
         cube_corners = wmin[None, :] + self._cube_index_flat.astype(np.float64) * self.cube_size
-        self._sample_world_flat = (
+        # (Ncubes, 27, 3) world-space sample points.
+        self._sample_world = (
             cube_corners[:, None, :] + self.cube_size * self._sample_offsets[None, :, :]
-        ).reshape(-1, 3).astype(np.float64)
+        ).astype(np.float64)
+        self._cube_centers = (cube_corners + 0.5 * self.cube_size).astype(np.float64)
+        # Camera-depth limit for the coarse cull; ARCore depth tops out around
+        # 8 m and we don't want to waste the per-cube work on cubes that have
+        # no chance of being measured.
+        self._max_depth_m = 8.0
 
     @property
     def n_cubes(self) -> int:
@@ -114,41 +120,64 @@ class CubeGrid:
         Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
         V_inv = np.linalg.inv(V)
 
-        pts_world = self._sample_world_flat                                   # (M, 3)
-        M = pts_world.shape[0]
+        # ----- coarse cull: only consider cubes whose centre is plausibly
+        # in the camera's view, within depth-sensor range. At 20 m × 20 m × 5 m
+        # there are ~10⁵ cubes; without this cull the per-frame work is dominated
+        # by projecting cubes that are kilometres outside the frustum.
+        Nc = self._cube_centers.shape[0]
+        cen_h = np.concatenate([self._cube_centers, np.ones((Nc, 1))], axis=1)
+        cen_view = cen_h @ V_inv.T
+        cen_view_xyz = cen_view[:, :3] / np.where(np.abs(cen_view[:, 3:4]) < 1e-12, 1.0, cen_view[:, 3:4])
+        cen_dist = -cen_view_xyz[:, 2]
+        cen_clip = np.concatenate([cen_view_xyz, np.ones((Nc, 1))], axis=1) @ P.T
+        cen_cw = cen_clip[:, 3:4]
+        cen_cw_safe = np.where(np.abs(cen_cw) < 1e-12, 1.0, cen_cw)
+        cen_ndc = cen_clip[:, :2] / cen_cw_safe
 
-        # World → view.
-        pts_h  = np.concatenate([pts_world, np.ones((M, 1))], axis=1)
+        cube_diag = self.cube_size * np.sqrt(3.0)
+        # NDC margin: a cube whose centre is up to ~one cube-radius outside the
+        # frustum can still have corners inside. At a 60° vertical FOV one cube
+        # edge subtends roughly cube_size / view_dist radians, so the NDC
+        # margin we'd need is bounded by ~cube_diag / dist. A flat 1.4 covers
+        # the practical range without false-rejecting near-frustum cubes.
+        coarse_keep = (
+            (cen_dist > 0.05)
+            & (cen_dist < self._max_depth_m + cube_diag)
+            & (np.abs(cen_ndc[:, 0]) < 1.4)
+            & (np.abs(cen_ndc[:, 1]) < 1.4)
+        )
+        keep_idx = np.nonzero(coarse_keep)[0]
+        if keep_idx.size == 0:
+            self.frames += 1
+            return {"frame": self.frames, "visible": 0, "occupied": 0, "free": 0,
+                    "considered": 0}
+
+        # ----- fine pass: project all 27 samples per surviving cube.
+        sample_world = self._sample_world[keep_idx].reshape(-1, 3)             # (Ns*27, 3)
+        M = sample_world.shape[0]
+
+        pts_h  = np.concatenate([sample_world, np.ones((M, 1))], axis=1)
         view_h = pts_h @ V_inv.T
         w = view_h[:, 3:4]
-        w_safe = np.where(np.abs(w) < 1e-12, 1.0, w)
-        view = view_h[:, :3] / w_safe                                          # (M, 3)
-        # In WebGL conventions the camera looks down -Z, so view-space points
-        # *in front* of the camera have z<0. The "z-distance" used in the
-        # depth buffer (and against which we compare) is therefore -view.z.
+        view = view_h[:, :3] / np.where(np.abs(w) < 1e-12, 1.0, w)
+        # WebGL: camera looks down -Z, so points in front have view.z < 0.
         view_dist = -view[:, 2]
 
-        # View → clip → NDC.
         view4 = np.concatenate([view, np.ones((M, 1))], axis=1)
         clip = view4 @ P.T
         cw = clip[:, 3:4]
-        cw_safe = np.where(np.abs(cw) < 1e-12, 1.0, cw)
-        ndc = clip[:, :3] / cw_safe
+        ndc = clip[:, :3] / np.where(np.abs(cw) < 1e-12, 1.0, cw)
 
-        # NDC ∈ [-1, 1]² → normalized view coords ∈ [0, 1]².
         u_v = (ndc[:, 0] + 1.0) * 0.5
         v_v = (ndc[:, 1] + 1.0) * 0.5
-
-        # Apply normDepthBufferFromNormView to (u_v, v_v, 0, 1) → (u_d, v_d).
         nv_h = np.stack([u_v, v_v, np.zeros(M), np.ones(M)], axis=1)
         nd_h = nv_h @ Bd.T
         nw = nd_h[:, 3:4]
-        nw_safe = np.where(np.abs(nw) < 1e-12, 1.0, nw)
-        u_d = (nd_h[:, 0:1] / nw_safe).ravel()
-        v_d = (nd_h[:, 1:2] / nw_safe).ravel()
+        u_d = (nd_h[:, 0:1] / np.where(np.abs(nw) < 1e-12, 1.0, nw)).ravel()
+        v_d = (nd_h[:, 1:2] / np.where(np.abs(nw) < 1e-12, 1.0, nw)).ravel()
 
-        # Per fusion.py: Chrome stores the buffer with column index running
-        # opposite to the matrix's u_d direction; row follows v_d directly.
+        # Per fusion.py / scan.js: Chrome stores the buffer with column index
+        # running opposite to the matrix's u_d; row follows v_d directly.
         bx = np.floor((1.0 - u_d) * width).astype(np.int32)
         by = np.floor(v_d * height).astype(np.int32)
 
@@ -164,25 +193,18 @@ class CubeGrid:
 
         bx_clamped = np.clip(bx, 0, width - 1)
         by_clamped = np.clip(by, 0, height - 1)
-        measured = depth[by_clamped, bx_clamped]                              # (M,)
+        measured = depth[by_clamped, bx_clamped]
 
-        # Reshape (M,) → (Ncubes, 27).
-        Nc = M // 27
-        in_frame = in_frame.reshape(Nc, 27)
-        measured = measured.reshape(Nc, 27)
-        view_dist = view_dist.reshape(Nc, 27)
-
+        Ns = keep_idx.size
+        in_frame = in_frame.reshape(Ns, 27)
+        measured = measured.reshape(Ns, 27)
+        view_dist = view_dist.reshape(Ns, 27)
         valid = in_frame & (measured > 0.0)
-
-        # Cube is "fully visible" iff every one of its 27 samples projects
-        # into the frame *and* has a valid (non-zero) depth measurement.
         cube_visible = np.all(valid, axis=1)
 
-        # For each visible sample, classify against the cube's surface band.
         half = 0.5 * self.cube_size
-        delta = measured - view_dist                                          # >0 → measured beyond sample
+        delta = measured - view_dist
         surface  = (np.abs(delta) <= half)
-        free_pt  = (delta >  half)
         occluded = (delta < -half)
 
         any_surface  = np.any(surface  & valid, axis=1)
@@ -191,16 +213,18 @@ class CubeGrid:
         is_occupied = cube_visible & any_surface
         is_free     = cube_visible & ~any_surface & ~any_occluded
 
+        global_idx = self._cube_index_flat[keep_idx]
         if np.any(is_occupied):
-            idx = self._cube_index_flat[is_occupied]
+            idx = global_idx[is_occupied]
             np.add.at(self.occupied, (idx[:, 0], idx[:, 1], idx[:, 2]), 1)
         if np.any(is_free):
-            idx = self._cube_index_flat[is_free]
+            idx = global_idx[is_free]
             np.add.at(self.free, (idx[:, 0], idx[:, 1], idx[:, 2]), 1)
 
         self.frames += 1
         return {
             "frame": self.frames,
+            "considered": int(keep_idx.size),
             "visible": int(cube_visible.sum()),
             "occupied": int(is_occupied.sum()),
             "free": int(is_free.sum()),
