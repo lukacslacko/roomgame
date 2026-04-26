@@ -44,12 +44,30 @@
     .toolbar .spacer { flex: 1; }
     .toolbar .stat { opacity: 0.75; font-variant-numeric: tabular-nums; }
     .toolbar .stat b { color: #6ec4ff; font-weight: 500; }
+    .keys { display: flex; align-items: center; gap: 0.25rem; opacity: 0.85; }
+    .keys kbd {
+      background: #1f1f24;
+      border: 1px solid #353541;
+      border-bottom-color: #15151b;
+      border-radius: 0.25rem;
+      padding: 0.05rem 0.4rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      color: #d8e1ff;
+    }
+    .keys-hint { margin-left: 0.5rem; opacity: 0.6; font-size: 0.82rem; }
   </style>
 </head>
 <body class="viewer">
   <div class="toolbar">
     <button id="reloadBtn">Re-mesh & reload</button>
     <button id="reloadOnlyBtn">Reload mesh</button>
+    <span class="spacer"></span>
+    <span class="keys">
+      <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>
+      <kbd>Space</kbd>/<kbd>Shift</kbd>
+      <span class="keys-hint">+ drag to look</span>
+    </span>
     <span class="spacer"></span>
     <span class="stat">verts <b id="stVerts">—</b></span>
     <span class="stat">faces <b id="stFaces">—</b></span>
