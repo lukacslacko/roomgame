@@ -287,31 +287,33 @@ function captureCameraRGBA(view, width, height) {
 
 // ----- depth overlay ------------------------------------------------------
 //
-// Paints the raw cpu-depth buffer onto a 2D canvas with bands alternating
-// dark/light per 1 m of depth. Because the depth buffer is in landscape
-// sensor orientation but the phone is held portrait, we transpose while
-// drawing so the overlay roughly aligns with the camera passthrough behind it
-// (assumes a 90° rotation between buffer u and view v, which is what we see
-// in practice on Pixels — the normDepthBufferFromNormView matrix had a
-// `(0, 1, -0.82, 0)` rotation block when we inspected it).
+// Paints the cpu-depth buffer onto a fullscreen 2D canvas with bands
+// alternating dark/light per 1 m of depth. We use `normDepthBufferFromNormView`
+// to map each output pixel (= view position) to the right depth-buffer pixel,
+// so the overlay aligns with the camera passthrough no matter how the phone
+// is held (portrait, landscape, rotated). Per the W3C Depth Sensing spec,
+// view coords have origin bottom-left (Y up) and depth-buffer coords have
+// origin top-left (Y down), with the array stored row-major top-row-first.
 //
 // Colours:
-//   depth == 0       → magenta (no measurement / out of confidence range)
+//   d == 0           → magenta (no measurement / low confidence)
 //   d ∈ [0, 1) m     → dark
 //   d ∈ [1, 2) m     → light
 //   d ∈ [2, 3) m     → dark
-//   ...
+//   ... etc.
 //   d ≥ overlayMaxM  → black (clamped, treated as "far")
+//   pixel outside buffer → fully transparent
+const OVERLAY_W = 120;        // canvas pixel grid; 120×210 ≈ 25k pixels, fast.
+const OVERLAY_H = 210;
+const OVERLAY_MAX_M = 8.0;
 function renderDepthOverlay(depthInfo) {
   const W = depthInfo.width;
   const H = depthInfo.height;
-  // Canvas size is the *rotated* depth-buffer shape so 1 buffer pixel = 1
-  // canvas pixel after the transpose, with no resampling.
-  if (depthOverlay.width !== H || depthOverlay.height !== W) {
-    depthOverlay.width = H;
-    depthOverlay.height = W;
+  if (depthOverlay.width !== OVERLAY_W || depthOverlay.height !== OVERLAY_H) {
+    depthOverlay.width = OVERLAY_W;
+    depthOverlay.height = OVERLAY_H;
     depthOverlayCtx = depthOverlay.getContext("2d");
-    depthOverlayImageData = depthOverlayCtx.createImageData(H, W);
+    depthOverlayImageData = depthOverlayCtx.createImageData(OVERLAY_W, OVERLAY_H);
   }
   const ctx = depthOverlayCtx;
   const imgData = depthOverlayImageData;
@@ -320,27 +322,55 @@ function renderDepthOverlay(depthInfo) {
   const xrData = depthInfo.data;
   const buf = xrData instanceof ArrayBuffer ? xrData : xrData.buffer;
   const off = xrData instanceof ArrayBuffer ? 0 : xrData.byteOffset;
-  // We only handle the luminance-alpha format here (the only one Chrome
-  // returns in practice). Float32 would need a Float32Array source.
   const u16 = new Uint16Array(buf, off, W * H);
   const r2m = depthInfo.rawValueToMeters;
 
-  const overlayMaxM = 8.0;
-  for (let by = 0; by < H; by++) {
-    for (let bx = 0; bx < W; bx++) {
+  // Column-major matrix: (u_d, v_d, 0, 1) = M @ (u_v, v_v, 0, 1).
+  // Read row 0 (→ u_d) and row 1 (→ v_d). For (u_v, v_v, 0, 1) the
+  // contributing components are M[col*4 + row] for col ∈ {0, 1, 3}.
+  const xform = depthInfo.normDepthBufferFromNormView;
+  const M = xform && xform.matrix;
+  if (!M) {
+    // No mapping available — clear the canvas and bail.
+    px.fill(0);
+    ctx.putImageData(imgData, 0, 0);
+    return;
+  }
+  const m00 = M[0], m04 = M[4], m12 = M[12];   // u_d = m00*u_v + m04*v_v + m12
+  const m01 = M[1], m05 = M[5], m13 = M[13];   // v_d = m01*u_v + m05*v_v + m13
+
+  for (let oy = 0; oy < OVERLAY_H; oy++) {
+    // Output canvas Y is top-down (CSS); view Y is bottom-up. Flip.
+    const v_v = 1.0 - (oy + 0.5) / OVERLAY_H;
+    for (let ox = 0; ox < OVERLAY_W; ox++) {
+      const u_v = (ox + 0.5) / OVERLAY_W;
+      const u_d = m00 * u_v + m04 * v_v + m12;
+      const v_d = m01 * u_v + m05 * v_v + m13;
+      const dst = (oy * OVERLAY_W + ox) * 4;
+
+      if (u_d < 0 || u_d > 1 || v_d < 0 || v_d > 1) {
+        // View ray maps outside the depth buffer — leave the canvas pixel
+        // transparent so camera passthrough shows cleanly here.
+        px[dst]     = 0;
+        px[dst + 1] = 0;
+        px[dst + 2] = 0;
+        px[dst + 3] = 0;
+        continue;
+      }
+
+      // Buffer Y-down: by=0 = top row of the array. v_d is also Y-down.
+      const bx = Math.min(W - 1, Math.max(0, Math.floor(u_d * W)));
+      const by = Math.min(H - 1, Math.max(0, Math.floor(v_d * H)));
       const d = u16[by * W + bx] * r2m;
-      // Counter-clockwise 90° rotation: buffer (bx, by) → output (by, W-1-bx).
-      const ox = by;
-      const oy = W - 1 - bx;
-      const dst = (oy * H + ox) * 4;
+
       let r, g, b, a;
       if (d <= 0.0) {
-        r = 220; g = 0; b = 220; a = 200;        // no measurement
-      } else if (d >= overlayMaxM) {
-        r = 0; g = 0; b = 0; a = 200;            // far / out of range
+        r = 220; g = 0; b = 220; a = 200;
+      } else if (d >= OVERLAY_MAX_M) {
+        r = 0; g = 0; b = 0; a = 200;
       } else {
         const band = Math.floor(d);
-        const v = (band & 1) === 0 ? 35 : 220;   // alternate dark/light
+        const v = (band & 1) === 0 ? 35 : 220;
         r = v; g = v; b = v; a = 220;
       }
       px[dst]     = r;
