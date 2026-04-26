@@ -341,6 +341,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
             return
+        if path == "/reset":
+            if voxel_room is None:
+                self._send_text(503, "voxel store not initialised\n")
+                return
+            voxel_room.reset()
+            sys.stderr.write(f"[{self.address_string()}] RESET — voxel grid wiped\n")
+            self._send_json(200, {"reset": True})
+            return
         if path == "/remesh":
             if voxel_room is None:
                 self._send_text(503, "voxel store not initialised — install deps\n")
@@ -439,10 +447,28 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         ingest_summary = ""
         if voxel_room is not None:
             try:
-                # ingest_frame returns the number of points written.
-                n_written = voxel_room.ingest_frame(frame)
+                # ingest_frame returns (n_points_written, drift_check_or_None).
+                # n_points_written = -1 when the frame was rejected as drifted.
+                n_written, drift = voxel_room.ingest_frame(frame)
                 stats = voxel_room.stats()
-                ingest_summary = f" → wrote {n_written}pts, total={stats['voxels']}vox in {stats['chunks']}ch"
+                if n_written < 0:
+                    if drift and "jump_m" in drift:
+                        ingest_summary = (
+                            f" → REJECTED pose jump {drift['jump_m']*100:.0f}cm "
+                            f"(rej_jump={stats['frames_rejected_jump']})"
+                        )
+                    else:
+                        md = drift["median_dist"] if drift else float("nan")
+                        mf = drift["match_fraction"] if drift else float("nan")
+                        ingest_summary = (
+                            f" → REJECTED drift {md*100:.1f}cm@{mf*100:.0f}% "
+                            f"(rej_drift={stats['frames_rejected_drift']})"
+                        )
+                else:
+                    drift_tag = ""
+                    if drift is not None and "median_dist" in drift:
+                        drift_tag = f" drift={drift['median_dist']*100:.1f}cm@{drift['match_fraction']*100:.0f}%"
+                    ingest_summary = f" → wrote {n_written}pts{drift_tag}, total={stats['voxels']}vox in {stats['chunks']}ch"
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
                 return

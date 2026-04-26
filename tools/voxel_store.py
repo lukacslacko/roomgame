@@ -57,6 +57,25 @@ class VoxelRoom:
         self.chunks: dict[tuple[int, int, int], np.ndarray] = {}
         self._lock = Lock()
         self._frames_ingested = 0
+        self._frames_rejected_drift = 0
+        self._frames_rejected_jump = 0
+        # kd-tree over occupied voxel centres (world m). Rebuilt lazily as
+        # the grid grows so we can detect frames whose ARCore pose drifted.
+        self._kdtree = None
+        self._kdtree_built_at_voxels = 0
+        # Last accepted camera position, for pose-jump rejection.
+        self._last_cam_origin: np.ndarray | None = None
+
+    def reset(self) -> None:
+        """Wipe the grid + drift state. Used by /reset when the user wants
+        to throw away a drifted scan and start over without restarting."""
+        with self._lock:
+            self.chunks.clear()
+            self._kdtree = None
+            self._kdtree_built_at_voxels = 0
+            self._last_cam_origin = None
+            # Counters are kept (across-session totals); resets are rare and
+            # the absolute frames-ingested number is still informative.
 
     # ---- ingestion -------------------------------------------------------
 
@@ -117,15 +136,116 @@ class VoxelRoom:
             total_written += locs.shape[0]
         return total_written
 
-    def ingest_frame(self, frame: dict[str, Any]) -> int:
+    # ---- drift detection -------------------------------------------------
+    #
+    # When ARCore re-localises mid-scan, the same wall can land at two
+    # slightly-different world positions across frames; integrating both
+    # produces "ghost" parallel walls. We catch that with a kd-tree over
+    # currently-occupied voxel centres: if a new frame has substantial
+    # overlap with the existing surface but a large median nearest-neighbour
+    # distance, the frame's pose has drifted and we reject it.
+
+    DRIFT_MATCH_RADIUS_M = 0.20      # max search radius for "near existing"
+    DRIFT_MIN_MATCH_FRACTION = 0.30  # need this much overlap to invoke check
+    DRIFT_REJECT_DIST_M = 0.04       # median displacement that's too far
+    DRIFT_MIN_VOXELS_FOR_CHECK = 1500  # grid needs to be populated enough
+    # Pose-jump rejection: ARCore re-localisations cause the camera to
+    # teleport between consecutive frames. At streaming cadence (≈5–15 fps)
+    # honest motion is bounded by walking pace; anything past 30 cm in a
+    # single frame is almost certainly a re-localisation, not the user.
+    POSE_JUMP_REJECT_M = 0.30
+
+    def _count_active_voxels(self) -> int:
+        n = 0
+        for chunk in self.chunks.values():
+            n += int(np.count_nonzero(chunk[..., CHANNEL_HITS]))
+        return n
+
+    def _maybe_rebuild_kdtree(self) -> None:
+        """Rebuild the spatial index when the grid has grown materially.
+        Caller must hold self._lock."""
+        n = self._count_active_voxels()
+        if n < self.DRIFT_MIN_VOXELS_FOR_CHECK:
+            return
+        if self._kdtree is not None and n < 1.5 * max(1, self._kdtree_built_at_voxels):
+            return  # no significant change since last rebuild
+        from scipy.spatial import cKDTree
+        all_centers: list[np.ndarray] = []
+        for (ci, cj, ck), chunk in self.chunks.items():
+            occ = np.argwhere(chunk[..., CHANNEL_HITS] > 0)  # (M, 3) local idx
+            if occ.size == 0:
+                continue
+            global_idx = occ.astype(np.int64) + np.array(
+                [ci, cj, ck], dtype=np.int64
+            ) * CHUNK_SIZE
+            centers = (global_idx + 0.5) * self.voxel_size
+            all_centers.append(centers)
+        if not all_centers:
+            self._kdtree = None
+            return
+        self._kdtree = cKDTree(np.concatenate(all_centers, axis=0))
+        self._kdtree_built_at_voxels = n
+
+    def _check_drift(self, world_points: np.ndarray) -> dict | None:
+        """Return None if no judgement (tree empty / no overlap), otherwise
+        median nearest-neighbour distance + overlap fraction."""
+        tree = self._kdtree
+        if tree is None or world_points.size == 0:
+            return None
+        dists, _ = tree.query(world_points, k=1,
+                              distance_upper_bound=self.DRIFT_MATCH_RADIUS_M)
+        finite = np.isfinite(dists)
+        n_match = int(finite.sum())
+        if n_match == 0:
+            return None
+        return {
+            "median_dist": float(np.median(dists[finite])),
+            "match_fraction": float(n_match / world_points.shape[0]),
+            "matches": n_match,
+        }
+
+    def ingest_frame(self, frame: dict[str, Any]) -> tuple[int, dict | None]:
+        """Returns (n_points_written, diagnostic_or_None).
+
+        n_points_written is -1 when the frame was rejected; the
+        diagnostic dict identifies why ("jump_m" or "median_dist" /
+        "match_fraction"). diagnostic is also returned for accepted
+        frames when the kd-tree check ran, so callers can log it.
+        """
         import fusion  # tools/ on sys.path when serve.py runs as a script
-        result = fusion.frame_to_world_points(frame, with_colors=True)
-        # with_colors=True returns a 3-tuple
-        points, _cam, colors = result
+        points, cam, colors = fusion.frame_to_world_points(frame, with_colors=True)
+        if points.size == 0:
+            with self._lock:
+                self._frames_ingested += 1
+            return 0, None
+
+        with self._lock:
+            # Pose-jump rejection: compare camera position to last accepted
+            # frame's pose. A big jump in a single inter-frame interval is
+            # ARCore re-localising, not the user moving. Update the anchor
+            # only on accept so a streak of rejections doesn't drift the
+            # reference.
+            if self._last_cam_origin is not None:
+                jump = float(np.linalg.norm(cam - self._last_cam_origin))
+                if jump >= self.POSE_JUMP_REJECT_M:
+                    self._frames_rejected_jump += 1
+                    self._frames_ingested += 1
+                    return -1, {"jump_m": jump}
+
+            self._maybe_rebuild_kdtree()
+            check = self._check_drift(points)
+            if (check is not None
+                and check["match_fraction"] >= self.DRIFT_MIN_MATCH_FRACTION
+                and check["median_dist"]    >= self.DRIFT_REJECT_DIST_M):
+                self._frames_rejected_drift += 1
+                self._frames_ingested += 1
+                return -1, check
+
         n = self.insert_points(points, colors)
         with self._lock:
             self._frames_ingested += 1
-        return n
+            self._last_cam_origin = cam.astype(np.float32)
+        return n, check
 
     # ---- persistence -----------------------------------------------------
 
@@ -203,6 +323,8 @@ class VoxelRoom:
                 "chunk_size": CHUNK_SIZE,
                 "channels": CHANNELS,
                 "frames_ingested": self._frames_ingested,
+                "frames_rejected_drift": self._frames_rejected_drift,
+                "frames_rejected_jump": self._frames_rejected_jump,
                 "bbox": bbox,
             }
 

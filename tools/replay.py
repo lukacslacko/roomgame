@@ -122,28 +122,32 @@ def replay(frames_dir: Path, voxel_size: float, near_m: float, far_m: float,
                   f"(should be ≈ depth if pose+projection are consistent)")
             print("------------------------------\n")
 
-        # Same code path as the server's ingest, but with extra reporting.
-        pts, cam, rgb = fusion.frame_to_world_points(
+        # Same code path as the server's ingest — including the kd-tree
+        # drift check, so we can validate the same rejections offline.
+        pts_preview, cam, _ = fusion.frame_to_world_points(
             frame, near_m=near_m, far_m=far_m, with_colors=True
         )
-        n_world = int(pts.shape[0])
-        n_written = room.insert_points(pts, rgb) if n_world else 0
+        n_world = int(pts_preview.shape[0])
+        if n_world:
+            n_written, drift = room.ingest_frame(frame)
+        else:
+            n_written, drift = 0, None
         stats = room.stats()
         color_tag = "rgb" if frame.get("color") is not None else "grey"
-        # Median world point per frame: if the same wall is being scanned from
-        # different camera positions, the medians should cluster (small std).
-        # If the medians follow the camera around, fusion isn't applying the
-        # pose's translation/rotation correctly.
-        med = np.median(pts, axis=0) if n_world else np.array([np.nan] * 3)
+        med = np.median(pts_preview, axis=0) if n_world else np.array([np.nan] * 3)
+        drift_tag = ""
+        if drift is not None:
+            drift_tag = f" drift={drift['median_dist']*100:.1f}cm@{drift['match_fraction']*100:.0f}%"
+        wrote_tag = "REJECT" if n_written < 0 else f"+{n_written}pts"
         print(
             f"#{idx+1:3d} {path.name}  "
             f"cam=({cam[0]:+.2f},{cam[1]:+.2f},{cam[2]:+.2f}) "
             f"med_world=({med[0]:+.2f},{med[1]:+.2f},{med[2]:+.2f}) "
-            f"dist={np.linalg.norm(med - cam):.2f}m "
             f"depth(nz={100*n_nonzero/max(1,n_total):.0f}% "
             f"med={np.median(nonzero) if n_nonzero else 0:.2f}) "
-            f"col={color_tag} "
-            f"+{n_written}pts → {stats['voxels']}vox/{stats['chunks']}ch"
+            f"col={color_tag}{drift_tag} "
+            f"{wrote_tag} → {stats['voxels']}vox/{stats['chunks']}ch "
+            f"(rej={stats['frames_rejected_drift']})"
         )
 
     print()

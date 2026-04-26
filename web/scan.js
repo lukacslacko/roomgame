@@ -34,12 +34,33 @@ const hudTap = $("hudTap");
 const exitBtn = $("exitBtn");
 const depthOverlay = $("depthOverlay");
 const depthToggleBtn = $("depthToggleBtn");
+const resetBtn = $("resetBtn");
 let depthOverlayCtx = null;
 let depthOverlayImageData = null;
 let depthOverlayVisible = true;
 depthToggleBtn?.addEventListener("click", () => {
   depthOverlayVisible = !depthOverlayVisible;
   depthOverlay.classList.toggle("hidden", !depthOverlayVisible);
+});
+resetBtn?.addEventListener("click", async () => {
+  resetBtn.disabled = true;
+  try {
+    const r = await fetch("/reset", { method: "POST" });
+    if (r.ok) {
+      framesSent = 0;
+      framesSkippedEmulated = 0;
+      hudFrames.textContent = "0";
+      hudLast.textContent = "grid wiped";
+      console.log("voxel grid reset");
+    } else {
+      hudLast.textContent = `reset failed ${r.status}`;
+    }
+  } catch (e) {
+    hudLast.textContent = "reset network err";
+    console.error("/reset failed", e);
+  } finally {
+    resetBtn.disabled = false;
+  }
 });
 
 let session = null;
