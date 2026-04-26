@@ -186,7 +186,7 @@ recenterBtn.addEventListener("click", () => recenter(true));
 // ambient up to 1.0 so each voxel renders as its captured colour without
 // any shading. Useful when uneven scan coverage (e.g. half-captured ceiling)
 // throws the lit version into harsh contrasts.
-let flatMode = false;
+let flatMode = true;
 function applyLightingMode() {
   if (flatMode) {
     ambient.intensity = 1.0;
@@ -220,6 +220,7 @@ lightingBtn.addEventListener("click", () => {
   flatMode = !flatMode;
   applyLightingMode();
 });
+applyLightingMode();   // sync renderer/lighting/button label with the flatMode default
 
 function onResize() {
   const w = stage.clientWidth || 1;
