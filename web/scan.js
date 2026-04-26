@@ -46,8 +46,12 @@ let session = null;
 let xrRefSpace = null;
 let gl = null;
 let xrCanvas = null;
-let captureRequested = false;
+let streaming = false;           // tap toggles this. while true, send frames
+                                 // as fast as the server returns 200.
+let fetchInFlight = false;       // backpressure: send next frame only when
+                                 // the previous one has finished posting.
 let framesSent = 0;
+let framesSkippedEmulated = 0;   // dropped because ARCore was tracking-emulated
 let depthBufferLogged = false;
 
 // Camera-access state. Initialised lazily on first frame that has both a
@@ -145,7 +149,10 @@ async function startSession() {
   hudStatus.textContent = `depth=${fmt} color=?`;
 
   session.addEventListener("end", onSessionEnd);
-  session.addEventListener("select", () => { captureRequested = true; });
+  session.addEventListener("select", () => {
+    streaming = !streaming;
+    hudTap.textContent = streaming ? "streaming · tap to stop" : "tap to start streaming";
+  });
   exitBtn.addEventListener("click", () => session && session.end());
 
   gate.style.display = "none";
@@ -159,6 +166,8 @@ function onSessionEnd() {
   session = null;
   xrRefSpace = null;
   xrBinding = null;
+  streaming = false;
+  fetchInFlight = false;
   if (xrCanvas && xrCanvas.parentNode) xrCanvas.parentNode.removeChild(xrCanvas);
   xrCanvas = null;
   gl = null;
@@ -433,13 +442,31 @@ function onXRFrame(time, frame, formatCode, bytesPerPixel) {
     );
   }
 
-  if (captureRequested) {
-    captureRequested = false;
+  if (streaming && !fetchInFlight) {
+    // ARCore can flag a pose as `emulatedPosition` when visual tracking
+    // briefly drops and the position is being inertia-extrapolated. Sending
+    // those frames bakes drift / re-localisation jumps into the voxel grid,
+    // which is exactly the "wall moved" artefact the user reported. Skip
+    // them — we'll catch up once tracking re-acquires.
+    if (pose.emulatedPosition) {
+      framesSkippedEmulated++;
+      hudStatus.textContent = `tracking lost (skipped ${framesSkippedEmulated})`;
+      return;
+    }
     captureAndSend(view, depthInfo, formatCode, bytesPerPixel);
   }
 }
 
 async function captureAndSend(view, depthInfo, formatCode, bytesPerPixel) {
+  fetchInFlight = true;
+  try {
+    await captureAndSendInner(view, depthInfo, formatCode, bytesPerPixel);
+  } finally {
+    fetchInFlight = false;
+  }
+}
+
+async function captureAndSendInner(view, depthInfo, formatCode, bytesPerPixel) {
   const w = depthInfo.width;
   const h = depthInfo.height;
   const depthBytes = w * h * bytesPerPixel;
@@ -488,7 +515,6 @@ async function captureAndSend(view, depthInfo, formatCode, bytesPerPixel) {
     new Uint8Array(buf, FRAME_HEADER_SIZE + depthBytes, colorBytes).set(colorPixels);
   }
 
-  hudTap.textContent = "uploading…";
   hudStatus.textContent = `depth=${formatCode === FORMAT_UINT16_LA ? "u16" : "f32"} color=${colorPixels ? "yes" : "no"}`;
 
   const t0 = performance.now();
@@ -506,13 +532,11 @@ async function captureAndSend(view, depthInfo, formatCode, bytesPerPixel) {
     } else {
       framesSent++;
       hudFrames.textContent = String(framesSent);
-      hudLast.textContent = `${total}B in ${elapsed}ms`;
+      hudLast.textContent = `${total}B · ${elapsed}ms`;
     }
   } catch (e) {
     hudLast.textContent = "network err";
     console.error("/frame upload failed", e);
-  } finally {
-    hudTap.textContent = "tap anywhere to capture a frame";
   }
 }
 
