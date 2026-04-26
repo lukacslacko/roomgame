@@ -1,0 +1,19 @@
+# Local Python venv
+.venv/
+
+# Phone-captured frame bodies — re-captureable, often large, room-private.
+captured_frames/
+
+# Generated artefacts (voxel grids, GLB meshes) — re-derivable from scans.
+web/out/
+
+# Python build cruft
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

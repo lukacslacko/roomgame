@@ -1,0 +1,166 @@
+/* Roomgame — minimal styling. Two surfaces: scanner (full-screen, dark
+   AR HUD) and laptop (orbit-camera viewer). Shared primitives only. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #0a0a0a;
+  color: #eaeaea;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+}
+
+a { color: #6ec4ff; }
+
+/* ---- landing page ----------------------------------------------------- */
+
+.landing {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem;
+  text-align: center;
+}
+
+.landing h1 {
+  font-size: 2.2rem;
+  margin: 0;
+  letter-spacing: -0.02em;
+}
+
+.landing p { max-width: 36rem; line-height: 1.5; opacity: 0.85; }
+
+.landing .links {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.landing .links a {
+  background: #1a1a1a;
+  border: 1px solid #2c2c2c;
+  border-radius: 0.6rem;
+  padding: 0.85rem 1.4rem;
+  text-decoration: none;
+  color: #eaeaea;
+  font-weight: 500;
+}
+
+.landing .links a small { display: block; opacity: 0.6; font-weight: 400; margin-top: 0.2rem; }
+
+/* ---- scanner gate (pre-AR) ------------------------------------------- */
+
+.scan-body { background: #050505; }
+
+.gate {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem;
+  text-align: center;
+}
+
+.gate h1 { margin: 0; font-size: 1.8rem; }
+.gate-msg { opacity: 0.8; max-width: 28rem; }
+
+.big-btn {
+  background: #2563eb;
+  color: white;
+  border: 0;
+  border-radius: 0.7rem;
+  padding: 1rem 2.4rem;
+  font-size: 1.2rem;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 0.5rem;
+}
+
+.big-btn:disabled { background: #333; cursor: not-allowed; }
+
+.gate-help {
+  opacity: 0.7;
+  max-width: 28rem;
+  font-size: 0.9rem;
+  margin-top: 1rem;
+}
+.gate-help summary { cursor: pointer; }
+.gate-help ul { text-align: left; padding-left: 1.2rem; }
+.gate-help code { background: #1a1a1a; padding: 0.1rem 0.35rem; border-radius: 0.25rem; }
+
+/* ---- AR HUD ----------------------------------------------------------- */
+
+.xr-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  display: none;             /* toggled to flex by scan.js when AR starts */
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 1rem;
+  font-size: 0.9rem;
+}
+
+.hud-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.hud-row.top    { padding-top: env(safe-area-inset-top, 0); }
+.hud-row.bottom { padding-bottom: env(safe-area-inset-bottom, 0); }
+
+.hud-btn {
+  pointer-events: auto;
+  background: rgba(0, 0, 0, 0.55);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+  width: 2.6rem;
+  height: 2.6rem;
+  font-size: 1.4rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.hud-status {
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-stat {
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 0.4rem;
+  padding: 0.35rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 4.5rem;
+  font-variant-numeric: tabular-nums;
+}
+.hud-label { font-size: 0.65rem; opacity: 0.65; text-transform: uppercase; letter-spacing: 0.1em; }
+.hud-value { font-size: 1rem; }
+
+.hud-tap {
+  position: absolute;
+  bottom: 5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  opacity: 0.85;
+  pointer-events: none;
+}

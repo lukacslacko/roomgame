@@ -1,0 +1,14 @@
+# Roomgame backend deps. Install into your venv:
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r tools/requirements.txt
+#
+# The server (tools/serve.py) needs nothing from here — it boots and serves
+# static files + parses /frame headers using only stdlib. The deps below are
+# only loaded once /frame ingestion or /remesh actually run.
+
+numpy>=1.24
+scikit-image>=0.22  # marching_cubes for /remesh
+trimesh>=4.0        # GLB writer for /remesh
+
+# Optional (nicer QR codes on stderr):
+# qrcode>=7.4

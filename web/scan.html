@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomgame · Scanner</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="scan-body">
+  <!-- Pre-AR landing (also shown if WebXR depth isn't available) -->
+  <div id="gate" class="gate">
+    <h1>Roomgame · Scanner</h1>
+    <p id="gateMsg" class="gate-msg">Checking WebXR depth-sensing support…</p>
+    <button id="startBtn" class="big-btn" disabled>Enter AR</button>
+    <details class="gate-help">
+      <summary>It says "not supported"?</summary>
+      <ul>
+        <li>This page works on <b>Android Chrome</b> with an ARCore-supported phone.</li>
+        <li>Connect the phone to the laptop over HTTPS (run <code>tools/serve.py&nbsp;--https</code>) or via <code>adb reverse</code>.</li>
+        <li>iOS Safari has no WebXR <code>immersive-ar</code> mode and won't work.</li>
+      </ul>
+    </details>
+  </div>
+
+  <!-- Shown to the WebXR session via the dom-overlay feature. The whole
+       overlay is click-through except for buttons; tapping anywhere else on
+       screen fires an XR select event we use to capture a frame. -->
+  <div id="xrOverlay" class="xr-overlay">
+    <div class="hud-row top">
+      <button id="exitBtn" class="hud-btn" aria-label="Exit AR">×</button>
+      <div id="hudStatus" class="hud-status">starting…</div>
+    </div>
+    <div class="hud-row bottom">
+      <div class="hud-stat">
+        <span class="hud-label">depth</span>
+        <span class="hud-value" id="hudDepth">—</span>
+      </div>
+      <div class="hud-stat">
+        <span class="hud-label">frames</span>
+        <span class="hud-value" id="hudFrames">0</span>
+      </div>
+      <div class="hud-stat">
+        <span class="hud-label">last</span>
+        <span class="hud-value" id="hudLast">—</span>
+      </div>
+    </div>
+    <div class="hud-tap" id="hudTap">tap anywhere to capture a frame</div>
+  </div>
+
+  <script type="module" src="./scan.js"></script>
+</body>
+</html>

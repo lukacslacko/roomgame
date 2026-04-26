@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomgame · Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+    }
+  }
+  </script>
+  <style>
+    body.viewer { display: flex; flex-direction: column; }
+    #stage { flex: 1; min-height: 0; position: relative; }
+    #stage canvas { display: block; }
+    .toolbar {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      padding: 0.6rem 1rem;
+      background: #111;
+      border-bottom: 1px solid #222;
+      font-size: 0.9rem;
+    }
+    .toolbar button {
+      background: #2563eb;
+      color: white;
+      border: 0;
+      border-radius: 0.4rem;
+      padding: 0.4rem 0.85rem;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    .toolbar button:disabled { background: #333; cursor: not-allowed; }
+    .toolbar .spacer { flex: 1; }
+    .toolbar .stat { opacity: 0.75; font-variant-numeric: tabular-nums; }
+    .toolbar .stat b { color: #6ec4ff; font-weight: 500; }
+  </style>
+</head>
+<body class="viewer">
+  <div class="toolbar">
+    <button id="reloadBtn">Re-mesh & reload</button>
+    <button id="reloadOnlyBtn">Reload mesh</button>
+    <span class="spacer"></span>
+    <span class="stat">verts <b id="stVerts">—</b></span>
+    <span class="stat">faces <b id="stFaces">—</b></span>
+    <span class="stat">voxels <b id="stVoxels">—</b></span>
+    <span class="stat" id="stMsg"></span>
+  </div>
+  <div id="stage"></div>
+  <script type="module" src="./game.js"></script>
+</body>
+</html>
