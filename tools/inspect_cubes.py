@@ -278,11 +278,15 @@ def main() -> None:
                     help="number of cubes to inspect (= rows in PNG)")
     ap.add_argument("--frames-per-cube", type=int, default=10,
                     help="number of frames per cube (= columns in PNG)")
-    ap.add_argument("--cell-width", type=int, default=320,
+    ap.add_argument("--cell-width", type=int, default=240,
                     help="pixel width of each cell in the output PNG")
-    ap.add_argument("--cell-aspect", type=float, default=4.0/3.0,
-                    help="aspect ratio (w/h) of each cell. Default 4:3 fits "
-                         "the typical cube projection without letterboxing.")
+    ap.add_argument("--cell-aspect", type=float, default=9.0/16.0,
+                    help="aspect ratio (w/h) of each cell. Default 9:16 "
+                         "matches the phone's portrait camera frame; "
+                         "scan.js blits the portrait camera texture into a "
+                         "landscape 320×180 buffer (stretching it horizontally), "
+                         "and rendering each cell back at 9:16 undoes that "
+                         "stretch so cubes look the right shape.")
     ap.add_argument("--out", default="cube_inspection.png",
                     help="output PNG path")
     ap.add_argument("--limit-frames", type=int, default=None,
