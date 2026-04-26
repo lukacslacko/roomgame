@@ -12,6 +12,7 @@ import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 const stage = document.getElementById("stage");
 const reloadBtn = document.getElementById("reloadBtn");
 const recenterBtn = document.getElementById("recenterBtn");
+const lightingBtn = document.getElementById("lightingBtn");
 const stVoxels = document.getElementById("stVoxels");
 const stSize = document.getElementById("stSize");
 const stMsg = document.getElementById("stMsg");
@@ -32,7 +33,8 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 stage.appendChild(renderer.domElement);
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.30));
+const ambient = new THREE.AmbientLight(0xffffff, 0.30);
+scene.add(ambient);
 const sun = new THREE.DirectionalLight(0xfff1d6, 1.4);
 sun.position.set(2.5, 5.0, 2.0);
 sun.castShadow = true;
@@ -46,7 +48,8 @@ sun.shadow.camera.bottom = -7;
 sun.shadow.bias = -0.0005;
 sun.shadow.normalBias = 0.01;
 scene.add(sun);
-scene.add(new THREE.HemisphereLight(0xc6d8ff, 0x202028, 0.45));
+const hemi = new THREE.HemisphereLight(0xc6d8ff, 0x202028, 0.45);
+scene.add(hemi);
 
 const floor = new THREE.Mesh(
   new THREE.PlaneGeometry(20, 20),
@@ -130,6 +133,9 @@ function rebuildMesh(payload) {
   scene.add(m);
   voxMesh = m;
   lastBBox = bbox.isEmpty() ? null : bbox;
+  // Newly-built mesh defaults to lit settings; re-apply current mode so a
+  // reload while in flat mode doesn't snap the cubes back to lit.
+  applyLightingMode();
 }
 
 async function loadVoxels() {
@@ -175,6 +181,45 @@ function recenter(adjustCamera) {
 
 reloadBtn.addEventListener("click", loadVoxels);
 recenterBtn.addEventListener("click", () => recenter(true));
+
+// "Flat" mode: kill the directional sun + hemisphere + SSAO and crank the
+// ambient up to 1.0 so each voxel renders as its captured colour without
+// any shading. Useful when uneven scan coverage (e.g. half-captured ceiling)
+// throws the lit version into harsh contrasts.
+let flatMode = false;
+function applyLightingMode() {
+  if (flatMode) {
+    ambient.intensity = 1.0;
+    sun.intensity = 0.0;
+    sun.castShadow = false;
+    hemi.intensity = 0.0;
+    floor.visible = false;
+    if (voxMesh) {
+      voxMesh.castShadow = false;
+      voxMesh.receiveShadow = false;
+    }
+    ssao.enabled = false;
+    renderer.toneMapping = THREE.NoToneMapping;
+    lightingBtn.textContent = "Flat";
+  } else {
+    ambient.intensity = 0.30;
+    sun.intensity = 1.4;
+    sun.castShadow = true;
+    hemi.intensity = 0.45;
+    floor.visible = true;
+    if (voxMesh) {
+      voxMesh.castShadow = true;
+      voxMesh.receiveShadow = true;
+    }
+    ssao.enabled = true;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    lightingBtn.textContent = "Lit";
+  }
+}
+lightingBtn.addEventListener("click", () => {
+  flatMode = !flatMode;
+  applyLightingMode();
+});
 
 function onResize() {
   const w = stage.clientWidth || 1;
