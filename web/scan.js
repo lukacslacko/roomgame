@@ -1,18 +1,25 @@
-// Phone-side WebXR depth scanner.
+// Phone-side WebXR depth + colour scanner.
 //
-// Captures one depth frame per tap, packs viewMatrix + projectionMatrix +
-// normDepthBufferFromNormView + dimensions + format into a 208-byte binary
-// header, appends the raw depth payload, and POSTs it to /frame on the laptop.
+// Each tap captures one frame:
+//   - depth   : the WebXR Depth Sensing CPU buffer (luminance-alpha or float32)
+//   - colour  : the camera image (camera-access feature), downsampled to the
+//               same resolution as the depth buffer via a tiny GL pipeline
+//   - pose    : viewMatrix, projectionMatrix, normDepthBufferFromNormView
+// All packed into one binary body and POSTed to /frame on the laptop. If
+// camera-access isn't granted we still send depth (color_format=NONE) so
+// scanning works on devices without it.
 //
-// No three.js — the AR view is camera passthrough only; we just need the
-// WebGL context to satisfy XRWebGLLayer. The HUD is HTML via dom-overlay.
+// No three.js — the AR view is camera passthrough only; we manage the GL
+// context and a single shader directly. The HUD is HTML via dom-overlay.
 
 import { hookConsoleToServer } from "./logbridge.js";
 hookConsoleToServer();
 
-const FRAME_HEADER_SIZE = 208;
+const FRAME_HEADER_SIZE = 224;       // matches FRAME_HEADER_FMT in tools/serve.py
 const FORMAT_UINT16_LA = 0;
 const FORMAT_FLOAT32 = 1;
+const COLOR_NONE = 0;
+const COLOR_RGBA8 = 1;
 
 const $ = (id) => document.getElementById(id);
 const gate = $("gate");
@@ -32,8 +39,20 @@ let gl = null;
 let xrCanvas = null;
 let captureRequested = false;
 let framesSent = 0;
-let lastFrameAt = 0;
 let depthBufferLogged = false;
+
+// Camera-access state. Initialised lazily on first frame that has both a
+// depth buffer (to know the target size) and a successful getCameraImage.
+let xrBinding = null;            // XRWebGLBinding
+let camProgram = null;           // GL program
+let camProgramUCam = null;       // sampler uniform location
+let camVao = null;               // empty VAO for the fullscreen-triangle trick
+let camFbo = null;               // framebuffer with attached output texture
+let camOutTex = null;            // RGBA8 output texture
+let camPixels = null;            // Uint8Array readback buffer
+let camOutW = 0, camOutH = 0;
+let cameraSetupTried = false;
+let cameraAvailable = false;     // true once we've successfully grabbed one image
 
 async function checkSupport() {
   if (!("xr" in navigator)) {
@@ -48,9 +67,7 @@ async function checkSupport() {
   if (!arSupported) {
     return { ok: false, reason: "immersive-ar not supported on this device." };
   }
-  // We can't pre-test depth-sensing without starting a session. Best-effort
-  // hint: WebXR Depth Sensing is Android Chrome / Quest browser only.
-  return { ok: true, reason: "immersive-ar available — depth support will be confirmed on session start." };
+  return { ok: true, reason: "immersive-ar available — depth + camera support confirmed on session start." };
 }
 
 async function init() {
@@ -82,7 +99,8 @@ async function startSession() {
   try {
     session = await navigator.xr.requestSession("immersive-ar", {
       requiredFeatures: ["local-floor", "depth-sensing"],
-      optionalFeatures: ["dom-overlay"],
+      // camera-access: needed for colour. dom-overlay: needed for the HUD.
+      optionalFeatures: ["camera-access", "dom-overlay"],
       depthSensing: {
         usagePreference: ["cpu-optimized"],
         dataFormatPreference: ["luminance-alpha", "float32"],
@@ -101,13 +119,21 @@ async function startSession() {
   await session.updateRenderState({ baseLayer });
   xrRefSpace = await session.requestReferenceSpace("local-floor");
 
-  // The phone may have selected one of the two formats we offered. Save it
-  // so we send the right bytes-per-pixel and format code on each frame.
   const fmt = session.depthDataFormat || "luminance-alpha";
   const formatCode = fmt === "float32" ? FORMAT_FLOAT32 : FORMAT_UINT16_LA;
   const bytesPerPixel = formatCode === FORMAT_FLOAT32 ? 4 : 2;
+
+  // Bind for camera image reads. We construct it even if camera-access wasn't
+  // granted; getCameraImage will throw and we'll fall back gracefully.
+  try {
+    xrBinding = new XRWebGLBinding(session, gl);
+  } catch (e) {
+    console.warn("XRWebGLBinding ctor failed:", e);
+    xrBinding = null;
+  }
+
   console.log(`session ready: depthDataFormat=${fmt} usage=${session.depthUsage}`);
-  hudStatus.textContent = `depth=${fmt}`;
+  hudStatus.textContent = `depth=${fmt} color=?`;
 
   session.addEventListener("end", onSessionEnd);
   session.addEventListener("select", () => { captureRequested = true; });
@@ -123,14 +149,134 @@ function onSessionEnd() {
   console.log("session ended");
   session = null;
   xrRefSpace = null;
+  xrBinding = null;
   if (xrCanvas && xrCanvas.parentNode) xrCanvas.parentNode.removeChild(xrCanvas);
   xrCanvas = null;
   gl = null;
+  // Drop GL resources tied to that context.
+  camProgram = camVao = camFbo = camOutTex = camPixels = null;
+  camOutW = camOutH = 0;
+  cameraSetupTried = false;
+  cameraAvailable = false;
+  depthBufferLogged = false;
   overlay.style.display = "none";
   gate.style.display = "";
   gateMsg.textContent = "Session ended. Tap Enter AR to scan again.";
   startBtn.disabled = false;
 }
+
+// ----- camera capture helpers ---------------------------------------------
+
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(sh);
+    gl.deleteShader(sh);
+    throw new Error(`shader compile failed: ${log}`);
+  }
+  return sh;
+}
+
+function ensureCameraSetup(width, height) {
+  if (camOutW === width && camOutH === height && camProgram) return true;
+  // (Re)build the FBO+texture for the requested size.
+  if (!camProgram) {
+    // GLSL ES 3.00. The single-triangle trick draws a triangle covering the
+    // whole NDC; gl_VertexID 0,1,2 → (-1,-1),(3,-1),(-1,3). vUV is in [0,1].
+    const vs = `#version 300 es
+      out vec2 vUV;
+      void main() {
+        float x = (gl_VertexID == 1) ? 3.0 : -1.0;
+        float y = (gl_VertexID == 2) ? 3.0 : -1.0;
+        vUV = vec2((x + 1.0) * 0.5, (y + 1.0) * 0.5);
+        gl_Position = vec4(x, y, 0.0, 1.0);
+      }`;
+    const fs = `#version 300 es
+      precision mediump float;
+      in vec2 vUV;
+      uniform sampler2D uCam;
+      out vec4 outColor;
+      void main() { outColor = texture(uCam, vUV); }`;
+    const v = compileShader(gl.VERTEX_SHADER, vs);
+    const f = compileShader(gl.FRAGMENT_SHADER, fs);
+    const p = gl.createProgram();
+    gl.attachShader(p, v); gl.attachShader(p, f);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error(`link failed: ${gl.getProgramInfoLog(p)}`);
+    }
+    camProgram = p;
+    camProgramUCam = gl.getUniformLocation(p, "uCam");
+    camVao = gl.createVertexArray();
+  }
+
+  if (camOutTex) gl.deleteTexture(camOutTex);
+  if (camFbo) gl.deleteFramebuffer(camFbo);
+  camOutTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, camOutTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  camFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, camFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, camOutTex, 0);
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    console.error(`color FBO incomplete: 0x${status.toString(16)}`);
+    return false;
+  }
+  camPixels = new Uint8Array(width * height * 4);
+  camOutW = width;
+  camOutH = height;
+  return true;
+}
+
+/** Returns the camera image as RGBA8 bytes at (width, height), or null if
+ *  camera-access isn't available / the texture isn't ready this frame. */
+function captureCameraRGBA(view, width, height) {
+  if (!xrBinding || !view.camera) return null;
+  let camTex = null;
+  try {
+    camTex = xrBinding.getCameraImage(view.camera);
+  } catch (e) {
+    if (!cameraSetupTried) {
+      cameraSetupTried = true;
+      console.warn("getCameraImage failed:", e);
+    }
+    return null;
+  }
+  if (!camTex) return null;
+  if (!ensureCameraSetup(width, height)) return null;
+
+  // Save current FB+viewport then restore — XR session expects baseLayer.fb.
+  const baseFb = session.renderState.baseLayer.framebuffer;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, camFbo);
+  gl.viewport(0, 0, width, height);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+  gl.useProgram(camProgram);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, camTex);
+  gl.uniform1i(camProgramUCam, 0);
+  gl.bindVertexArray(camVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindVertexArray(null);
+  gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, camPixels);
+
+  // Restore baseLayer FBO so XR doesn't notice we ran a side-pass.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, baseFb);
+
+  cameraAvailable = true;
+  return camPixels;
+}
+
+// ----- main per-frame loop ------------------------------------------------
 
 function onXRFrame(time, frame, formatCode, bytesPerPixel) {
   if (!session) return;
@@ -138,8 +284,6 @@ function onXRFrame(time, frame, formatCode, bytesPerPixel) {
 
   const baseLayer = session.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
-  // Clear to fully transparent so passthrough shows through; the spec says
-  // immersive-ar's blend mode is alpha-blend on most devices.
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
@@ -150,8 +294,7 @@ function onXRFrame(time, frame, formatCode, bytesPerPixel) {
   let depthInfo = null;
   try {
     depthInfo = frame.getDepthInformation(view);
-  } catch (e) {
-    // Some implementations throw if depth isn't ready yet.
+  } catch {
     return;
   }
   if (!depthInfo) {
@@ -167,7 +310,8 @@ function onXRFrame(time, frame, formatCode, bytesPerPixel) {
     console.log(
       `depth buffer: ${depthInfo.width}×${depthInfo.height} ` +
       `data=${d?.constructor?.name || typeof d} byteLength=${d?.byteLength} ` +
-      `rawValueToMeters=${depthInfo.rawValueToMeters}`
+      `rawValueToMeters=${depthInfo.rawValueToMeters} ` +
+      `cameraGranted=${!!view.camera}`
     );
   }
 
@@ -180,55 +324,55 @@ function onXRFrame(time, frame, formatCode, bytesPerPixel) {
 async function captureAndSend(view, depthInfo, formatCode, bytesPerPixel) {
   const w = depthInfo.width;
   const h = depthInfo.height;
-  const payloadBytes = w * h * bytesPerPixel;
-  const total = FRAME_HEADER_SIZE + payloadBytes;
+  const depthBytes = w * h * bytesPerPixel;
 
-  // Build the wire buffer.
+  // Capture colour at depth resolution. If camera-access isn't usable,
+  // colorPixels is null and we send a NONE-format colour record.
+  const colorPixels = captureCameraRGBA(view, w, h);
+  const colorBytes = colorPixels ? w * h * 4 : 0;
+  const colorFormat = colorPixels ? COLOR_RGBA8 : COLOR_NONE;
+  const total = FRAME_HEADER_SIZE + depthBytes + colorBytes;
+
   const buf = new ArrayBuffer(total);
   const dv = new DataView(buf);
   let off = 0;
+  const writeMat = (m) => { for (let i = 0; i < 16; i++) { dv.setFloat32(off, m[i], true); off += 4; } };
 
-  const writeMat = (m) => {
-    for (let i = 0; i < 16; i++) {
-      dv.setFloat32(off, m[i], true);
-      off += 4;
-    }
-  };
-
-  // viewMatrix = world_from_view, column-major
   writeMat(view.transform.matrix);
-  // projectionMatrix
   writeMat(view.projectionMatrix);
-  // normDepthBufferFromNormView (XRRigidTransform.matrix)
   writeMat(depthInfo.normDepthBufferFromNormView.matrix);
-
-  dv.setUint32(off, w, true); off += 4;
-  dv.setUint32(off, h, true); off += 4;
-  dv.setFloat32(off, depthInfo.rawValueToMeters, true); off += 4;
-  dv.setUint32(off, formatCode, true); off += 4;
+  dv.setUint32(off, w, true); off += 4;                                  // depth_width
+  dv.setUint32(off, h, true); off += 4;                                  // depth_height
+  dv.setFloat32(off, depthInfo.rawValueToMeters, true); off += 4;         // rawValueToMeters
+  dv.setUint32(off, formatCode, true); off += 4;                          // depth_format
+  dv.setUint32(off, colorPixels ? w : 0, true); off += 4;                 // color_width
+  dv.setUint32(off, colorPixels ? h : 0, true); off += 4;                 // color_height
+  dv.setUint32(off, colorFormat, true); off += 4;                         // color_format
+  dv.setUint32(off, colorBytes, true); off += 4;                          // color_byte_length
   if (off !== FRAME_HEADER_SIZE) {
-    console.error(`header size mismatch: wrote ${off} bytes, expected ${FRAME_HEADER_SIZE}`);
+    console.error(`header size mismatch: wrote ${off}, expected ${FRAME_HEADER_SIZE}`);
     return;
   }
 
-  // Copy raw depth bytes from the XR buffer into the wire buffer.
-  // Chrome's XRCPUDepthInformation.data is an ArrayBuffer per the WebXR
-  // Depth Sensing IDL, but other implementations could plausibly hand back
-  // a TypedArray. Handle both. (When this was broken it returned all-zero
-  // payloads silently, since `new Uint8Array(undefined, undefined, N)`
-  // is `new Uint8Array(0)` — wrong but doesn't throw.)
+  // Depth payload.
   const xrData = depthInfo.data;
   const srcBuf = xrData instanceof ArrayBuffer ? xrData : xrData.buffer;
   const srcOff = xrData instanceof ArrayBuffer ? 0 : xrData.byteOffset;
-  const srcLen = xrData.byteLength;
-  if (srcLen < payloadBytes) {
-    console.warn(`depth buffer too small: ${srcLen}B < expected ${payloadBytes}B (${depthInfo.width}×${depthInfo.height}×${bytesPerPixel}); skipping frame`);
+  if (xrData.byteLength < depthBytes) {
+    console.warn(`depth buffer too small: ${xrData.byteLength}B < ${depthBytes}B`);
     return;
   }
-  const src = new Uint8Array(srcBuf, srcOff, payloadBytes);
-  new Uint8Array(buf, FRAME_HEADER_SIZE, payloadBytes).set(src);
+  new Uint8Array(buf, FRAME_HEADER_SIZE, depthBytes)
+    .set(new Uint8Array(srcBuf, srcOff, depthBytes));
+
+  // Colour payload (if any).
+  if (colorPixels) {
+    new Uint8Array(buf, FRAME_HEADER_SIZE + depthBytes, colorBytes).set(colorPixels);
+  }
 
   hudTap.textContent = "uploading…";
+  hudStatus.textContent = `depth=${formatCode === FORMAT_UINT16_LA ? "u16" : "f32"} color=${colorPixels ? "yes" : "no"}`;
+
   const t0 = performance.now();
   try {
     const r = await fetch("/frame", {
@@ -243,7 +387,6 @@ async function captureAndSend(view, depthInfo, formatCode, bytesPerPixel) {
       console.error(`/frame ${r.status}: ${text}`);
     } else {
       framesSent++;
-      lastFrameAt = Date.now();
       hudFrames.textContent = String(framesSent);
       hudLast.textContent = `${total}B in ${elapsed}ms`;
     }

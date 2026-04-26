@@ -78,8 +78,15 @@ async function loadMesh(forceRemesh) {
     currentMesh = gltf.scene;
     currentMesh.traverse((o) => {
       if (o.isMesh) {
+        const hasVertexColors = !!o.geometry?.attributes?.color;
         o.material = new THREE.MeshStandardMaterial({
-          color: 0xc0c8d8, metalness: 0.05, roughness: 0.9, side: THREE.DoubleSide,
+          // When vertex colours are present the material acts as a tint;
+          // white = "show the vertex colour as-is".
+          color: hasVertexColors ? 0xffffff : 0xc0c8d8,
+          vertexColors: hasVertexColors,
+          metalness: 0.0,
+          roughness: 0.85,
+          side: THREE.DoubleSide,
         });
       }
     });

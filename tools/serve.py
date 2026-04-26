@@ -60,57 +60,88 @@ DEFAULT_CERT_DIR = Path.home() / ".roomgame" / "cert"
 #   16 floats viewMatrix             (world_from_view, column-major Float32)
 #   16 floats projectionMatrix       (column-major Float32)
 #   16 floats normDepthBufferFromNormView (column-major Float32)
-#    1 uint32 width
-#    1 uint32 height
+#    1 uint32 depth_width
+#    1 uint32 depth_height
 #    1 float32 rawValueToMeters
-#    1 uint32 format    (0=uint16 luminance-alpha, 1=float32)
-# Total = 48 floats + 3 uint32 + 1 float32 = 48*4 + 16 = 208 bytes.
-FRAME_HEADER_FMT = "<48f I I f I"
+#    1 uint32 depth_format            (0=uint16 luminance-alpha, 1=float32)
+#    1 uint32 color_width
+#    1 uint32 color_height
+#    1 uint32 color_format            (0=none, 1=RGBA8)
+#    1 uint32 color_byte_length
+# Total = 48f + 7 u32 + 1 f32 = 48*4 + 32 = 224 bytes.
+# Body = header + depth payload + color payload.
+FRAME_HEADER_FMT = "<48f I I f I I I I I"
 FRAME_HEADER_SIZE = struct.calcsize(FRAME_HEADER_FMT)
-assert FRAME_HEADER_SIZE == 208, FRAME_HEADER_SIZE
+assert FRAME_HEADER_SIZE == 224, FRAME_HEADER_SIZE
 
 FORMAT_UINT16_LA = 0
 FORMAT_FLOAT32 = 1
+COLOR_NONE = 0
+COLOR_RGBA8 = 1
 
 
 def parse_frame(body: bytes) -> dict:
-    """Decode a /frame body into a dict of header fields and the raw depth buffer.
-
-    The 'depth' field is left as bytes; conversion to numpy happens in fusion.py
-    when that module exists. M1's job is just to verify the header parses.
-    """
+    """Decode a /frame body into header fields + raw depth buffer + raw color
+    buffer (or None if the frame didn't carry color)."""
     if len(body) < FRAME_HEADER_SIZE:
         raise ValueError(f"frame body too short: {len(body)} < {FRAME_HEADER_SIZE}")
     fields = struct.unpack(FRAME_HEADER_FMT, body[:FRAME_HEADER_SIZE])
     view_m = fields[0:16]
     proj_m = fields[16:32]
     norm_m = fields[32:48]
-    width = fields[48]
-    height = fields[49]
+    depth_w = fields[48]
+    depth_h = fields[49]
     raw_to_m = fields[50]
-    fmt = fields[51]
-    if fmt == FORMAT_UINT16_LA:
-        bytes_per_pixel = 2
-    elif fmt == FORMAT_FLOAT32:
-        bytes_per_pixel = 4
+    depth_fmt = fields[51]
+    color_w = fields[52]
+    color_h = fields[53]
+    color_fmt = fields[54]
+    color_len = fields[55]
+
+    if depth_fmt == FORMAT_UINT16_LA:
+        depth_bpp = 2
+    elif depth_fmt == FORMAT_FLOAT32:
+        depth_bpp = 4
     else:
-        raise ValueError(f"unknown frame format code {fmt}")
-    expected_payload = width * height * bytes_per_pixel
-    payload = body[FRAME_HEADER_SIZE:]
-    if len(payload) != expected_payload:
+        raise ValueError(f"unknown depth format code {depth_fmt}")
+    depth_expected = depth_w * depth_h * depth_bpp
+
+    body_after_header = body[FRAME_HEADER_SIZE:]
+    if len(body_after_header) < depth_expected:
         raise ValueError(
-            f"depth payload length mismatch: got {len(payload)}, "
-            f"expected {expected_payload} ({width}x{height} @ {bytes_per_pixel} B/px)"
+            f"depth payload truncated: got {len(body_after_header)}, "
+            f"expected {depth_expected}+color ({depth_w}x{depth_h} @ {depth_bpp} B/px)"
         )
+    depth_payload = body_after_header[:depth_expected]
+
+    if color_fmt == COLOR_NONE:
+        if color_len != 0:
+            raise ValueError(f"color_format=NONE but color_byte_length={color_len}")
+        color_payload = None
+    elif color_fmt == COLOR_RGBA8:
+        expected_color = color_w * color_h * 4
+        if expected_color != color_len:
+            raise ValueError(f"RGBA8 declared {color_len} bytes, expected {expected_color}")
+        rest = body_after_header[depth_expected:]
+        if len(rest) < color_len:
+            raise ValueError(f"color payload truncated: got {len(rest)}, expected {color_len}")
+        color_payload = rest[:color_len]
+    else:
+        raise ValueError(f"unknown color format code {color_fmt}")
+
     return {
         "viewMatrix": view_m,
         "projectionMatrix": proj_m,
         "normDepthBufferFromNormView": norm_m,
-        "width": width,
-        "height": height,
+        "width": depth_w,
+        "height": depth_h,
         "rawValueToMeters": raw_to_m,
-        "format": fmt,
-        "depth": payload,
+        "format": depth_fmt,
+        "depth": depth_payload,
+        "color_width": color_w,
+        "color_height": color_h,
+        "color_format": color_fmt,
+        "color": color_payload,
     }
 
 
@@ -416,11 +447,17 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
                 return
 
+        color_summary = ""
+        if frame["color"] is not None:
+            color_summary = f" color={frame['color_width']}x{frame['color_height']}"
+        else:
+            color_summary = " color=none"
+
         sys.stderr.write(
             f"[{ip}] FRAME #{frame_count} {frame['width']}x{frame['height']} "
             f"fmt={frame['format']} rawToM={frame['rawValueToMeters']:.6f} "
             f"pose=({pose_translation[0]:+.2f},{pose_translation[1]:+.2f},{pose_translation[2]:+.2f})"
-            f"{depth_summary}{ingest_summary}\n"
+            f"{depth_summary}{color_summary}{ingest_summary}\n"
         )
         self._send_json(200, {"ok": True, "frame": frame_count})
 

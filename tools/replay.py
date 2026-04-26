@@ -87,18 +87,20 @@ def replay(frames_dir: Path, voxel_size: float, near_m: float, far_m: float,
                     print(f"  [{lo:>5.2f}, {hi:>6.2f}) : {c}")
             print("------------------------------\n")
 
-        # Run through the same code path the server uses, but tell us how
-        # many points pass each filter stage.
-        pts, cam = fusion.frame_to_world_points(frame, near_m=near_m, far_m=far_m)
-
+        # Same code path as the server's ingest, but with extra reporting.
+        pts, _cam, rgb = fusion.frame_to_world_points(
+            frame, near_m=near_m, far_m=far_m, with_colors=True
+        )
         n_world = int(pts.shape[0])
-        n_written = room.insert_points(pts) if n_world else 0
+        n_written = room.insert_points(pts, rgb) if n_world else 0
         stats = room.stats()
+        color_tag = "rgb" if frame.get("color") is not None else "grey"
         print(
             f"#{idx+1:3d} {path.name}  {W}x{H}  "
             f"depth(nz={100*n_nonzero/max(1,n_total):.0f}% "
             f"min={nonzero.min() if n_nonzero else 0:.2f} "
             f"max={nonzero.max() if n_nonzero else 0:.2f}) "
+            f"col={color_tag} "
             f"-> world_pts={n_world}  +vox_writes={n_written}  "
             f"total={stats['voxels']}vox/{stats['chunks']}ch"
         )

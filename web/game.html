@@ -14,9 +14,14 @@
   }
   </script>
   <style>
+    html, body.viewer {
+      height: 100vh;
+      max-height: 100vh;
+      overflow: hidden;
+    }
     body.viewer { display: flex; flex-direction: column; }
-    #stage { flex: 1; min-height: 0; position: relative; }
-    #stage canvas { display: block; }
+    #stage { flex: 1 1 0; min-height: 0; position: relative; overflow: hidden; }
+    #stage canvas { display: block; width: 100% !important; height: 100% !important; }
     .toolbar {
       display: flex;
       gap: 0.5rem;
