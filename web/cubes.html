@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomgame · Occupancy cubes</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    .cube-controls {
+      pointer-events: auto;
+      align-self: stretch;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      background: rgba(0, 0, 0, 0.55);
+      border-radius: 0.6rem;
+      padding: 0.7rem 0.9rem;
+      margin: 0 1rem;
+    }
+    .cube-controls .row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .cube-controls label {
+      font-size: 0.8rem;
+      opacity: 0.75;
+      min-width: 4.5rem;
+    }
+    .cube-controls input[type="range"] {
+      flex: 1;
+      accent-color: #6ec4ff;
+    }
+    .cube-controls select,
+    .cube-controls input[type="number"] {
+      background: #1a1a1a;
+      color: #eaeaea;
+      border: 1px solid #333;
+      border-radius: 0.3rem;
+      padding: 0.25rem 0.4rem;
+      font-size: 0.85rem;
+    }
+    .rec-btn {
+      pointer-events: auto;
+      background: #d33;
+      color: white;
+      border: 0;
+      border-radius: 0.6rem;
+      padding: 0.7rem 1.2rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .rec-btn.recording { background: #4caf50; }
+    .rec-btn:disabled { background: #333; cursor: not-allowed; }
+    .cube-stats {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+  </style>
+</head>
+<body class="scan-body">
+  <div id="gate" class="gate">
+    <h1>Occupancy cubes</h1>
+    <p id="gateMsg" class="gate-msg">Checking WebXR depth-sensing support…</p>
+    <button id="startBtn" class="big-btn" disabled>Enter AR</button>
+    <details class="gate-help">
+      <summary>What is this?</summary>
+      <p>
+        Server keeps a coarse 3D grid of cubes (default 50 cm). While
+        recording, every frame's depth map updates per-cube counters.
+        Cubes whose surface gets observed often enough are rendered as
+        boxes overlaid on the camera. Use the mix slider to fade the
+        cubes against the camera passthrough; switch to "occluded" mode
+        to hide cubes that the live depth says are behind a real surface.
+      </p>
+    </details>
+  </div>
+
+  <div id="xrOverlay" class="xr-overlay">
+    <div class="hud-row top">
+      <button id="exitBtn" class="hud-btn" aria-label="Exit AR">×</button>
+      <div id="hudStatus" class="hud-status">starting…</div>
+      <button id="resetBtn" class="hud-btn" aria-label="Reset cube grid" title="Wipe grid">↺</button>
+    </div>
+
+    <div class="cube-controls">
+      <div class="row">
+        <button id="recBtn" class="rec-btn">Start recording</button>
+        <span class="cube-stats">
+          <span class="hud-stat"><span class="hud-label">frames</span><span class="hud-value" id="hudFrames">0</span></span>
+          <span class="hud-stat"><span class="hud-label">cubes</span><span class="hud-value" id="hudCubes">0</span></span>
+        </span>
+      </div>
+      <div class="row">
+        <label for="mixSlider">mix</label>
+        <input id="mixSlider" type="range" min="0" max="1" step="0.01" value="0.55">
+        <span id="mixVal" class="hud-value" style="min-width:2.6rem; text-align:right">0.55</span>
+      </div>
+      <div class="row">
+        <label for="modeSel">mode</label>
+        <select id="modeSel">
+          <option value="plain" selected>plain (a)</option>
+          <option value="occluded">depth-occluded (b)</option>
+        </select>
+        <label for="cubeSize" style="min-width:0">size</label>
+        <input id="cubeSize" type="number" min="0.05" max="2.0" step="0.05" value="0.25" style="width:5rem">
+        <span style="opacity:0.7; font-size:0.8rem">m</span>
+      </div>
+      <div class="row">
+        <label for="threshSlider">thr</label>
+        <input id="threshSlider" type="range" min="0" max="1" step="0.01" value="0.25">
+        <span id="threshVal" class="hud-value" style="min-width:2.6rem; text-align:right">0.25</span>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./cubes.js"></script>
+</body>
+</html>

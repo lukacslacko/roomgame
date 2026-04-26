@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomgame · Pose stability</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    .pose-readout {
+      pointer-events: none;
+      background: rgba(0, 0, 0, 0.6);
+      border-radius: 0.5rem;
+      padding: 0.75rem 1rem;
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 1.1rem;
+      line-height: 1.45;
+      align-self: center;
+      min-width: 18rem;
+    }
+    .pose-readout .label { display: inline-block; width: 5.5rem; opacity: 0.65; }
+    .pose-readout .row    { display: block; }
+    .pose-readout .big    { font-size: 1.35rem; font-weight: 600; margin-bottom: 0.4rem; }
+    .pose-readout .ok     { color: #6cf28b; }
+    .pose-readout .warn   { color: #f2c46c; }
+    .pose-readout .bad    { color: #ff7777; }
+    .traj-canvas {
+      pointer-events: none;
+      align-self: center;
+      width: 70vw;
+      max-width: 320px;
+      height: 70vw;
+      max-height: 320px;
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 0.5rem;
+    }
+  </style>
+</head>
+<body class="scan-body">
+  <div id="gate" class="gate">
+    <h1>Pose stability</h1>
+    <p id="gateMsg" class="gate-msg">Checking WebXR support…</p>
+    <button id="startBtn" class="big-btn" disabled>Enter AR</button>
+    <details class="gate-help">
+      <summary>What does this do?</summary>
+      <p>
+        Tap the screen to set the current phone position as the origin.
+        The numbers below show how far the phone has moved (cm) and
+        rotated (deg) relative to that origin. Walk around, come back,
+        and check how close to zero the readings return — that tells
+        you how much ARCore drifts on this device.
+      </p>
+    </details>
+  </div>
+
+  <div id="xrOverlay" class="xr-overlay">
+    <div class="hud-row top">
+      <button id="exitBtn" class="hud-btn" aria-label="Exit AR">×</button>
+      <div id="hudStatus" class="hud-status">starting…</div>
+      <button id="anchorBtn" class="hud-btn" aria-label="Set origin" title="Set current pose as origin">⊕</button>
+    </div>
+    <div id="poseReadout" class="pose-readout">
+      <span class="row big" id="rDist">|t| = — cm    ∠R = — °</span>
+      <span class="row"><span class="label">tx</span><span id="rTx">—</span> cm</span>
+      <span class="row"><span class="label">ty</span><span id="rTy">—</span> cm</span>
+      <span class="row"><span class="label">tz</span><span id="rTz">—</span> cm</span>
+      <span class="row"><span class="label">yaw</span><span id="rYaw">—</span>°</span>
+      <span class="row"><span class="label">pitch</span><span id="rPitch">—</span>°</span>
+      <span class="row"><span class="label">roll</span><span id="rRoll">—</span>°</span>
+      <span class="row"><span class="label">tracking</span><span id="rTrack">—</span></span>
+    </div>
+    <canvas id="trajCanvas" class="traj-canvas" width="320" height="320"></canvas>
+    <div class="hud-tap" id="hudTap">tap anywhere (or ⊕) to set origin</div>
+  </div>
+
+  <script type="module" src="./pose.js"></script>
+</body>
+</html>

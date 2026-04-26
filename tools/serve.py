@@ -266,6 +266,12 @@ def ensure_cert(cert_dir: Path, sans: list[str]) -> tuple[Path, Path]:
 voxel_room: object | None = None
 frame_count = 0
 
+# Coarse occupancy cubes — independent representation populated by /frame
+# while a recording is active (controlled by /cubes/start and /cubes/stop).
+# `cube_grid` is None until /cubes/start is called for the first time.
+cube_grid: object | None = None
+cube_recording: bool = False
+
 
 def init_voxel_room(voxel_size_m: float) -> None:
     """Try to construct the global VoxelRoom; log a clear message if numpy
@@ -367,6 +373,15 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
             return
+        if path == "/cubes/start":
+            self._handle_cubes_start()
+            return
+        if path == "/cubes/stop":
+            self._handle_cubes_stop()
+            return
+        if path == "/cubes/reset":
+            self._handle_cubes_reset()
+            return
         if path == "/log" or path == "/log/dump":
             body = self._read_body()
             try:
@@ -386,7 +401,11 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        path = self.path.rstrip("/") or "/"
+        from urllib.parse import urlparse
+        path = (urlparse(self.path).path or "/").rstrip("/") or "/"
+        if path == "/cubes/state":
+            self._handle_cubes_state()
+            return
         if path == "/stats":
             if voxel_room is None:
                 self._send_json(200, {"frames": frame_count, "voxels": 0, "bbox": None, "ready": False})
@@ -400,6 +419,122 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
             return
         return super().do_GET()
+
+    def _handle_cubes_start(self) -> None:
+        """Initialise (or re-initialise) the occupancy-cube grid and switch
+        ingestion on. Body is an optional JSON object:
+            { "cube_size": 0.5,
+              "world_min": [-3, -0.3, -3],
+              "world_max": [ 3,  2.9, 3],
+              "reset": true }
+        Any field is optional; defaults match cubes.CubeGrid defaults.
+        Re-calling /cubes/start with a different cube_size or bbox replaces
+        the grid (counters lost). With the same shape and reset=false the
+        existing counters are kept and recording is just re-armed.
+        """
+        global cube_grid, cube_recording
+        body = self._read_body()
+        cfg = {}
+        if body:
+            try:
+                cfg = json.loads(body.decode("utf-8"))
+            except Exception as e:  # noqa: BLE001
+                self._send_text(400, f"bad JSON body: {e}\n")
+                return
+        try:
+            import cubes  # tools/ on sys.path
+        except ImportError as e:
+            self._send_text(503, f"cubes module unavailable: {e}\n")
+            return
+
+        cube_size = float(cfg.get("cube_size", cubes.CubeGrid.DEFAULT_CUBE_SIZE))
+        world_min = cfg.get("world_min")
+        world_max = cfg.get("world_max")
+        reset_flag = bool(cfg.get("reset", True))
+
+        # Decide whether to rebuild. Rebuild on first call, on geometry change,
+        # or when reset=true. Otherwise keep the existing counters.
+        rebuild = (
+            cube_grid is None
+            or reset_flag
+            or abs(getattr(cube_grid, "cube_size", 0) - cube_size) > 1e-9
+            or (world_min is not None and list(world_min) != list(getattr(cube_grid, "world_min", [])))
+        )
+        if rebuild:
+            try:
+                cube_grid = cubes.CubeGrid(
+                    cube_size=cube_size,
+                    world_min=tuple(world_min) if world_min is not None else None,
+                    world_max=tuple(world_max) if world_max is not None else None,
+                )
+            except Exception as e:  # noqa: BLE001
+                self._send_text(400, f"CubeGrid init failed: {type(e).__name__}: {e}\n")
+                return
+
+        cube_recording = True
+        sys.stderr.write(
+            f"[{self.address_string()}] CUBES start "
+            f"cube_size={cube_grid.cube_size}m shape={cube_grid.shape} "
+            f"({cube_grid.n_cubes} cubes) recording=on\n"
+        )
+        self._send_json(200, {
+            "recording": True,
+            "cube_size": cube_grid.cube_size,
+            "shape": list(cube_grid.shape),
+            "world_min": cube_grid.world_min.tolist(),
+            "world_max": cube_grid.world_max.tolist(),
+            "n_cubes": cube_grid.n_cubes,
+            "frames": cube_grid.frames,
+        })
+
+    def _handle_cubes_stop(self) -> None:
+        global cube_recording
+        if cube_grid is None:
+            self._send_text(409, "no cube grid initialised — call /cubes/start first\n")
+            return
+        cube_recording = False
+        sys.stderr.write(
+            f"[{self.address_string()}] CUBES stop after {cube_grid.frames} frames "
+            f"(recording=off)\n"
+        )
+        self._send_json(200, {"recording": False, "frames": cube_grid.frames})
+
+    def _handle_cubes_reset(self) -> None:
+        if cube_grid is None:
+            self._send_text(409, "no cube grid initialised\n")
+            return
+        cube_grid.reset()
+        sys.stderr.write(f"[{self.address_string()}] CUBES reset\n")
+        self._send_json(200, {"reset": True, "frames": 0})
+
+    def _handle_cubes_state(self) -> None:
+        if cube_grid is None:
+            self._send_json(200, {"ready": False, "recording": False, "cubes": []})
+            return
+        # Optional ?threshold=0.25&min=2 query overrides.
+        threshold = 0.25
+        min_obs = 2
+        if "?" in self.path:
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            if "threshold" in qs:
+                try:
+                    threshold = max(0.0, min(1.0, float(qs["threshold"][0])))
+                except ValueError:
+                    pass
+            if "min" in qs:
+                try:
+                    min_obs = max(1, int(qs["min"][0]))
+                except ValueError:
+                    pass
+        try:
+            payload = cube_grid.state(threshold=threshold, min_observations=min_obs)
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"{type(e).__name__}: {e}\n")
+            return
+        payload["ready"] = True
+        payload["recording"] = cube_recording
+        self._send_json(200, payload)
 
     def _handle_frame(self) -> None:
         global frame_count
@@ -488,6 +623,16 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 self._send_text(500, f"{type(e).__name__}: {e}\n")
                 return
 
+        cube_summary = ""
+        if cube_grid is not None and cube_recording:
+            try:
+                cs = cube_grid.ingest_frame(frame)
+                cube_summary = (
+                    f" cubes(vis={cs['visible']} occ+={cs['occupied']} free+={cs['free']})"
+                )
+            except Exception as e:  # noqa: BLE001
+                cube_summary = f" cubes(err: {type(e).__name__}: {e})"
+
         color_summary = ""
         if frame["color"] is not None:
             color_summary = f" color={frame['color_width']}x{frame['color_height']}"
@@ -498,7 +643,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             f"[{ip}] FRAME #{frame_count} {frame['width']}x{frame['height']} "
             f"fmt={frame['format']} rawToM={frame['rawValueToMeters']:.6f} "
             f"pose=({pose_translation[0]:+.2f},{pose_translation[1]:+.2f},{pose_translation[2]:+.2f})"
-            f"{depth_summary}{color_summary}{ingest_summary}\n"
+            f"{depth_summary}{color_summary}{ingest_summary}{cube_summary}\n"
         )
         self._send_json(200, {"ok": True, "frame": frame_count})
 

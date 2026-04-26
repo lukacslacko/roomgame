@@ -8,19 +8,28 @@ pipeline, with one unsolved issue (gradual ARCore pose drift).
 ## Architecture
 
 ```
-[Android Chrome / WebXR depth + camera]
-         │  binary frames (depth + RGBA + pose)
-         ▼  HTTPS POST /frame, ~5–10 fps with backpressure
-[Python serve.py]
-   ├── parse_frame      (224-byte header + payload)
-   ├── fusion.py        (depth pixel → world point)
-   ├── voxel_store.py   (chunked uint8 RGBA grid + ICP)
-   └── meshing.py       (dense marching cubes → GLB)
-         │
-         ▼  /out/room.glb
-[Laptop browser, three.js]
-   └── game.html        (fly cam, SSAO, vertex colours, shadows)
+[Android Chrome / WebXR depth + camera]   [OAK-D Lite via USB-C / DepthAI v3]
+         │  binary frames                          │  Sync-paired depth + RGB
+         ▼  HTTPS POST /frame, ~5–10 fps           ▼  in-process, ~10 fps
+[Python serve.py]                         [Python tools/oakd_scan.py]
+   ├── parse_frame      (224-byte hdr)             ├── depthai pipeline
+   ├── fusion.py        (depth → world)            ├── intrinsics unproject
+   │                                                │
+   └─────────────► voxel_store.py ◄─────────────────┘
+                  (chunked uint8 RGBA grid + ICP)
+                          │
+                          ▼
+                     meshing.py (dense marching cubes → GLB)
+                          │
+                          ▼  web/out/room.glb
+                  [Laptop browser, three.js]
+                  └── game.html (fly cam, SSAO, vertex colours, shadows)
 ```
+
+Two interchangeable capture front ends share the same voxel + meshing
+back end. The WebXR scanner integrates over HTTP `POST /frame`; the
+OAK-D scanner runs as a standalone process and writes the same
+`web/out/room.glb` directly. Pick whichever is convenient.
 
 No build step on either side; three.js loaded via importmap from
 jsdelivr. Server is stdlib `ThreadingHTTPServer` with HTTPS auto-cert
@@ -49,6 +58,121 @@ Phone HUD:
 Laptop viewer:
 - `WASD` move, `Space`/`Shift` up/down, arrows look, drag-to-look,
   wheel dollies.
+
+## Pose stability validation (`/pose.html`)
+
+Open `/pose.html` on the phone to validate how much ARCore drifts on
+this device:
+
+1. Tap **Enter AR**.
+2. Tap anywhere (or the `⊕` button) to mark the current pose as origin.
+3. Walk around. Translation (cm) and Euler angles (yaw/pitch/roll, deg)
+   are shown live, plus a top-down trajectory plot.
+4. Return to the start pose; readings should fall back near zero.
+   Whatever residual remains is ARCore's drift on this run.
+
+The page is self-contained — no server-side state, no recording. It's a
+sanity check before doing a long capture.
+
+## Coarse occupancy cubes (`/cubes.html`)
+
+The cube scanner is a simpler, more robust alternative to the 2 cm
+voxel pipeline. It maintains a dense 3D grid of larger cubes (default
+25 cm) with two saturating counters per cube:
+
+- `occupied` ticks each time a frame's depth map shows a surface
+  passing through that cube while the cube is fully visible.
+- `free` ticks each time the cube is fully visible *and* every valid
+  sample reports the surface beyond the cube (i.e. the camera saw
+  past the cube into empty space).
+
+Cubes with `occupied / (occupied + free) > threshold` (default 0.25)
+are returned by `GET /cubes/state` and rendered live on the phone:
+
+- **Plain mode**: cubes drawn with alpha = mix slider, blended on top
+  of camera passthrough.
+- **Occluded mode**: per-fragment depth comparison with the live
+  WebXR depth buffer hides cube fragments behind real surfaces.
+
+Endpoints:
+
+| Method | Path | Body / query | Effect |
+|---|---|---|---|
+| POST | `/cubes/start` | `{cube_size?, world_min?, world_max?, reset?}` | Init/replace grid; turn recording on |
+| POST | `/cubes/stop`  | — | Turn recording off |
+| POST | `/cubes/reset` | — | Wipe counters |
+| GET  | `/cubes/state` | `?threshold=0.25&min=2` | JSON: cube list with indices + counts |
+
+While `/cubes/start` is active, every `/frame` ingestion also feeds
+the cube grid. Raw frame bodies still land in `captured_frames/` for
+later offline reconstruction (planned 5 cm voxel-within-cube pass).
+
+## Alternative scanner: OAK-D Lite
+
+The Android Chrome scanner is the default, but if you have a Luxonis
+**OAK-D Lite** depth camera you can scan from the laptop directly over
+USB-C — no phone, no HTTPS dance, no ARCore drift.
+
+```
+# one-time install (in the same venv as serve.py)
+pip install -r tools/oakd_requirements.txt
+
+# plug the OAK-D Lite into a USB-C *data* cable, then:
+python tools/oakd_scan.py                   # default 640x360 @ 15 fps
+python tools/oakd_scan.py --preview         # live RGB + depth preview
+python tools/oakd_scan.py --min-hits 20     # stricter noise filter
+python tools/oakd_scan.py --remesh-every 30 # rewrite room.glb every 30 frames
+```
+
+Ctrl-C (or ESC in the preview window) stops capture and writes
+`web/out/room.npz` + `web/out/room.glb`. Open
+`https://localhost:8080/game.html` (run `tools/serve.py` in another
+terminal) to fly through the result — the viewer doesn't know or care
+which scanner produced the GLB.
+
+What `oakd_scan.py` actually does:
+
+1. Builds a DepthAI v3 pipeline that aligns the stereo-depth output to
+   the colour camera on-device (`StereoDepth.setDepthAlign(CAM_A)` +
+   `setOutputSize`) so depth pixel `(i, j)` corresponds to RGB pixel
+   `(i, j)` exactly, and pairs the two streams via a `dai.node.Sync`
+   so we read them as a single timestamp-aligned `MessageGroup`
+   (avoids dropping ~half the frames to RGB/depth queue skew).
+2. Reads the calibrated intrinsics for that resolution from
+   `Device.readCalibration().getCameraIntrinsics(CAM_A, W, H)`.
+3. Unprojects each depth pixel (uint16 mm) through `(fx, fy, cx, cy)`
+   into camera-frame metres, converts OpenCV camera axes
+   `(x_right, y_down, z_forward)` → OpenGL/three.js world axes
+   `(x_right, y_up, z_back)` so the voxel grid lines up the same way
+   the WebXR scanner produces.
+4. Tracks the camera pose by running one Procrustes-ICP iteration
+   per frame against the cumulative voxel grid (using
+   `voxel_store._check_drift`, the same machinery the WebXR scanner
+   uses for drift correction). Frame 1 anchors the world origin.
+
+**Pose-tracking caveats.** OAK-D Lite has no SLAM and the cost-reduced
+units have no IMU either, so we have no a priori pose. The script
+relies entirely on frame-to-grid ICP, which means:
+
+- Adjacent frames must overlap on real surfaces — pan **slowly**
+  (sweep, don't dart). Per-frame motion above ~5 cm or ~2° gets capped
+  by `voxel_store`'s ICP safety limits and drift will accumulate.
+- Hold the device upright (USB-C connector consistently down or up).
+  The first frame defines world Y=up relative to whatever attitude the
+  camera has at startup.
+- The first ~1500 voxels are inserted with no ICP refinement (drift
+  detection needs a populated grid to query against). At 2 cm voxels
+  this is roughly the first 1–2 frames; ICP starts kicking in by
+  frame 3.
+
+If pose tracking falls over, try `--no-icp` to confirm raw capture is
+working, then scan more slowly. `--preview` is invaluable for
+sanity-checking what the depth map looks like.
+
+**Hardware notes.** USB-C from a laptop is enough power; no external
+adapter needed. Most early-Kickstarter OAK-D Lite units shipped without
+the IMU, later units have a BMI270 — `oakd_scan.py` prints which one is
+attached on startup but doesn't currently use it.
 
 ## What works
 
@@ -170,20 +294,29 @@ In rough order of likely payoff vs. cost:
 ```
 tools/
   serve.py            — stdlib HTTPS server. Endpoints:
-                          POST /frame  ingest a binary frame
-                          POST /save   write room.npz
-                          POST /reset  wipe grid + drift state
-                          POST /remesh write room.glb
-                          GET  /stats  JSON status
-                          POST /log    phone console mirror
+                          POST /frame         ingest a binary frame
+                          POST /save          write room.npz
+                          POST /reset         wipe voxel grid + drift state
+                          POST /remesh        write room.glb
+                          GET  /stats         JSON status
+                          POST /cubes/start   init coarse cube grid + start recording
+                          POST /cubes/stop    stop cube ingestion
+                          POST /cubes/reset   wipe cube counters
+                          GET  /cubes/state   JSON list of populated cubes
+                          POST /log           phone console mirror
   fusion.py           — depth + pose → world points (with colour samples)
   voxel_store.py      — VoxelRoom: chunked sparse RGBA grid + Procrustes ICP
+  cubes.py            — CubeGrid: dense coarse-cube occupancy/free counters
   meshing.py          — dense marching cubes + GLB writer with vertex colours
   replay.py           — offline replay of captured_frames/ for debugging
+  oakd_scan.py        — alternative scanner using a Luxonis OAK-D Lite over USB-C
   requirements.txt    — numpy, scikit-image, trimesh
+  oakd_requirements.txt — depthai, opencv-python, scipy (only for oakd_scan.py)
 web/
   index.html          — landing page
   scan.html / .js     — phone WebXR scanner with depth overlay + reset
+  pose.html / .js     — phone pose-stability validator (tap-to-anchor, return-to-zero)
+  cubes.html / .js    — phone cube scanner + live overlay (plain & depth-occluded)
   game.html / .js     — laptop fly-through viewer with SSAO + shadows
   logbridge.js        — mirrors phone console.log to /log
   styles.css          — shared styles
