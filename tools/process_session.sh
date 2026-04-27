@@ -12,9 +12,16 @@
 # single-pass scans (no revisits) skip them gracefully.
 #
 # Usage:
-#   tools/process_session.sh <session_id>     # full pipeline
+#   tools/process_session.sh <session_id>                    # full pipeline
 #   tools/process_session.sh <session_id> --no-refine        # skip step 1
 #   tools/process_session.sh <session_id> --no-loop-closure  # skip step 2
+#
+# Anything after the session id that isn't a known flag is forwarded to
+# every voxel-reverse invocation, e.g.:
+#   tools/process_session.sh <id> --voxel-size 0.025 --threshold 0.2
+#   tools/process_session.sh <id> --no-loop-closure -- --min-color-count 3
+# (the bare `--` is optional but lets you forward args that share a name
+# with our flags).
 #
 # Run from the project root, with .venv active and the Rust binary built.
 set -euo pipefail
@@ -23,16 +30,18 @@ SESSION="${1:-}"
 shift || true
 SKIP_REFINE=0
 SKIP_LOOP=0
-for arg in "$@"; do
-  case "$arg" in
-    --no-refine)        SKIP_REFINE=1 ;;
-    --no-loop-closure)  SKIP_LOOP=1 ;;
-    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+PASSTHROUGH=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-refine)       SKIP_REFINE=1; shift ;;
+    --no-loop-closure) SKIP_LOOP=1;   shift ;;
+    --)                shift; PASSTHROUGH+=("$@"); break ;;
+    *)                 PASSTHROUGH+=("$1"); shift ;;
   esac
 done
 
 if [[ -z "$SESSION" ]]; then
-  echo "usage: $0 <session_id> [--no-refine] [--no-loop-closure]" >&2
+  echo "usage: $0 <session_id> [--no-refine] [--no-loop-closure] [-- voxel-reverse-args …]" >&2
   exit 2
 fi
 
@@ -81,7 +90,8 @@ for entry in "${VARIANTS[@]}"; do
     printf "\n--- %s → %s ---\n" "$src" "$dst"
     "$RUST_BIN" \
       --frames-dir "$SESSION_DIR/$src" \
-      --out        "$SESSION_DIR/$dst"
+      --out        "$SESSION_DIR/$dst" \
+      ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
   else
     printf "\n--- %s → %s (skipped: dir not present) ---\n" "$src" "$dst"
   fi
