@@ -1,0 +1,13 @@
+# Optional dependencies for the OAK-D Lite scanner (tools/oakd_scan.py).
+# Only needed if you actually have the device. The WebXR phone scanner
+# does not need any of this.
+#
+#   pip install -r tools/oakd_requirements.txt
+#
+# depthai ships native arm64 wheels for macOS (M-series) since 2.17.x.
+# No `brew install libusb` and no udev rules are required on macOS;
+# just plug the OAK-D Lite into a USB-C *data* cable.
+
+depthai>=3.0        # Luxonis DepthAI v3 API (Camera node, requestOutput, no XLinkOut)
+opencv-python>=4.8  # used for the optional --preview window and colour maps
+scipy>=1.11         # cKDTree for ICP refinement in voxel_store
