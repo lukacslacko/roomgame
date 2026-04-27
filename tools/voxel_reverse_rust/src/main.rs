@@ -14,7 +14,7 @@
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glam::{DMat4, DVec3, DVec4};
@@ -240,8 +240,15 @@ fn project_voxel_to_frame(
 // ----------------------------------------------------------------------
 
 struct Args {
-    frames_dir: PathBuf,
-    out: PathBuf,
+    // Two ways to specify input:
+    //   --session <id> [--frames-root <dir>]   → run twice
+    //                                            (frames/ + frames_refined/),
+    //                                            outputs go into the session dir
+    //   --frames-dir <dir> [--out <path>]      → single ad-hoc run
+    session: Option<String>,
+    frames_root: PathBuf,
+    frames_dir: Option<PathBuf>,
+    out: Option<PathBuf>,
     voxel_size: f64,
     world_min: [f64; 3],
     world_max: [f64; 3],
@@ -256,8 +263,10 @@ struct Args {
 impl Args {
     fn parse() -> Args {
         let mut a = Args {
-            frames_dir: PathBuf::from("captured_frames"),
-            out: PathBuf::from("web/out/voxels.json"),
+            session: None,
+            frames_root: PathBuf::from("captured_frames"),
+            frames_dir: None,
+            out: None,
             voxel_size: 0.05,
             world_min: [-2.5, -0.3, -2.5],
             world_max: [ 2.5,  4.7,  2.5],
@@ -268,20 +277,22 @@ impl Args {
             min_color_count: 1,
             max_frames: None,
         };
-        let mut args: Vec<String> = env::args().skip(1).collect();
+        let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
-                "--frames-dir" => { a.frames_dir = PathBuf::from(args[i+1].clone()); i += 2; }
-                "--out"        => { a.out        = PathBuf::from(args[i+1].clone()); i += 2; }
-                "--voxel-size" => { a.voxel_size = args[i+1].parse().unwrap();        i += 2; }
-                "--near"       => { a.near       = args[i+1].parse().unwrap();        i += 2; }
-                "--far"        => { a.far        = args[i+1].parse().unwrap();        i += 2; }
-                "--tol"        => { a.tol        = args[i+1].parse().unwrap();        i += 2; }
-                "--threshold"  => { a.threshold  = args[i+1].parse().unwrap();        i += 2; }
+                "--session"     => { a.session     = Some(args[i+1].clone());        i += 2; }
+                "--frames-root" => { a.frames_root = PathBuf::from(args[i+1].clone()); i += 2; }
+                "--frames-dir"  => { a.frames_dir  = Some(PathBuf::from(args[i+1].clone())); i += 2; }
+                "--out"         => { a.out         = Some(PathBuf::from(args[i+1].clone())); i += 2; }
+                "--voxel-size"  => { a.voxel_size  = args[i+1].parse().unwrap();     i += 2; }
+                "--near"        => { a.near        = args[i+1].parse().unwrap();     i += 2; }
+                "--far"         => { a.far         = args[i+1].parse().unwrap();     i += 2; }
+                "--tol"         => { a.tol         = args[i+1].parse().unwrap();     i += 2; }
+                "--threshold"   => { a.threshold   = args[i+1].parse().unwrap();     i += 2; }
                 "--min-color-count" => { a.min_color_count = args[i+1].parse().unwrap(); i += 2; }
-                "--max-frames" => { a.max_frames = Some(args[i+1].parse().unwrap()); i += 2; }
-                "--world-min"  => {
+                "--max-frames"  => { a.max_frames  = Some(args[i+1].parse().unwrap()); i += 2; }
+                "--world-min"   => {
                     a.world_min = [
                         args[i+1].parse().unwrap(),
                         args[i+2].parse().unwrap(),
@@ -289,7 +300,7 @@ impl Args {
                     ];
                     i += 4;
                 }
-                "--world-max"  => {
+                "--world-max"   => {
                     a.world_max = [
                         args[i+1].parse().unwrap(),
                         args[i+2].parse().unwrap(),
@@ -298,7 +309,9 @@ impl Args {
                     i += 4;
                 }
                 "-h" | "--help" => {
-                    eprintln!("usage: voxel-reverse [--frames-dir DIR] [--out PATH] \\
+                    eprintln!("usage: voxel-reverse \\
+        --session <id> [--frames-root DIR]      # session mode (writes both variants) \\
+      | --frames-dir DIR [--out PATH]           # ad-hoc mode \\
         [--voxel-size M] [--world-min X Y Z] [--world-max X Y Z] \\
         [--near M] [--far M] [--tol M] \\
         [--threshold R] [--min-color-count N] [--max-frames N]");
@@ -309,19 +322,25 @@ impl Args {
                     std::process::exit(2);
                 }
             }
-            args.truncate(args.len()); // silence unused_assignments lints
         }
         a
     }
 }
 
-fn main() {
-    let args = Args::parse();
+/// Returns true if a JSON file was written, false if the input dir was empty
+/// or yielded no kept voxels.
+fn run_pass(
+    label: &str,
+    frames_dir: &Path,
+    out_path: &Path,
+    args: &Args,
+) -> bool {
+    println!("=== {label} ===");
+    println!("frames-dir: {:?}", frames_dir);
+    println!("out:        {:?}", out_path);
 
-    println!("rayon threads: {}", rayon::current_num_threads());
-
-    // Load frame paths.
-    let mut frame_paths: Vec<PathBuf> = match fs::read_dir(&args.frames_dir) {
+    // Load + sort frame paths.
+    let mut frame_paths: Vec<PathBuf> = match fs::read_dir(frames_dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -333,8 +352,8 @@ fn main() {
             })
             .collect(),
         Err(e) => {
-            eprintln!("cannot read frames-dir {:?}: {}", args.frames_dir, e);
-            std::process::exit(1);
+            eprintln!("cannot read frames-dir {:?}: {}", frames_dir, e);
+            return false;
         }
     };
     frame_paths.sort();
@@ -342,8 +361,8 @@ fn main() {
         frame_paths.truncate(n);
     }
     if frame_paths.is_empty() {
-        eprintln!("no frames found in {:?}", args.frames_dir);
-        std::process::exit(1);
+        eprintln!("no frames found in {:?}", frames_dir);
+        return false;
     }
 
     // Decode frames in parallel.
@@ -370,7 +389,7 @@ fn main() {
     println!("  decoded {}/{} frames in {:.2} s",
              frames.len(), frame_paths.len(),
              t_dec.elapsed().as_secs_f64());
-    if frames.is_empty() { return; }
+    if frames.is_empty() { return false; }
     if let Some(f0) = frames.first() {
         println!("  depth {}×{}, color {}×{}", f0.h, f0.w, f0.ch, f0.cw);
     }
@@ -454,10 +473,10 @@ fn main() {
     let n_kept = indices.len();
     println!("Kept {n_kept} of {n_total} voxels (ratio >= {}, color_count >= {})",
              args.threshold, args.min_color_count);
-    if n_kept == 0 { return; }
+    if n_kept == 0 { return false; }
 
     // JSON output (matches the Python schema).
-    if let Some(parent) = args.out.parent() {
+    if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
         }
@@ -477,8 +496,51 @@ fn main() {
         "colors":  colors,
     });
     let s = serde_json::to_string(&payload).unwrap();
-    let mut f = fs::File::create(&args.out).unwrap();
+    let mut f = fs::File::create(out_path).unwrap();
     f.write_all(s.as_bytes()).unwrap();
-    let size_mb = fs::metadata(&args.out).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
-    println!("Wrote {:?}  ({:.1} MB)", args.out, size_mb);
+    let size_mb = fs::metadata(out_path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+    println!("Wrote {:?}  ({:.1} MB)", out_path, size_mb);
+    true
+}
+
+fn main() {
+    let args = Args::parse();
+    println!("rayon threads: {}", rayon::current_num_threads());
+
+    if let Some(session_id) = &args.session {
+        // Session mode: produce both voxels_original.json and (if refined
+        // frames exist) voxels_refined.json into the session dir.
+        let session_dir = args.frames_root.join(session_id);
+        let mut wrote_any = false;
+        let original_dir = session_dir.join("frames");
+        if original_dir.exists() {
+            let out = session_dir.join("voxels_original.json");
+            if run_pass("original", &original_dir, &out, &args) {
+                wrote_any = true;
+            }
+        } else {
+            eprintln!("session has no frames/ subdir at {:?}", original_dir);
+        }
+        let refined_dir = session_dir.join("frames_refined");
+        if refined_dir.exists() {
+            let out = session_dir.join("voxels_refined.json");
+            if run_pass("refined", &refined_dir, &out, &args) {
+                wrote_any = true;
+            }
+        } else {
+            println!("(no frames_refined/ — run tools/depth_refine.py first to add it)");
+        }
+        if !wrote_any {
+            std::process::exit(1);
+        }
+    } else {
+        // Ad-hoc mode (single dir → single output).
+        let frames_dir = args.frames_dir.clone()
+            .unwrap_or_else(|| PathBuf::from("captured_frames"));
+        let out = args.out.clone()
+            .unwrap_or_else(|| PathBuf::from("web/out/voxels.json"));
+        if !run_pass("ad-hoc", &frames_dir, &out, &args) {
+            std::process::exit(1);
+        }
+    }
 }
