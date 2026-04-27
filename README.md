@@ -5,6 +5,46 @@ The plan is for it to eventually become a small racing/destruction game
 inside the scanned room. Right now it's a working scanner + reconstruction
 pipeline, with one unsolved issue (gradual ARCore pose drift).
 
+## Reconstruct a captured session
+
+Each phone scan goes into its own `captured_frames/<timestamp>/frames/`
+directory; the timestamp is minted by the server when the scanner page
+loads (`POST /session/new`). Once you've finished a recording, refine the
+depth with Depth Anything V2 and voxelise both the original and refined
+depths into the session dir:
+
+```
+# 1. (one-time) install the depth-refine deps; pulls torch + the model
+#                weights (~2 GB total, cached).
+source .venv/bin/activate
+pip install -r tools/depth_refine_requirements.txt
+
+# 2. (one-time) build the Rust voxeliser in release mode.
+(cd tools/voxel_reverse_rust && cargo build --release)
+
+# 3. Per recording — replace <session> with the timestamp directory you
+#                    see under captured_frames/.
+SESSION=20260427_113426
+
+python tools/depth_refine.py --session "$SESSION"
+tools/voxel_reverse_rust/target/release/voxel-reverse --session "$SESSION"
+```
+
+`depth_refine.py` runs Depth Anything V2 Metric Indoor on each colour
+frame, fits a per-frame affine `(a, b)` against the phone's lowres depth
+on valid pixels, and writes refined float32 frames into
+`captured_frames/<session>/frames_refined/`. Roughly 1.5 s per frame on
+M2 Pro MPS.
+
+`voxel-reverse --session <id>` reads both `frames/` and `frames_refined/`
+(if present) and writes `voxels_original.json` + `voxels_refined.json`
+into the session dir. ~50 ms per pass for ≈100 frames × 1 M voxels.
+
+Open `https://localhost:8443/voxelview.html` (with `tools/serve.py`
+running) — the viewer's two dropdowns auto-populate from `/sessions` and
+default to the newest session + the refined variant. Reload re-fetches
+the list.
+
 ## Architecture
 
 ```
