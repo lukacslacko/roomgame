@@ -1,6 +1,9 @@
 # Local Python venv
 .venv/
 
+# Claude Code per-project state
+.claude/
+
 # Phone-captured frame bodies — re-captureable, often large, room-private.
 captured_frames/
 
