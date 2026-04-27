@@ -46,10 +46,13 @@
     }
     .toolbar label { opacity: 0.7; font-size: 0.82rem; }
 
-    /* Frame-debug panel: scrollable thumbnail list on the left. */
+    /* Frame-debug panel: scrollable thumbnail list on the left.
+       Width sized for two ~200 px-wide portrait thumbs side-by-side plus
+       a small info column; only ~2 frames fit on a 1080p screen, which
+       matches the deliberate "see them well, scroll if needed" goal. */
     .main-row { display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; }
     #framePanel {
-      width: 300px; flex: 0 0 300px;
+      width: 520px; flex: 0 0 520px;
       overflow-y: auto; overflow-x: hidden;
       background: #0c0c10; border-right: 1px solid #222;
       font-size: 0.82rem;
@@ -70,30 +73,38 @@
     #framePanel .panel-list { padding: 0.2rem 0; }
     .frame-item {
       display: grid;
-      grid-template-columns: auto auto 1fr;
+      grid-template-columns: 6px 80px 1fr 1fr;
       gap: 0.4rem;
-      padding: 0.3rem 0.5rem;
+      padding: 0.45rem 0.5rem;
       border-bottom: 1px solid #14141a;
       cursor: pointer;
-      align-items: center;
+      align-items: stretch;
     }
     .frame-item:hover { background: #14141c; }
     .frame-item.selected { background: #15263f; box-shadow: inset 3px 0 0 #6ec4ff; }
     .frame-item .swatch {
-      width: 8px; height: 28px; border-radius: 1px;
+      border-radius: 2px;
       background: transparent;
+      align-self: stretch;
     }
     .frame-item.selected .swatch { background: var(--swatch-color, #6ec4ff); }
-    .frame-item .thumbs {
-      display: flex; flex-direction: column; gap: 2px;
-    }
     .frame-item img {
-      width: 70px; height: auto; max-height: 56px; object-fit: cover;
-      border-radius: 2px; background: #111;
+      width: 100%; height: auto;
+      object-fit: contain;
+      border-radius: 3px;
+      background: #111;
+      align-self: start;       /* don't stretch — preserve aspect */
     }
-    .frame-item .info { line-height: 1.25; }
+    .frame-item .info { line-height: 1.3; padding-top: 0.1rem; }
     .frame-item .info .idx { color: #d8e1ff; font-weight: 500; }
-    .frame-item .info .pose { opacity: 0.7; font-size: 0.72rem; font-variant-numeric: tabular-nums; }
+    .frame-item .info .pose {
+      opacity: 0.75; font-size: 0.72rem; font-variant-numeric: tabular-nums;
+      word-break: break-word;
+    }
+    .frame-item .info .label {
+      opacity: 0.5; font-size: 0.7rem; margin-top: 0.4rem;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
   </style>
 </head>
 <body class="viewer">

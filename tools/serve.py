@@ -956,9 +956,19 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 # Frame-debug helpers (called from the per-frame endpoints above).
 # --------------------------------------------------------------------------
 
-def _render_color_thumb(body: bytes, size: int = 240) -> bytes | None:
+def _thumb_target_size(cw: int, ch: int, long_edge: int) -> tuple[int, int]:
+    """Return (out_w, out_h) so the long edge equals `long_edge` and the
+    aspect matches (cw, ch). Both thumbnails (colour + depth) use this so
+    they end up the same shape in the panel."""
+    if cw >= ch:
+        return long_edge, max(1, int(round(long_edge * ch / cw)))
+    return max(1, int(round(long_edge * cw / ch))), long_edge
+
+
+def _render_color_thumb(body: bytes, size: int = 600) -> bytes | None:
     """Decode the captured RGBA payload, vertical-flip from GL convention to
-    natural orientation, downscale to a thumbnail, return PNG bytes."""
+    natural orientation, downscale to a thumbnail with long edge ≤ `size`,
+    return PNG bytes."""
     import io
     import numpy as np
     from PIL import Image
@@ -968,16 +978,23 @@ def _render_color_thumb(body: bytes, size: int = 240) -> bytes | None:
     cw = int(frame["color_width"]); ch = int(frame["color_height"])
     rgba = np.frombuffer(frame["color"], dtype=np.uint8).reshape(ch, cw, 4)
     rgb = np.ascontiguousarray(rgba[::-1, :, :3])  # GL → CV
-    img = Image.fromarray(rgb)
-    img.thumbnail((size, size), Image.LANCZOS)
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    img = Image.fromarray(rgb).resize((out_w, out_h), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=False)
     return buf.getvalue()
 
 
-def _render_depth_thumb(body: bytes, size: int = 240) -> bytes | None:
-    """Render the phone (or refined) depth map as a small grayscale PNG.
-    Pixels with no depth get the background colour."""
+def _render_depth_thumb(body: bytes, size: int = 600) -> bytes | None:
+    """Render the depth map as a grayscale PNG aligned with the colour image:
+    we resample the (possibly landscape) depth buffer into the colour image's
+    pixel grid via Bd⁻¹ at the target thumbnail resolution. That way colour
+    and depth thumbs share orientation and aspect, and pixel-for-pixel they
+    correspond to the same view ray.
+
+    Pixels for which Bd⁻¹ lands outside the depth buffer (e.g. the corners
+    of a wider-FOV colour image where the depth sensor doesn't cover) get
+    rendered black."""
     import io
     import numpy as np
     from PIL import Image
@@ -985,21 +1002,54 @@ def _render_depth_thumb(body: bytes, size: int = 240) -> bytes | None:
     import fusion  # noqa: E402
     frame = parse_frame(body)
     dw = int(frame["width"]); dh = int(frame["height"])
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    if cw == 0 or ch == 0:
+        # Fall back to the raw depth grid if there's no colour to align to.
+        cw, ch = dw, dh
     depth = fusion.decode_depth(
         frame["depth"], dw, dh,
         int(frame["format"]), float(frame["rawValueToMeters"]),
     )
-    valid = (depth > 0) & np.isfinite(depth)
+    Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+
+    # Build a sampling grid at the *thumbnail's* output resolution in the
+    # colour image's UV space, then map each cell through Bd to land in the
+    # depth-buffer pixel grid.
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing="ij")
+    u = (xx + 0.5) / out_w        # colour UV (0,0) bottom-left … but we
+    v = (yy + 0.5) / out_h        # render top-down for natural display, see flip below
+    nv = np.stack([u, v, np.zeros_like(u), np.ones_like(u)], axis=-1)
+    nd = nv @ Bd.T
+    safe = np.where(np.abs(nd[..., 3]) > 1e-12, nd[..., 3], 1.0)
+    u_d = nd[..., 0] / safe
+    v_d = nd[..., 1] / safe
+    bx = (1.0 - u_d) * dw
+    by = v_d * dh
+    in_buf = (bx >= 0) & (bx <= dw - 1) & (by >= 0) & (by <= dh - 1)
+    bxc = np.clip(bx, 0.0, dw - 1.0 - 1e-3)
+    byc = np.clip(by, 0.0, dh - 1.0 - 1e-3)
+    bx0 = np.floor(bxc).astype(np.int32); by0 = np.floor(byc).astype(np.int32)
+    bx1 = np.minimum(bx0 + 1, dw - 1); by1 = np.minimum(by0 + 1, dh - 1)
+    fx = (bxc - bx0).astype(np.float32); fy = (byc - by0).astype(np.float32)
+    d00 = depth[by0, bx0]; d10 = depth[by0, bx1]
+    d01 = depth[by1, bx0]; d11 = depth[by1, bx1]
+    sampled = ((d00 * (1 - fx) + d10 * fx) * (1 - fy)
+               + (d01 * (1 - fx) + d11 * fx) * fy)
+    sampled = np.where(in_buf, sampled, 0.0)
+
+    valid = (sampled > 0) & np.isfinite(sampled)
     if not valid.any():
-        norm = np.zeros_like(depth, dtype=np.uint8)
+        norm = np.zeros_like(sampled, dtype=np.uint8)
     else:
-        d_min = float(np.percentile(depth[valid], 2))
-        d_max = float(np.percentile(depth[valid], 98))
+        d_min = float(np.percentile(sampled[valid], 2))
+        d_max = float(np.percentile(sampled[valid], 98))
         d_max = max(d_max, d_min + 1e-3)
-        norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0) * 255.0
+        norm = np.clip((sampled - d_min) / (d_max - d_min), 0.0, 1.0) * 255.0
         norm = np.where(valid, norm, 0).astype(np.uint8)
-    img = Image.fromarray(norm[::-1, :], mode="L")  # vertical flip for natural
-    img.thumbnail((size, size), Image.LANCZOS)
+    # Sampling grid above had v=0 at the colour image's bottom (matching the
+    # GL-convention buffer). Vertical-flip for natural top-down display.
+    img = Image.fromarray(norm[::-1, :], mode="L")
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=False)
     return buf.getvalue()

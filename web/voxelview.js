@@ -548,21 +548,10 @@ function renderFramePanel() {
     item.style.setProperty("--swatch-color",
                            `rgb(${(c.r*255)|0},${(c.g*255)|0},${(c.b*255)|0})`);
 
+    // Grid layout: [swatch] [info column] [colour thumb] [depth thumb]
     const swatch = document.createElement("span");
     swatch.className = "swatch";
     item.appendChild(swatch);
-
-    const thumbs = document.createElement("div");
-    thumbs.className = "thumbs";
-    const colorImg = document.createElement("img");
-    colorImg.loading = "lazy";
-    colorImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=frames&kind=color`;
-    thumbs.appendChild(colorImg);
-    const depthImg = document.createElement("img");
-    depthImg.loading = "lazy";
-    depthImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=frames&kind=depth`;
-    thumbs.appendChild(depthImg);
-    item.appendChild(thumbs);
 
     const info = document.createElement("div");
     info.className = "info";
@@ -572,9 +561,26 @@ function renderFramePanel() {
     info.appendChild(idx);
     const pose = document.createElement("div");
     pose.className = "pose";
-    pose.textContent = `(${f.pose[0].toFixed(2)}, ${f.pose[1].toFixed(2)}, ${f.pose[2].toFixed(2)})`;
+    pose.textContent = `(${f.pose[0].toFixed(2)},\n${f.pose[1].toFixed(2)},\n${f.pose[2].toFixed(2)})`;
+    pose.style.whiteSpace = "pre";
     info.appendChild(pose);
+    const labelRgb = document.createElement("div");
+    labelRgb.className = "label";
+    labelRgb.textContent = "rgb · depth";
+    info.appendChild(labelRgb);
     item.appendChild(info);
+
+    const colorImg = document.createElement("img");
+    colorImg.loading = "lazy";
+    colorImg.alt = `rgb #${f.idx}`;
+    colorImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=frames&kind=color`;
+    item.appendChild(colorImg);
+
+    const depthImg = document.createElement("img");
+    depthImg.loading = "lazy";
+    depthImg.alt = `depth #${f.idx}`;
+    depthImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=frames&kind=depth`;
+    item.appendChild(depthImg);
 
     item.addEventListener("click", () => toggleFrameSelection(f.idx, item));
     frag.appendChild(item);
