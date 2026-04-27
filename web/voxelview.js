@@ -210,18 +210,44 @@ function renderSessionDropdown() {
   syncVariantOptions();
 }
 
+// Variant naming convention: any captured_frames/<id>/voxels_<name>.json on
+// disk shows up here. We sort the dropdown by a hand-tuned "quality"
+// preference so the most processed variant lands at the top, then fall
+// back alphabetically. Default selection on a new session goes to the
+// top entry; the user's previous choice is preserved if still valid.
+const VARIANT_ORDER = ["refined_aligned", "aligned", "refined", "original"];
+function _variantSortKey(v) {
+  const i = VARIANT_ORDER.indexOf(v);
+  return i >= 0 ? [0, i, v] : [1, 0, v];
+}
+
 function syncVariantOptions() {
   const sid = sessionSel.value;
   const sess = availableSessions.find((s) => s.id === sid);
-  const have = new Set(sess ? sess.variants : []);
-  for (const opt of variantSel.options) {
-    opt.disabled = !have.has(opt.value);
+  const variants = (sess ? sess.variants : []).slice().sort((a, b) => {
+    const ka = _variantSortKey(a), kb = _variantSortKey(b);
+    if (ka[0] !== kb[0]) return ka[0] - kb[0];
+    if (ka[1] !== kb[1]) return ka[1] - kb[1];
+    return ka[2] < kb[2] ? -1 : 1;
+  });
+  const previous = variantSel.value;
+  variantSel.innerHTML = "";
+  if (variants.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = ""; opt.textContent = "(no variants)";
+    variantSel.appendChild(opt);
+    return;
   }
-  // Default to refined if present, else original; but keep the user's
-  // previous pick when it's still valid.
-  if (variantSel.options[variantSel.selectedIndex]?.disabled) {
-    if (have.has("refined"))      variantSel.value = "refined";
-    else if (have.has("original")) variantSel.value = "original";
+  for (const v of variants) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    variantSel.appendChild(opt);
+  }
+  if (previous && variants.includes(previous)) {
+    variantSel.value = previous;
+  } else {
+    variantSel.value = variants[0];   // best-ranked variant
   }
 }
 

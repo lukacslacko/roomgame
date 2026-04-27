@@ -282,11 +282,14 @@ import time as _time
 SESSIONS: dict[str, dict] = {}
 SESSIONS_LOCK = _threading.Lock()
 DEFAULT_SESSION_ID: str | None = None
-# Allowed variant suffixes (matches what depth_refine.py + the Rust voxeliser
-# write into the session dir). Keep this list short on purpose so an attacker
-# can't make /captures/ read arbitrary files.
-SESSION_VARIANTS = ("original", "refined")
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+# Variant naming for `voxels_<variant>.json` files inside a session dir.
+# The set of variants isn't fixed (depth_refine.py, the loop-closure tool,
+# future MVS refiners etc. all write under their own name) so we accept
+# anything matching VARIANT_RE and let the per-session listing report what's
+# actually on disk. The strict regex still blocks path traversal.
+SESSION_ID_RE      = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+SESSION_VARIANT_RE = re.compile(r"^[A-Za-z0-9_\-]{1,32}$")
+SESSION_VOXELS_FILE_RE = re.compile(r"^voxels_([A-Za-z0-9_\-]{1,32})\.json$")
 
 
 def _mint_session_id() -> str:
@@ -754,9 +757,12 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                             if p.is_file() and p.name.startswith("frame_") and p.suffix == ".bin"
                         )
                     variants = []
-                    for v in SESSION_VARIANTS:
-                        if (child / f"voxels_{v}.json").exists():
-                            variants.append(v)
+                    for p in child.iterdir():
+                        if not p.is_file(): continue
+                        m = SESSION_VOXELS_FILE_RE.match(p.name)
+                        if m:
+                            variants.append(m.group(1))
+                    variants.sort()
                     result.append({
                         "id": child.name,
                         "n_frames": n_frames,
@@ -770,8 +776,8 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_capture_static(self, path: str) -> None:
         """Serve a vetted subset of files under captured_frames/. Only
-        `voxels_<variant>.json` for known variants is exposed; anything else
-        (raw .bin frames, refined depths) returns 404."""
+        `voxels_<variant>.json` files matching the regexes are exposed;
+        raw .bin frames, refined depths, and anything else return 404."""
         # path = "/captures/<id>/voxels_<variant>.json"
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/voxels_([A-Za-z0-9_\-]{1,32})\.json",
@@ -780,8 +786,6 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         if not m:
             self.send_response(404); self.end_headers(); return
         session_id, variant = m.group(1), m.group(2)
-        if variant not in SESSION_VARIANTS:
-            self.send_response(404); self.end_headers(); return
         f = FRAMES_DIR / session_id / f"voxels_{variant}.json"
         if not f.exists() or not f.is_file():
             self.send_response(404); self.end_headers(); return
