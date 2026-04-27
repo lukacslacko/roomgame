@@ -225,6 +225,13 @@ function syncVariantOptions() {
   }
 }
 
+// Camera is only repositioned on the very first successful load; subsequent
+// reloads (variant switch, session switch, Reload button) keep the user's
+// current viewpoint so A/B-ing between variants doesn't snap them away from
+// the spot they were inspecting. The shadow bounds are still refreshed
+// every time via recenter(false).
+let hasLoadedOnce = false;
+
 async function loadVoxels() {
   reloadBtn.disabled = true;
   stMsg.textContent = "loading…";
@@ -245,7 +252,8 @@ async function loadVoxels() {
     stSize.textContent = `${payload.voxel_size?.toFixed?.(2) ?? "?"} m`;
     const tag = sid ? `${sid} · ${variant}` : "legacy /out/voxels.json";
     stMsg.textContent = `bbox ${payload.shape?.join("×") ?? "?"} · ${tag}`;
-    recenter(true);
+    recenter(!hasLoadedOnce);
+    hasLoadedOnce = true;
   } catch (e) {
     stMsg.textContent = `error: ${e.message || e}`;
     console.error(e);
