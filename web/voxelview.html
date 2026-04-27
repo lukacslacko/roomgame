@@ -45,6 +45,55 @@
       font-family: inherit;
     }
     .toolbar label { opacity: 0.7; font-size: 0.82rem; }
+
+    /* Frame-debug panel: scrollable thumbnail list on the left. */
+    .main-row { display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; }
+    #framePanel {
+      width: 300px; flex: 0 0 300px;
+      overflow-y: auto; overflow-x: hidden;
+      background: #0c0c10; border-right: 1px solid #222;
+      font-size: 0.82rem;
+    }
+    #framePanel .panel-head {
+      display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap;
+      padding: 0.4rem 0.6rem; border-bottom: 1px solid #1c1c24;
+      position: sticky; top: 0; background: #0c0c10; z-index: 1;
+    }
+    #framePanel .panel-head button {
+      background: #2563eb; color: white; border: 0; border-radius: 0.3rem;
+      padding: 0.2rem 0.55rem; font-size: 0.78rem; cursor: pointer;
+    }
+    #framePanel .panel-head button.secondary {
+      background: #1f1f24; border: 1px solid #353541;
+    }
+    #framePanel .panel-stat { opacity: 0.6; font-size: 0.78rem; }
+    #framePanel .panel-list { padding: 0.2rem 0; }
+    .frame-item {
+      display: grid;
+      grid-template-columns: auto auto 1fr;
+      gap: 0.4rem;
+      padding: 0.3rem 0.5rem;
+      border-bottom: 1px solid #14141a;
+      cursor: pointer;
+      align-items: center;
+    }
+    .frame-item:hover { background: #14141c; }
+    .frame-item.selected { background: #15263f; box-shadow: inset 3px 0 0 #6ec4ff; }
+    .frame-item .swatch {
+      width: 8px; height: 28px; border-radius: 1px;
+      background: transparent;
+    }
+    .frame-item.selected .swatch { background: var(--swatch-color, #6ec4ff); }
+    .frame-item .thumbs {
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .frame-item img {
+      width: 70px; height: auto; max-height: 56px; object-fit: cover;
+      border-radius: 2px; background: #111;
+    }
+    .frame-item .info { line-height: 1.25; }
+    .frame-item .info .idx { color: #d8e1ff; font-weight: 500; }
+    .frame-item .info .pose { opacity: 0.7; font-size: 0.72rem; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body class="viewer">
@@ -56,6 +105,7 @@
     <button id="reloadBtn">Reload</button>
     <button id="recenterBtn">Recenter</button>
     <button id="lightingBtn" title="Toggle lit / flat shading. Flat = no shadows, no SSAO, raw captured colours">Flat</button>
+    <button id="panelToggleBtn" title="Show / hide the per-frame debug panel">Frames ▸</button>
     <span class="spacer"></span>
     <span class="keys">
       <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>
@@ -69,7 +119,17 @@
     <span class="stat">size <b id="stSize">—</b></span>
     <span class="stat" id="stMsg">loading…</span>
   </div>
-  <div id="stage"></div>
+  <div class="main-row">
+    <aside id="framePanel" hidden>
+      <div class="panel-head">
+        <span class="panel-stat" id="framePanelCount">0 frames</span>
+        <span class="spacer" style="flex: 1"></span>
+        <button id="panelClearBtn" class="secondary" title="Deselect all">clear</button>
+      </div>
+      <div class="panel-list" id="framePanelList"></div>
+    </aside>
+    <div id="stage"></div>
+  </div>
   <script type="module" src="./voxelview.js"></script>
 </body>
 </html>
