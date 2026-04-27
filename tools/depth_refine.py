@@ -54,20 +54,29 @@ DEPTH_FMT_FLOAT32 = 1
 
 def _encode_refined_body(orig_body: bytes, refined_depth_m: np.ndarray) -> bytes:
     """Take the original frame body and return a new one with the depth
-    payload replaced by `refined_depth_m` (float32 metres, format=1,
-    rawValueToMeters=1.0). Matrices and colour payload are byte-identical.
-    """
+    payload replaced by `refined_depth_m`.
+
+    The refined buffer can be at any resolution we like (we keep the same Bd
+    coordinate frame as the original ARCore depth — that matrix maps view-UV
+    to normalised depth-buffer-UV regardless of the buffer's pixel count,
+    so denser is just denser). We rewrite depth_w / depth_h in the header
+    accordingly. Format is forced to float32 metres (rawValueToMeters=1)
+    so we don't quantise twice."""
+    new_dh, new_dw = refined_depth_m.shape
     header = bytearray(orig_body[:FRAME_HEADER_SIZE])
+    struct.pack_into("<I", header, 192, new_dw)            # depth_w
+    struct.pack_into("<I", header, 196, new_dh)            # depth_h
     struct.pack_into("<f", header, 200, 1.0)               # rawValueToMeters
     struct.pack_into("<I", header, 204, DEPTH_FMT_FLOAT32) # depth_format
 
     orig_frame = serve.parse_frame(orig_body)
-    dw = orig_frame["width"]; dh = orig_frame["height"]
-    if refined_depth_m.shape != (dh, dw):
-        raise ValueError(
-            f"refined depth shape {refined_depth_m.shape} != phone ({dh},{dw})"
-        )
     new_depth = refined_depth_m.astype(np.float32, copy=False).tobytes()
+    expected_bytes = new_dw * new_dh * 4
+    if len(new_depth) != expected_bytes:
+        raise ValueError(
+            f"refined depth payload size mismatch: {len(new_depth)} bytes "
+            f"vs expected {expected_bytes} for ({new_dh},{new_dw})"
+        )
     color = orig_frame["color"] or b""
     return bytes(header) + new_depth + color
 
@@ -229,24 +238,34 @@ def refine_session(
             pred, size=(ch_, cw), mode="bilinear", align_corners=False,
         )[0, 0].detach().to("cpu").float().numpy()
 
-        # Resample to depth grid.
         Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
         dw = int(frame["width"]); dh = int(frame["height"])
-        model_on_depth = _resample_model_to_depth_grid(pred_full, cw, ch_, Bd, dw, dh)
 
+        # Fit the affine at phone-depth resolution (~90×160) — small, stable,
+        # and the only resolution at which the phone depth exists. Then
+        # apply the same (a, b) at colour resolution where the model output
+        # actually has detail.
+        model_on_phone = _resample_model_to_depth_grid(pred_full, cw, ch_, Bd, dw, dh)
         phone_depth = fusion.decode_depth(
             frame["depth"], dw, dh,
             int(frame["format"]), float(frame["rawValueToMeters"]),
         )
+        a, b, n_used = _fit_affine(model_on_phone, phone_depth, near, far)
 
-        a, b, n_used = _fit_affine(model_on_depth, phone_depth, near, far)
-        refined = (a * model_on_depth + b)
-        # NaNs (out-of-frame from Bd) → fall back to 0 so downstream treats
-        # them as "no measurement".
-        refined = np.where(np.isfinite(refined), refined, 0.0)
-        refined = np.clip(refined, 0.0, far)
+        # Apply the affine at colour resolution, then re-grid into the
+        # original Bd coordinate frame (still the same Bd, just a denser
+        # output buffer — Rust reads dw/dh from the header).
+        refined_color = (a * pred_full + b).astype(np.float32)
+        target_dw, target_dh = cw, ch_
+        refined_hi = _resample_model_to_depth_grid(
+            refined_color, cw, ch_, Bd, target_dw, target_dh,
+        )
+        # NaNs (out-of-frame after Bd⁻¹) → 0 so downstream treats them as
+        # "no measurement".
+        refined_hi = np.where(np.isfinite(refined_hi), refined_hi, 0.0)
+        refined_hi = np.clip(refined_hi, 0.0, far).astype(np.float32)
 
-        new_body = _encode_refined_body(body, refined)
+        new_body = _encode_refined_body(body, refined_hi)
         (out_dir / fp.name).write_bytes(new_body)
 
         fits.append((a, b, n_used))
