@@ -537,6 +537,15 @@ function renderFramePanel() {
     return;
   }
   const sid = sessionSel.value;
+  // Pick the depth-thumbnail source: prefer the model-derived depth in
+  // `frames_refined/` (i.e. what depth_refine.py wrote out — that's the
+  // depth the user actually wants to inspect for debugging), fall back
+  // to the phone's lowres ARCore depth in `frames/` if the session hasn't
+  // been through the refiner yet.
+  const sessInfo = availableSessions.find((s) => s.id === sid);
+  const depthDir = (sessInfo && (sessInfo.n_frames_refined ?? 0) > 0)
+                   ? "frames_refined" : "frames";
+  const depthLabel = depthDir === "frames_refined" ? "model depth" : "phone depth";
   // Render in batches to keep the DOM responsive on long sessions.
   const frag = document.createDocumentFragment();
   for (const f of frames) {
@@ -566,7 +575,7 @@ function renderFramePanel() {
     info.appendChild(pose);
     const labelRgb = document.createElement("div");
     labelRgb.className = "label";
-    labelRgb.textContent = "rgb · depth";
+    labelRgb.textContent = `rgb · ${depthLabel}`;
     info.appendChild(labelRgb);
     item.appendChild(info);
 
@@ -579,7 +588,7 @@ function renderFramePanel() {
     const depthImg = document.createElement("img");
     depthImg.loading = "lazy";
     depthImg.alt = `depth #${f.idx}`;
-    depthImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=frames&kind=depth`;
+    depthImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=${encodeURIComponent(depthDir)}&kind=depth`;
     item.appendChild(depthImg);
 
     item.addEventListener("click", () => toggleFrameSelection(f.idx, item));
