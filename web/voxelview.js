@@ -16,6 +16,8 @@ const lightingBtn = document.getElementById("lightingBtn");
 const stVoxels = document.getElementById("stVoxels");
 const stSize = document.getElementById("stSize");
 const stMsg = document.getElementById("stMsg");
+const sessionSel = document.getElementById("sessionSel");
+const variantSel = document.getElementById("variantSel");
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x101015);
@@ -138,13 +140,102 @@ function rebuildMesh(payload) {
   applyLightingMode();
 }
 
+// State: which session/variant the dropdowns are pointing at, plus the
+// last fetched /sessions snapshot so we can recompute "available variants
+// for current session" without hitting the network on every dropdown change.
+let availableSessions = [];
+
+function urlFor(sessionId, variant) {
+  if (sessionId) {
+    return `/captures/${encodeURIComponent(sessionId)}/voxels_${encodeURIComponent(variant)}.json?t=${Date.now()}`;
+  }
+  // Legacy fallback: old /out/voxels.json written by the standalone tools.
+  return `/out/voxels.json?t=${Date.now()}`;
+}
+
+async function refreshSessionList() {
+  try {
+    const r = await fetch("/sessions");
+    if (!r.ok) {
+      console.warn(`/sessions HTTP ${r.status}`);
+      return;
+    }
+    const j = await r.json();
+    availableSessions = j.sessions || [];
+  } catch (e) {
+    console.warn("/sessions fetch failed", e);
+    availableSessions = [];
+  }
+  renderSessionDropdown();
+}
+
+function renderSessionDropdown() {
+  // Newest sessions first; only sessions with at least one voxel JSON are
+  // worth selecting, but we still show the rest so the user can spot a
+  // session they haven't run the voxeliser on yet.
+  const usable = availableSessions
+    .filter((s) => (s.variants || []).length > 0)
+    .sort((a, b) => (a.id < b.id ? 1 : -1));
+  const stale = availableSessions
+    .filter((s) => (s.variants || []).length === 0)
+    .sort((a, b) => (a.id < b.id ? 1 : -1));
+
+  const previous = sessionSel.value;
+  sessionSel.innerHTML = "";
+  if (usable.length === 0 && stale.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = ""; opt.textContent = "(no sessions yet)";
+    sessionSel.appendChild(opt);
+  } else {
+    for (const s of usable) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = `${s.id}  (${s.variants.join(", ")})`;
+      sessionSel.appendChild(opt);
+    }
+    for (const s of stale) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = `${s.id}  (no voxels yet)`;
+      opt.disabled = true;
+      sessionSel.appendChild(opt);
+    }
+  }
+
+  // Pick previous if still present, otherwise the newest usable session.
+  let pick = previous && [...sessionSel.options].some((o) => o.value === previous)
+    ? previous
+    : (usable[0]?.id || "");
+  sessionSel.value = pick;
+  syncVariantOptions();
+}
+
+function syncVariantOptions() {
+  const sid = sessionSel.value;
+  const sess = availableSessions.find((s) => s.id === sid);
+  const have = new Set(sess ? sess.variants : []);
+  for (const opt of variantSel.options) {
+    opt.disabled = !have.has(opt.value);
+  }
+  // Default to refined if present, else original; but keep the user's
+  // previous pick when it's still valid.
+  if (variantSel.options[variantSel.selectedIndex]?.disabled) {
+    if (have.has("refined"))      variantSel.value = "refined";
+    else if (have.has("original")) variantSel.value = "original";
+  }
+}
+
 async function loadVoxels() {
   reloadBtn.disabled = true;
   stMsg.textContent = "loading…";
+  const sid = sessionSel.value || "";
+  const variant = variantSel.value || "refined";
   try {
-    const r = await fetch(`/out/voxels.json?t=${Date.now()}`);
+    const r = await fetch(urlFor(sid, variant));
     if (!r.ok) {
-      stMsg.textContent = `voxels.json: HTTP ${r.status}`;
+      stMsg.textContent = sid
+        ? `${sid}/${variant}: HTTP ${r.status}`
+        : `voxels.json: HTTP ${r.status}`;
       stVoxels.textContent = "—";
       return;
     }
@@ -152,7 +243,8 @@ async function loadVoxels() {
     rebuildMesh(payload);
     stVoxels.textContent = (payload.n_voxels || 0).toLocaleString();
     stSize.textContent = `${payload.voxel_size?.toFixed?.(2) ?? "?"} m`;
-    stMsg.textContent = `bbox ${payload.shape?.join("×") ?? "?"}`;
+    const tag = sid ? `${sid} · ${variant}` : "legacy /out/voxels.json";
+    stMsg.textContent = `bbox ${payload.shape?.join("×") ?? "?"} · ${tag}`;
     recenter(true);
   } catch (e) {
     stMsg.textContent = `error: ${e.message || e}`;
@@ -179,8 +271,10 @@ function recenter(adjustCamera) {
   sun.shadow.camera.updateProjectionMatrix();
 }
 
-reloadBtn.addEventListener("click", loadVoxels);
+reloadBtn.addEventListener("click", () => refreshSessionList().then(loadVoxels));
 recenterBtn.addEventListener("click", () => recenter(true));
+sessionSel.addEventListener("change", () => { syncVariantOptions(); loadVoxels(); });
+variantSel.addEventListener("change", () => loadVoxels());
 
 // "Flat" mode: kill the directional sun + hemisphere + SSAO and crank the
 // ambient up to 1.0 so each voxel renders as its captured colour without
@@ -329,4 +423,6 @@ renderer.setAnimationLoop(() => {
   composer.render();
 });
 
-loadVoxels();
+// Boot: fetch the session list first so the dropdowns are populated before
+// the initial fetch picks the latest session + refined variant.
+refreshSessionList().then(loadVoxels);

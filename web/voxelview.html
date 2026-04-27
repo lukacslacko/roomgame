@@ -39,10 +39,23 @@
       font-size: 0.78rem; color: #d8e1ff;
     }
     .keys-hint { margin-left: 0.4rem; opacity: 0.6; font-size: 0.82rem; }
+    .toolbar select {
+      background: #1f1f24; color: #d8e1ff; border: 1px solid #353541;
+      border-radius: 0.3rem; padding: 0.25rem 0.4rem; font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .toolbar label { opacity: 0.7; font-size: 0.82rem; }
   </style>
 </head>
 <body class="viewer">
   <div class="toolbar">
+    <label for="sessionSel">session</label>
+    <select id="sessionSel"><option>(loading…)</option></select>
+    <label for="variantSel">variant</label>
+    <select id="variantSel">
+      <option value="refined">refined</option>
+      <option value="original">original</option>
+    </select>
     <button id="reloadBtn">Reload</button>
     <button id="recenterBtn">Recenter</button>
     <button id="lightingBtn" title="Toggle lit / flat shading. Flat = no shadows, no SSAO, raw captured colours">Flat</button>

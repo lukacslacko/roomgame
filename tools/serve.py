@@ -264,13 +264,62 @@ def ensure_cert(cert_dir: Path, sans: list[str]) -> tuple[Path, Path]:
 # When it's None, /frame still parses + logs (for transport debugging) but
 # /save and /stats return a clear "not initialised" response.
 voxel_room: object | None = None
-frame_count = 0
+frame_count = 0  # legacy global, kept for /stats; per-session counts live in SESSIONS
 
 # Coarse occupancy cubes — independent representation populated by /frame
 # while a recording is active (controlled by /cubes/start and /cubes/stop).
 # `cube_grid` is None until /cubes/start is called for the first time.
 cube_grid: object | None = None
 cube_recording: bool = False
+
+# Per-session frame state. Each "session" is a phone scanner page-load on the
+# laptop's wall clock — clients call POST /session/new to mint one and then
+# include ?session=<id> on every /frame POST. Frames land under
+# `captured_frames/<id>/frames/`. Legacy frames (no session) fall back to
+# `captured_frames/frame_NNNNNN.bin` so existing recordings keep working.
+import threading as _threading
+import time as _time
+SESSIONS: dict[str, dict] = {}
+SESSIONS_LOCK = _threading.Lock()
+DEFAULT_SESSION_ID: str | None = None
+# Allowed variant suffixes (matches what depth_refine.py + the Rust voxeliser
+# write into the session dir). Keep this list short on purpose so an attacker
+# can't make /captures/ read arbitrary files.
+SESSION_VARIANTS = ("original", "refined")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def _mint_session_id() -> str:
+    return _time.strftime("%Y%m%d_%H%M%S", _time.localtime())
+
+
+def _ensure_session(session_id: str | None = None) -> str:
+    """Create the session if it doesn't exist yet. Pass `session_id=None` to
+    mint a fresh wall-clock id; collisions within the same second get a
+    `_2`, `_3`, … suffix."""
+    with SESSIONS_LOCK:
+        if session_id is None:
+            base = _mint_session_id()
+            sid = base
+            n = 2
+            while sid in SESSIONS or (FRAMES_DIR / sid).exists():
+                sid = f"{base}_{n}"
+                n += 1
+        else:
+            sid = session_id
+        if sid not in SESSIONS:
+            SESSIONS[sid] = {"count": 0, "created": _time.time()}
+            try:
+                (FRAMES_DIR / sid / "frames").mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                sys.stderr.write(f"session {sid}: mkdir failed: {e}\n")
+        return sid
+
+
+def _next_frame_index(session_id: str) -> int:
+    with SESSIONS_LOCK:
+        SESSIONS[session_id]["count"] += 1
+        return SESSIONS[session_id]["count"]
 
 
 def init_voxel_room(voxel_size_m: float) -> None:
@@ -331,9 +380,15 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         global frame_count
-        path = self.path.rstrip("/") or "/"
+        from urllib.parse import urlparse
+        path = (urlparse(self.path).path or "/").rstrip("/") or "/"
         if path == "/frame":
             self._handle_frame()
+            return
+        if path == "/session/new":
+            sid = _ensure_session()
+            sys.stderr.write(f"[{self.address_string()}] new session: {sid}\n")
+            self._send_json(200, {"session": sid})
             return
         if path == "/save":
             if voxel_room is None:
@@ -403,6 +458,12 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         from urllib.parse import urlparse
         path = (urlparse(self.path).path or "/").rstrip("/") or "/"
+        if path == "/sessions":
+            self._handle_sessions_list()
+            return
+        if path.startswith("/captures/"):
+            self._handle_capture_static(path)
+            return
         if path == "/cubes/state":
             self._handle_cubes_state()
             return
@@ -537,7 +598,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, payload)
 
     def _handle_frame(self) -> None:
-        global frame_count
+        global frame_count, DEFAULT_SESSION_ID
         body = self._read_body()
         try:
             frame = parse_frame(body)
@@ -549,10 +610,30 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         view = frame["viewMatrix"]
         pose_translation = (view[12], view[13], view[14])  # column-major: last column = translation
 
-        # Persist the raw body for offline replay (tools/replay.py).
+        # Resolve the recording session for this frame. New clients pass
+        # ?session=<id>; legacy clients (no query) use the server's default
+        # session, minted on first such frame.
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        session_id = (qs.get("session") or [None])[0]
+        if session_id is not None:
+            if not SESSION_ID_RE.match(session_id):
+                self._send_text(400, f"invalid session id: {session_id!r}\n")
+                return
+            session_id = _ensure_session(session_id)
+        else:
+            if DEFAULT_SESSION_ID is None:
+                DEFAULT_SESSION_ID = _ensure_session()
+                sys.stderr.write(f"[{ip}] minted default session {DEFAULT_SESSION_ID} "
+                                 f"for legacy /frame post\n")
+            session_id = DEFAULT_SESSION_ID
+        idx = _next_frame_index(session_id)
+
+        # Persist the raw body for offline replay + offline reconstruction.
         try:
-            FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-            (FRAMES_DIR / f"frame_{frame_count:06d}.bin").write_bytes(body)
+            session_frames_dir = FRAMES_DIR / session_id / "frames"
+            session_frames_dir.mkdir(parents=True, exist_ok=True)
+            (session_frames_dir / f"frame_{idx:06d}.bin").write_bytes(body)
         except OSError as e:
             sys.stderr.write(f"[{ip}] frame-save failed: {e}\n")
 
@@ -640,12 +721,80 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             color_summary = " color=none"
 
         sys.stderr.write(
-            f"[{ip}] FRAME #{frame_count} {frame['width']}x{frame['height']} "
+            f"[{ip}] {session_id} #{idx:06d} {frame['width']}x{frame['height']} "
             f"fmt={frame['format']} rawToM={frame['rawValueToMeters']:.6f} "
             f"pose=({pose_translation[0]:+.2f},{pose_translation[1]:+.2f},{pose_translation[2]:+.2f})"
             f"{depth_summary}{color_summary}{ingest_summary}{cube_summary}\n"
         )
-        self._send_json(200, {"ok": True, "frame": frame_count})
+        self._send_json(200, {"ok": True, "session": session_id, "frame": idx})
+
+    def _handle_sessions_list(self) -> None:
+        """Enumerate session directories under captured_frames/ and report
+        the frame count + which voxel JSON variants are present."""
+        result = []
+        try:
+            if FRAMES_DIR.exists():
+                for child in sorted(FRAMES_DIR.iterdir()):
+                    if not child.is_dir():
+                        continue
+                    if not SESSION_ID_RE.match(child.name):
+                        continue
+                    frames_dir = child / "frames"
+                    n_frames = 0
+                    if frames_dir.exists():
+                        n_frames = sum(
+                            1 for p in frames_dir.iterdir()
+                            if p.is_file() and p.name.startswith("frame_") and p.suffix == ".bin"
+                        )
+                    n_frames_refined = 0
+                    refined_dir = child / "frames_refined"
+                    if refined_dir.exists():
+                        n_frames_refined = sum(
+                            1 for p in refined_dir.iterdir()
+                            if p.is_file() and p.name.startswith("frame_") and p.suffix == ".bin"
+                        )
+                    variants = []
+                    for v in SESSION_VARIANTS:
+                        if (child / f"voxels_{v}.json").exists():
+                            variants.append(v)
+                    result.append({
+                        "id": child.name,
+                        "n_frames": n_frames,
+                        "n_frames_refined": n_frames_refined,
+                        "variants": variants,
+                    })
+        except OSError as e:
+            self._send_text(500, f"sessions enumeration failed: {e}\n")
+            return
+        self._send_json(200, {"sessions": result})
+
+    def _handle_capture_static(self, path: str) -> None:
+        """Serve a vetted subset of files under captured_frames/. Only
+        `voxels_<variant>.json` for known variants is exposed; anything else
+        (raw .bin frames, refined depths) returns 404."""
+        # path = "/captures/<id>/voxels_<variant>.json"
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/voxels_([A-Za-z0-9_\-]{1,32})\.json",
+            path,
+        )
+        if not m:
+            self.send_response(404); self.end_headers(); return
+        session_id, variant = m.group(1), m.group(2)
+        if variant not in SESSION_VARIANTS:
+            self.send_response(404); self.end_headers(); return
+        f = FRAMES_DIR / session_id / f"voxels_{variant}.json"
+        if not f.exists() or not f.is_file():
+            self.send_response(404); self.end_headers(); return
+        try:
+            body = f.read_bytes()
+        except OSError as e:
+            self._send_text(500, f"read failed: {e}\n"); return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def build_ssl_context(cert: Path, key: Path) -> ssl.SSLContext:

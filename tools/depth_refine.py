@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+Per-frame depth refinement using Depth Anything V2 (Metric Indoor).
+
+For a captured session under captured_frames/<session>/frames/, this script
+runs the model on every frame's RGB image, then linearly aligns the model's
+output to the phone's lowres depth buffer (a per-frame scale + shift fit on
+the valid pixels). The aligned depth is written into
+captured_frames/<session>/frames_refined/ in the same wire format the Rust
+voxeliser already understands — only the depth payload changes (re-emitted
+as float32 metres so we don't quantise twice).
+
+Why this shape and not e.g. depth completion?
+    Depth Anything V2 has no public hint/conditioning input — it's an
+    encoder-decoder DPT, RGB → relative depth. The "metric" finetune gives
+    semi-absolute meters but per-frame scale and offset still drift. The
+    phone's lowres ARCore depth is sparse but absolute, so a per-frame
+    affine fit anchors the dense model output to the same scale.
+
+Run:
+    python tools/depth_refine.py --session <id>
+
+Useful flags:
+    --model         HF id (default: depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf)
+    --device        cpu | mps | cuda  (default: auto, mps on Apple Silicon)
+    --max-frames    debug
+"""
+from __future__ import annotations
+
+import argparse
+import struct
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+import fusion
+import serve
+
+PROJECT_ROOT = ROOT.parent
+DEFAULT_FRAMES_ROOT = PROJECT_ROOT / "captured_frames"
+
+FRAME_HEADER_SIZE = serve.FRAME_HEADER_SIZE
+DEPTH_FMT_FLOAT32 = 1
+
+
+# --------------------------------------------------------------------------
+# Frame re-encoding (preserve everything except depth payload + format).
+# --------------------------------------------------------------------------
+
+def _encode_refined_body(orig_body: bytes, refined_depth_m: np.ndarray) -> bytes:
+    """Take the original frame body and return a new one with the depth
+    payload replaced by `refined_depth_m` (float32 metres, format=1,
+    rawValueToMeters=1.0). Matrices and colour payload are byte-identical.
+    """
+    header = bytearray(orig_body[:FRAME_HEADER_SIZE])
+    struct.pack_into("<f", header, 200, 1.0)               # rawValueToMeters
+    struct.pack_into("<I", header, 204, DEPTH_FMT_FLOAT32) # depth_format
+
+    orig_frame = serve.parse_frame(orig_body)
+    dw = orig_frame["width"]; dh = orig_frame["height"]
+    if refined_depth_m.shape != (dh, dw):
+        raise ValueError(
+            f"refined depth shape {refined_depth_m.shape} != phone ({dh},{dw})"
+        )
+    new_depth = refined_depth_m.astype(np.float32, copy=False).tobytes()
+    color = orig_frame["color"] or b""
+    return bytes(header) + new_depth + color
+
+
+# --------------------------------------------------------------------------
+# Model output → phone depth grid (using Bd^{-1} so rays line up).
+# --------------------------------------------------------------------------
+
+def _bilinear_sample(img: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Bilinearly sample a (H, W) array at fractional pixel coords.
+    Coords outside the image return NaN."""
+    h, w = img.shape
+    inside = (x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)
+    x_c = np.clip(x, 0, w - 1 - 1e-3)
+    y_c = np.clip(y, 0, h - 1 - 1e-3)
+    x0 = np.floor(x_c).astype(np.int32); y0 = np.floor(y_c).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1);       y1 = np.minimum(y0 + 1, h - 1)
+    fx = (x_c - x0).astype(np.float32);   fy = (y_c - y0).astype(np.float32)
+    s = ((img[y0, x0] * (1 - fx) + img[y0, x1] * fx) * (1 - fy)
+         + (img[y1, x0] * (1 - fx) + img[y1, x1] * fx) * fy)
+    return np.where(inside, s, np.nan)
+
+
+def _resample_model_to_depth_grid(
+    model_depth_color_grid: np.ndarray,   # (ch, cw)
+    cw: int, ch_: int,
+    Bd: np.ndarray, dw: int, dh: int,
+) -> np.ndarray:
+    """Resample a model depth map from the colour-image grid to the phone
+    depth-buffer grid via Bd⁻¹ so the same view ray hits the same value in
+    both. Output shape: (dh, dw)."""
+    Bv = np.linalg.inv(Bd)  # normView ← normDepthBuffer
+    bx, by = np.meshgrid(np.arange(dw, dtype=np.float64),
+                         np.arange(dh, dtype=np.float64),
+                         indexing="xy")
+    # depth-buffer pixel → norm depth-buffer UV (matches the forward path)
+    u_d = 1.0 - (bx + 0.5) / dw
+    v_d = (by + 0.5) / dh
+    nd_h = np.stack([u_d, v_d, np.zeros_like(u_d), np.ones_like(u_d)], axis=-1)
+    nv_h = nd_h @ Bv.T
+    safe_w = np.where(np.abs(nv_h[..., 3]) > 1e-12, nv_h[..., 3], 1.0)
+    u = nv_h[..., 0] / safe_w
+    v = nv_h[..., 1] / safe_w
+    cx = u * cw - 0.5
+    cy = v * ch_ - 0.5
+    return _bilinear_sample(model_depth_color_grid, cx, cy)
+
+
+# --------------------------------------------------------------------------
+# Robust scale + shift fit.
+# --------------------------------------------------------------------------
+
+def _fit_affine(model_d: np.ndarray, phone_d: np.ndarray,
+                near: float, far: float) -> tuple[float, float, int]:
+    """Fit phone_d ≈ a * model_d + b on valid pixels via OLS, then trim
+    outliers (|residual| > 3·MAD·1.4826) and refit once. Returns (a, b, n_used)."""
+    mask = (
+        (phone_d > near) & (phone_d < far)
+        & np.isfinite(model_d)
+        & (model_d > 1e-3)
+    )
+    n = int(mask.sum())
+    if n < 100:
+        return 1.0, 0.0, n
+    x = model_d[mask].astype(np.float64)
+    y = phone_d[mask].astype(np.float64)
+    a, b = _ols(x, y)
+    resid = y - (a * x + b)
+    mad = np.median(np.abs(resid))
+    if mad > 1e-6:
+        keep = np.abs(resid) < 3.0 * mad * 1.4826
+        if int(keep.sum()) > 100:
+            a2, b2 = _ols(x[keep], y[keep])
+            return a2, b2, int(keep.sum())
+    return a, b, n
+
+
+def _ols(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    xm, ym = float(x.mean()), float(y.mean())
+    var = float(((x - xm) ** 2).mean())
+    if var < 1e-9:
+        return 1.0, ym - xm
+    cov = float(((x - xm) * (y - ym)).mean())
+    a = cov / var
+    return a, ym - a * xm
+
+
+# --------------------------------------------------------------------------
+# Driver.
+# --------------------------------------------------------------------------
+
+def refine_session(
+    session_dir: Path,
+    model_id: str,
+    device_str: str,
+    near: float,
+    far: float,
+    max_frames: int | None,
+) -> None:
+    in_dir  = session_dir / "frames"
+    out_dir = session_dir / "frames_refined"
+    if not in_dir.exists():
+        print(f"no frames dir at {in_dir}", file=sys.stderr)
+        sys.exit(1)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_paths = sorted(in_dir.glob("frame_*.bin"))
+    if max_frames is not None:
+        frame_paths = frame_paths[:max_frames]
+    if not frame_paths:
+        print(f"no frames in {in_dir}", file=sys.stderr)
+        sys.exit(1)
+    print(f"refining {len(frame_paths)} frames in {in_dir}")
+
+    # Lazy-import torch / transformers so a `--help` invocation is cheap.
+    import torch
+    from transformers import pipeline
+
+    if device_str == "auto":
+        if torch.backends.mps.is_available():
+            device_str = "mps"
+        elif torch.cuda.is_available():
+            device_str = "cuda"
+        else:
+            device_str = "cpu"
+    print(f"loading model {model_id} on {device_str}…")
+    t0 = time.time()
+    pipe = pipeline("depth-estimation", model=model_id, device=device_str)
+    print(f"  model ready in {time.time()-t0:.1f} s")
+
+    fits = []
+    t_proc = time.time()
+    for i, fp in enumerate(frame_paths):
+        body = fp.read_bytes()
+        try:
+            frame = serve.parse_frame(body)
+        except Exception as e:  # noqa: BLE001
+            print(f"  parse error on {fp.name}: {e}")
+            continue
+        if frame["color"] is None:
+            print(f"  {fp.name}: no colour, skipping")
+            continue
+
+        cw = int(frame["color_width"]); ch_ = int(frame["color_height"])
+        rgba = np.frombuffer(frame["color"], dtype=np.uint8).reshape(ch_, cw, 4)
+        rgb = Image.fromarray(rgba[..., :3])
+
+        # Run model.
+        result = pipe(rgb)
+        # `predicted_depth` is a torch tensor; on the metric-indoor finetune
+        # the values are already in metres. Resize to (ch_, cw) so the
+        # subsequent Bd⁻¹ resample matches the colour image's pixel grid.
+        pred = result["predicted_depth"]
+        if pred.dim() == 2:
+            pred = pred.unsqueeze(0).unsqueeze(0)
+        elif pred.dim() == 3:
+            pred = pred.unsqueeze(0)
+        pred_full = torch.nn.functional.interpolate(
+            pred, size=(ch_, cw), mode="bilinear", align_corners=False,
+        )[0, 0].detach().to("cpu").float().numpy()
+
+        # Resample to depth grid.
+        Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+        dw = int(frame["width"]); dh = int(frame["height"])
+        model_on_depth = _resample_model_to_depth_grid(pred_full, cw, ch_, Bd, dw, dh)
+
+        phone_depth = fusion.decode_depth(
+            frame["depth"], dw, dh,
+            int(frame["format"]), float(frame["rawValueToMeters"]),
+        )
+
+        a, b, n_used = _fit_affine(model_on_depth, phone_depth, near, far)
+        refined = (a * model_on_depth + b)
+        # NaNs (out-of-frame from Bd) → fall back to 0 so downstream treats
+        # them as "no measurement".
+        refined = np.where(np.isfinite(refined), refined, 0.0)
+        refined = np.clip(refined, 0.0, far)
+
+        new_body = _encode_refined_body(body, refined)
+        (out_dir / fp.name).write_bytes(new_body)
+
+        fits.append((a, b, n_used))
+        if (i + 1) % 5 == 0 or i == 0 or i + 1 == len(frame_paths):
+            elapsed = time.time() - t_proc
+            eta = (elapsed / (i + 1)) * (len(frame_paths) - i - 1)
+            print(f"  [{i+1:4d}/{len(frame_paths)}] {fp.name} "
+                  f"a={a:6.3f} b={b:+.3f} n={n_used:6d} "
+                  f"elapsed {elapsed:5.1f}s ETA {eta:5.1f}s")
+
+    if fits:
+        a_arr = np.array([f[0] for f in fits])
+        b_arr = np.array([f[1] for f in fits])
+        n_arr = np.array([f[2] for f in fits])
+        print(f"\nWrote {len(fits)} refined frames to {out_dir}")
+        print(f"  scale a: median={np.median(a_arr):.3f} "
+              f"p10={np.percentile(a_arr, 10):.3f} "
+              f"p90={np.percentile(a_arr, 90):.3f}")
+        print(f"  shift b: median={np.median(b_arr):+.3f} "
+              f"p10={np.percentile(b_arr, 10):+.3f} "
+              f"p90={np.percentile(b_arr, 90):+.3f}")
+        print(f"  fit pixels: median={int(np.median(n_arr))}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--session", required=True,
+                    help="session id (timestamp dir under captured_frames/)")
+    ap.add_argument("--frames-root", default=str(DEFAULT_FRAMES_ROOT),
+                    help="root holding session dirs (default: captured_frames)")
+    ap.add_argument("--model",
+                    default="depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
+                    help="HuggingFace model id")
+    ap.add_argument("--device", default="auto",
+                    help="cpu | mps | cuda | auto (default: auto)")
+    ap.add_argument("--near", type=float, default=0.05)
+    ap.add_argument("--far",  type=float, default=8.0)
+    ap.add_argument("--max-frames", type=int, default=None)
+    args = ap.parse_args()
+
+    session_dir = Path(args.frames_root) / args.session
+    refine_session(
+        session_dir, args.model, args.device,
+        args.near, args.far, args.max_frames,
+    )
+
+
+if __name__ == "__main__":
+    main()

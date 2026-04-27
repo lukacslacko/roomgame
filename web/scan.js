@@ -67,6 +67,7 @@ let session = null;
 let xrRefSpace = null;
 let gl = null;
 let xrCanvas = null;
+let captureSessionId = null;    // server-minted recording-session id (timestamp)
 let streaming = false;           // tap toggles this. while true, send frames
                                  // as fast as the server returns 200.
 let fetchInFlight = false;       // backpressure: send next frame only when
@@ -116,6 +117,21 @@ async function init() {
 async function startSession() {
   startBtn.disabled = true;
   gateMsg.textContent = "Requesting AR session…";
+
+  // Mint a recording session up front; if the server is unreachable we
+  // still proceed with WebXR but frames will land in the default session.
+  try {
+    const r = await fetch("/session/new", { method: "POST" });
+    if (r.ok) {
+      const j = await r.json();
+      captureSessionId = j.session;
+      console.log(`recording session = ${captureSessionId}`);
+    } else {
+      console.warn(`/session/new HTTP ${r.status} — frames will go to default session`);
+    }
+  } catch (e) {
+    console.warn("/session/new failed", e);
+  }
 
   xrCanvas = document.createElement("canvas");
   xrCanvas.style.position = "fixed";
@@ -550,7 +566,10 @@ async function captureAndSendInner(view, depthInfo, formatCode, bytesPerPixel) {
 
   const t0 = performance.now();
   try {
-    const r = await fetch("/frame", {
+    const url = captureSessionId
+      ? `/frame?session=${encodeURIComponent(captureSessionId)}`
+      : "/frame";
+    const r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: buf,

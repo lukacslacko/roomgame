@@ -36,10 +36,11 @@ const COLOR_NONE = 0;
 const COLOR_RGBA8 = 1;
 
 // ----- session-level state -------------------------------------------------
-let session = null;
+let session = null;            // WebXR XRSession
 let xrRefSpace = null;
 let gl = null;
 let xrCanvas = null;
+let captureSessionId = null;   // server-minted recording-session id (timestamp)
 
 let recording = false;
 let fetchInFlight = false;
@@ -76,6 +77,23 @@ async function init() {
 async function startSession() {
   startBtn.disabled = true;
   gateMsg.textContent = "Requesting AR session…";
+
+  // Mint a fresh server-side recording session so this scan's frames land
+  // in their own captured_frames/<id>/frames/ directory. Failure here is
+  // not fatal — the server falls back to a default session, but then
+  // multiple scans pile into the same dir.
+  try {
+    const r = await fetch("/session/new", { method: "POST" });
+    if (r.ok) {
+      const j = await r.json();
+      captureSessionId = j.session;
+      console.log(`recording session = ${captureSessionId}`);
+    } else {
+      console.warn(`/session/new HTTP ${r.status} — frames will go to default session`);
+    }
+  } catch (e) {
+    console.warn("/session/new failed", e);
+  }
 
   xrCanvas = document.createElement("canvas");
   xrCanvas.style.position = "fixed";
@@ -386,7 +404,10 @@ async function captureAndSendInner(view, depthInfo, formatCode, bytesPerPixel) {
   }
 
   try {
-    const r = await fetch("/frame", {
+    const url = captureSessionId
+      ? `/frame?session=${encodeURIComponent(captureSessionId)}`
+      : "/frame";
+    const r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: buf,
