@@ -45,14 +45,48 @@
       font-family: inherit;
     }
     .toolbar label { opacity: 0.7; font-size: 0.82rem; }
+    /* The 2×2 variant grid — rows = depth source (raw / refined),
+       columns = pose source (raw / aligned). Each cell maps to a
+       voxels_<name>.json on disk. */
+    .variant-grid {
+      display: grid;
+      grid-template-columns: auto auto auto;
+      grid-template-rows: auto auto auto;
+      gap: 0.18rem 0.3rem;
+      align-items: center;
+      font-size: 0.78rem;
+    }
+    .variant-grid .vg-axis { opacity: 0.55; }
+    .variant-grid button {
+      background: #1f1f24; color: #d8e1ff; border: 1px solid #353541;
+      border-radius: 0.3rem; padding: 0.22rem 0.55rem; font-size: 0.78rem;
+      cursor: pointer; min-width: 5.2rem; text-align: center;
+    }
+    .variant-grid button.active {
+      background: #2563eb; color: white; border-color: #2563eb;
+    }
+    .variant-grid button:disabled {
+      background: #15151b; color: #555; border-color: #2a2a36;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body class="viewer">
   <div class="toolbar">
     <label for="sessionSel">session</label>
     <select id="sessionSel"><option>(loading…)</option></select>
-    <label for="variantSel">variant</label>
-    <select id="variantSel"></select>
+    <div class="variant-grid" id="variantGrid"
+         title="Pick which voxel reconstruction to render. Rows = depth source; columns = pose source.">
+      <span></span>
+      <span class="vg-axis">raw poses</span>
+      <span class="vg-axis">aligned</span>
+      <span class="vg-axis">raw depth</span>
+      <button data-variant="original">original</button>
+      <button data-variant="aligned">aligned</button>
+      <span class="vg-axis">refined</span>
+      <button data-variant="refined">refined</button>
+      <button data-variant="refined_aligned">refined+aligned</button>
+    </div>
     <button id="reloadBtn">Reload</button>
     <button id="recenterBtn">Recenter</button>
     <button id="lightingBtn" title="Toggle lit / flat shading. Flat = no shadows, no SSAO, raw captured colours">Flat</button>

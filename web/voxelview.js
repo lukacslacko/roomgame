@@ -17,7 +17,10 @@ const stVoxels = document.getElementById("stVoxels");
 const stSize = document.getElementById("stSize");
 const stMsg = document.getElementById("stMsg");
 const sessionSel = document.getElementById("sessionSel");
-const variantSel = document.getElementById("variantSel");
+const variantBtns = Array.from(
+  document.querySelectorAll("#variantGrid button[data-variant]"),
+);
+let activeVariant = "refined_aligned";   // updated by syncVariantOptions
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x101015);
@@ -210,44 +213,26 @@ function renderSessionDropdown() {
   syncVariantOptions();
 }
 
-// Variant naming convention: any captured_frames/<id>/voxels_<name>.json on
-// disk shows up here. We sort the dropdown by a hand-tuned "quality"
-// preference so the most processed variant lands at the top, then fall
-// back alphabetically. Default selection on a new session goes to the
-// top entry; the user's previous choice is preserved if still valid.
-const VARIANT_ORDER = ["refined_aligned", "aligned", "refined", "original"];
-function _variantSortKey(v) {
-  const i = VARIANT_ORDER.indexOf(v);
-  return i >= 0 ? [0, i, v] : [1, 0, v];
-}
+// Variant grid: 2×2 of (depth source) × (pose source). Available variants
+// come from /sessions; missing combinations get a disabled button. Default
+// = best (refined+aligned) > aligned > refined > original of those that
+// exist on disk for the current session.
+const VARIANT_PREFERENCE = ["refined_aligned", "aligned", "refined", "original"];
 
 function syncVariantOptions() {
   const sid = sessionSel.value;
   const sess = availableSessions.find((s) => s.id === sid);
-  const variants = (sess ? sess.variants : []).slice().sort((a, b) => {
-    const ka = _variantSortKey(a), kb = _variantSortKey(b);
-    if (ka[0] !== kb[0]) return ka[0] - kb[0];
-    if (ka[1] !== kb[1]) return ka[1] - kb[1];
-    return ka[2] < kb[2] ? -1 : 1;
-  });
-  const previous = variantSel.value;
-  variantSel.innerHTML = "";
-  if (variants.length === 0) {
-    const opt = document.createElement("option");
-    opt.value = ""; opt.textContent = "(no variants)";
-    variantSel.appendChild(opt);
-    return;
+  const have = new Set(sess ? sess.variants : []);
+
+  // If our currently active variant is gone (different session, etc.), pick
+  // the best available; otherwise keep what the user had.
+  if (!have.has(activeVariant)) {
+    activeVariant = VARIANT_PREFERENCE.find((v) => have.has(v)) || "";
   }
-  for (const v of variants) {
-    const opt = document.createElement("option");
-    opt.value = v;
-    opt.textContent = v;
-    variantSel.appendChild(opt);
-  }
-  if (previous && variants.includes(previous)) {
-    variantSel.value = previous;
-  } else {
-    variantSel.value = variants[0];   // best-ranked variant
+  for (const btn of variantBtns) {
+    const v = btn.dataset.variant;
+    btn.disabled = !have.has(v);
+    btn.classList.toggle("active", v === activeVariant);
   }
 }
 
@@ -262,7 +247,13 @@ async function loadVoxels() {
   reloadBtn.disabled = true;
   stMsg.textContent = "loading…";
   const sid = sessionSel.value || "";
-  const variant = variantSel.value || "refined";
+  const variant = activeVariant || "";
+  if (!variant) {
+    stMsg.textContent = sid ? `${sid}: no voxel variants on disk` : "no variants";
+    stVoxels.textContent = "—";
+    reloadBtn.disabled = false;
+    return;
+  }
   try {
     const r = await fetch(urlFor(sid, variant));
     if (!r.ok) {
@@ -308,7 +299,14 @@ function recenter(adjustCamera) {
 reloadBtn.addEventListener("click", () => refreshSessionList().then(loadVoxels));
 recenterBtn.addEventListener("click", () => recenter(true));
 sessionSel.addEventListener("change", () => { syncVariantOptions(); loadVoxels(); });
-variantSel.addEventListener("change", () => loadVoxels());
+for (const btn of variantBtns) {
+  btn.addEventListener("click", () => {
+    if (btn.disabled) return;
+    activeVariant = btn.dataset.variant;
+    syncVariantOptions();
+    loadVoxels();
+  });
+}
 
 // "Flat" mode: kill the directional sun + hemisphere + SSAO and crank the
 // ambient up to 1.0 so each voxel renders as its captured colour without

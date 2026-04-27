@@ -508,27 +508,40 @@ fn main() {
     println!("rayon threads: {}", rayon::current_num_threads());
 
     if let Some(session_id) = &args.session {
-        // Session mode: produce both voxels_original.json and (if refined
-        // frames exist) voxels_refined.json into the session dir.
+        // Session mode: voxelise every frame variant present on disk. The
+        // four standard variants come from the offline pipeline:
+        //
+        //   frames/                  → voxels_original.json
+        //   frames_refined/          → voxels_refined.json     (depth_refine.py)
+        //   frames_aligned/          → voxels_aligned.json     (loop_closure --apply)
+        //   frames_refined_aligned/  → voxels_refined_aligned.json
+        //
+        // Each is independent — we just skip the ones whose dir doesn't
+        // exist, so a single-pass scan with no loops still gets two
+        // outputs, and a refine-only run still gets two as well.
         let session_dir = args.frames_root.join(session_id);
+        let variants: &[(&str, &str, &str)] = &[
+            ("original",        "frames",                 "voxels_original.json"),
+            ("refined",         "frames_refined",         "voxels_refined.json"),
+            ("aligned",         "frames_aligned",         "voxels_aligned.json"),
+            ("refined+aligned", "frames_refined_aligned", "voxels_refined_aligned.json"),
+        ];
         let mut wrote_any = false;
-        let original_dir = session_dir.join("frames");
-        if original_dir.exists() {
-            let out = session_dir.join("voxels_original.json");
-            if run_pass("original", &original_dir, &out, &args) {
-                wrote_any = true;
+        let mut saw_original = false;
+        for (label, src, dst) in variants {
+            let dir = session_dir.join(src);
+            if dir.exists() {
+                if *src == "frames" { saw_original = true; }
+                let out = session_dir.join(dst);
+                if run_pass(label, &dir, &out, &args) {
+                    wrote_any = true;
+                }
+            } else {
+                println!("(skipped: {:?} not present)", dir);
             }
-        } else {
-            eprintln!("session has no frames/ subdir at {:?}", original_dir);
         }
-        let refined_dir = session_dir.join("frames_refined");
-        if refined_dir.exists() {
-            let out = session_dir.join("voxels_refined.json");
-            if run_pass("refined", &refined_dir, &out, &args) {
-                wrote_any = true;
-            }
-        } else {
-            println!("(no frames_refined/ — run tools/depth_refine.py first to add it)");
+        if !saw_original {
+            eprintln!("session has no frames/ subdir at {:?}", session_dir);
         }
         if !wrote_any {
             std::process::exit(1);
