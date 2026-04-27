@@ -291,6 +291,16 @@ SESSION_ID_RE      = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 SESSION_VARIANT_RE = re.compile(r"^[A-Za-z0-9_\-]{1,32}$")
 SESSION_VOXELS_FILE_RE = re.compile(r"^voxels_([A-Za-z0-9_\-]{1,32})\.json$")
 
+# Frame-debug endpoints serve from these specific subdirs only.
+FRAME_VARIANT_DIRS = ("frames", "frames_refined", "frames_aligned",
+                      "frames_refined_aligned", "frames_refined_mv")
+# Cap on how many of the captured colour pixels we project for the
+# frame-voxels endpoint (subsample stride = ceil(sqrt(npix / cap))).
+FRAME_VOXELS_PIXEL_CAP = 80_000
+# In-memory thumbnail cache. Keyed by (session, variant_dir, idx, kind).
+_THUMB_CACHE: dict[tuple, bytes] = {}
+_THUMB_CACHE_MAX = 2000  # ~50KB each → ~100MB ceiling
+
 
 def _mint_session_id() -> str:
     return _time.strftime("%Y%m%d_%H%M%S", _time.localtime())
@@ -775,31 +785,385 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, {"sessions": result})
 
     def _handle_capture_static(self, path: str) -> None:
-        """Serve a vetted subset of files under captured_frames/. Only
-        `voxels_<variant>.json` files matching the regexes are exposed;
-        raw .bin frames, refined depths, and anything else return 404."""
-        # path = "/captures/<id>/voxels_<variant>.json"
+        """Dispatch /captures/<id>/… requests. The legacy route
+        `voxels_<variant>.json` is served as a static file; the
+        frame-debug endpoints (manifest, thumb, voxels) hit the helpers
+        below."""
+        from urllib.parse import urlparse, parse_qs
+        purl = urlparse(self.path)
+        path = purl.path or "/"
+
+        # /captures/<id>/voxels_<variant>.json — kept for the voxel viewer.
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/voxels_([A-Za-z0-9_\-]{1,32})\.json",
             path,
         )
-        if not m:
+        if m:
+            session_id, variant = m.group(1), m.group(2)
+            f = FRAMES_DIR / session_id / f"voxels_{variant}.json"
+            if not f.exists() or not f.is_file():
+                self.send_response(404); self.end_headers(); return
+            try:
+                body = f.read_bytes()
+            except OSError as e:
+                self._send_text(500, f"read failed: {e}\n"); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # /captures/<id>/frame-manifest?variant=<vd>
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/frame-manifest", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            variant_dir = (qs.get("variant") or ["frames"])[0]
+            self._handle_frame_manifest(m.group(1), variant_dir)
+            return
+
+        # /captures/<id>/frame-thumb/<idx>.<png|jpg>?variant=<vd>&kind=color|depth
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/frame-thumb/(\d+)\.png", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            variant_dir = (qs.get("variant") or ["frames"])[0]
+            kind = (qs.get("kind") or ["color"])[0]
+            self._handle_frame_thumb(m.group(1), variant_dir, int(m.group(2)), kind)
+            return
+
+        # /captures/<id>/frame-voxels/<idx>.json?variant=<vd>
+        #     &voxel_size=<f>&world_min=x,y,z&shape=Nx,Ny,Nz
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/frame-voxels/(\d+)\.json", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            variant_dir = (qs.get("variant") or ["frames"])[0]
+            voxel_size = float((qs.get("voxel_size") or ["0.05"])[0])
+            world_min  = [float(x) for x in (qs.get("world_min") or ["-2.5,-0.3,-2.5"])[0].split(",")]
+            shape      = [int(x)   for x in (qs.get("shape")     or ["100,100,100"])[0].split(",")]
+            self._handle_frame_voxels(
+                m.group(1), variant_dir, int(m.group(2)),
+                voxel_size, world_min, shape,
+            )
+            return
+
+        self.send_response(404); self.end_headers()
+
+    def _handle_frame_manifest(self, session_id: str, variant_dir: str) -> None:
+        if not SESSION_ID_RE.match(session_id) or variant_dir not in FRAME_VARIANT_DIRS:
             self.send_response(404); self.end_headers(); return
-        session_id, variant = m.group(1), m.group(2)
-        f = FRAMES_DIR / session_id / f"voxels_{variant}.json"
-        if not f.exists() or not f.is_file():
+        d = FRAMES_DIR / session_id / variant_dir
+        if not d.is_dir():
+            self.send_response(404); self.end_headers(); return
+        frames = []
+        try:
+            for fp in sorted(d.glob("frame_*.bin")):
+                m = re.match(r"frame_(\d+)\.bin", fp.name)
+                if not m: continue
+                idx = int(m.group(1))
+                try:
+                    with fp.open("rb") as f:
+                        head = f.read(FRAME_HEADER_SIZE)
+                except OSError:
+                    continue
+                if len(head) < FRAME_HEADER_SIZE: continue
+                # First 16 floats of the header are viewMatrix (column-major
+                # float32). The 4th column is the camera origin in world.
+                view = struct.unpack("<16f", head[:64])
+                pose = [float(view[12]), float(view[13]), float(view[14])]
+                # Forward direction = -view's z column rotated to world.
+                # For column-major storage, column 2 of V is at indices 8,9,10
+                # — that's the view-space +z direction expressed in world. The
+                # camera looks down -z in view, so world-space forward = -col2.
+                fwd = [-float(view[8]), -float(view[9]), -float(view[10])]
+                # Read enough of the trailing fields for depth/colour dims.
+                tail = struct.unpack("<I I f I I I I I", head[192:224])
+                dw, dh, _raw, _dfmt, cw, ch_, _cfmt, _clen = tail
+                frames.append({
+                    "idx": idx,
+                    "pose": pose,
+                    "forward": fwd,
+                    "depth": [int(dw), int(dh)],
+                    "color": [int(cw), int(ch_)],
+                })
+        except OSError as e:
+            self._send_text(500, f"manifest scan failed: {e}\n"); return
+        self._send_json(200, {"session": session_id, "variant": variant_dir, "frames": frames})
+
+    def _handle_frame_thumb(self, session_id: str, variant_dir: str,
+                             idx: int, kind: str) -> None:
+        if not SESSION_ID_RE.match(session_id) or variant_dir not in FRAME_VARIANT_DIRS:
+            self.send_response(404); self.end_headers(); return
+        if kind not in ("color", "depth"):
+            self.send_response(404); self.end_headers(); return
+        cache_key = (session_id, variant_dir, idx, kind)
+        png = _THUMB_CACHE.get(cache_key)
+        if png is None:
+            f = FRAMES_DIR / session_id / variant_dir / f"frame_{idx:06d}.bin"
+            if not f.exists():
+                self.send_response(404); self.end_headers(); return
+            try:
+                body = f.read_bytes()
+                png = (_render_color_thumb(body) if kind == "color"
+                       else _render_depth_thumb(body))
+            except Exception as e:  # noqa: BLE001
+                self._send_text(500, f"thumb render failed: {e}\n"); return
+            if png is None:
+                self.send_response(404); self.end_headers(); return
+            if len(_THUMB_CACHE) >= _THUMB_CACHE_MAX:
+                # Pop an arbitrary entry to bound memory; don't bother with LRU
+                # since the panel's working set is small.
+                _THUMB_CACHE.pop(next(iter(_THUMB_CACHE)))
+            _THUMB_CACHE[cache_key] = png
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(png)
+
+    def _handle_frame_voxels(self, session_id: str, variant_dir: str, idx: int,
+                              voxel_size: float, world_min: list,
+                              shape: list) -> None:
+        if not SESSION_ID_RE.match(session_id) or variant_dir not in FRAME_VARIANT_DIRS:
+            self.send_response(404); self.end_headers(); return
+        if voxel_size <= 0 or voxel_size > 10 or len(world_min) != 3 or len(shape) != 3:
+            self._send_text(400, "bad grid params\n"); return
+        f = FRAMES_DIR / session_id / variant_dir / f"frame_{idx:06d}.bin"
+        if not f.exists():
             self.send_response(404); self.end_headers(); return
         try:
-            body = f.read_bytes()
-        except OSError as e:
-            self._send_text(500, f"read failed: {e}\n"); return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+            indices, pose, frustum_corners = _frame_to_voxel_indices(
+                f.read_bytes(), voxel_size, world_min, shape,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"projection failed: {e}\n"); return
+        self._send_json(200, {
+            "idx": idx,
+            "pose": pose,
+            "frustum_world": frustum_corners,
+            "indices": indices,
+        })
 
+
+# --------------------------------------------------------------------------
+# Frame-debug helpers (called from the per-frame endpoints above).
+# --------------------------------------------------------------------------
+
+def _thumb_target_size(cw: int, ch: int, long_edge: int) -> tuple[int, int]:
+    """Return (out_w, out_h) so the long edge equals `long_edge` and the
+    aspect matches (cw, ch). Both thumbnails (colour + depth) use this so
+    they end up the same shape in the panel."""
+    if cw >= ch:
+        return long_edge, max(1, int(round(long_edge * ch / cw)))
+    return max(1, int(round(long_edge * cw / ch))), long_edge
+
+
+def _render_color_thumb(body: bytes, size: int = 600) -> bytes | None:
+    """Decode the captured RGBA payload, vertical-flip from GL convention to
+    natural orientation, downscale to a thumbnail with long edge ≤ `size`,
+    return PNG bytes."""
+    import io
+    import numpy as np
+    from PIL import Image
+    frame = parse_frame(body)
+    if frame["color"] is None:
+        return None
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    rgba = np.frombuffer(frame["color"], dtype=np.uint8).reshape(ch, cw, 4)
+    rgb = np.ascontiguousarray(rgba[::-1, :, :3])  # GL → CV
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    img = Image.fromarray(rgb).resize((out_w, out_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
+def _render_depth_thumb(body: bytes, size: int = 600) -> bytes | None:
+    """Render the depth map as a grayscale PNG aligned with the colour image:
+    we resample the (possibly landscape) depth buffer into the colour image's
+    pixel grid via Bd⁻¹ at the target thumbnail resolution. That way colour
+    and depth thumbs share orientation and aspect, and pixel-for-pixel they
+    correspond to the same view ray.
+
+    Pixels for which Bd⁻¹ lands outside the depth buffer (e.g. the corners
+    of a wider-FOV colour image where the depth sensor doesn't cover) get
+    rendered black."""
+    import io
+    import numpy as np
+    from PIL import Image
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+    frame = parse_frame(body)
+    dw = int(frame["width"]); dh = int(frame["height"])
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    if cw == 0 or ch == 0:
+        # Fall back to the raw depth grid if there's no colour to align to.
+        cw, ch = dw, dh
+    depth = fusion.decode_depth(
+        frame["depth"], dw, dh,
+        int(frame["format"]), float(frame["rawValueToMeters"]),
+    )
+    Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+
+    # Build a sampling grid at the *thumbnail's* output resolution in the
+    # colour image's UV space, then map each cell through Bd to land in the
+    # depth-buffer pixel grid.
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing="ij")
+    u = (xx + 0.5) / out_w        # colour UV (0,0) bottom-left … but we
+    v = (yy + 0.5) / out_h        # render top-down for natural display, see flip below
+    nv = np.stack([u, v, np.zeros_like(u), np.ones_like(u)], axis=-1)
+    nd = nv @ Bd.T
+    safe = np.where(np.abs(nd[..., 3]) > 1e-12, nd[..., 3], 1.0)
+    u_d = nd[..., 0] / safe
+    v_d = nd[..., 1] / safe
+    bx = (1.0 - u_d) * dw
+    by = v_d * dh
+    in_buf = (bx >= 0) & (bx <= dw - 1) & (by >= 0) & (by <= dh - 1)
+    bxc = np.clip(bx, 0.0, dw - 1.0 - 1e-3)
+    byc = np.clip(by, 0.0, dh - 1.0 - 1e-3)
+    bx0 = np.floor(bxc).astype(np.int32); by0 = np.floor(byc).astype(np.int32)
+    bx1 = np.minimum(bx0 + 1, dw - 1); by1 = np.minimum(by0 + 1, dh - 1)
+    fx = (bxc - bx0).astype(np.float32); fy = (byc - by0).astype(np.float32)
+    d00 = depth[by0, bx0]; d10 = depth[by0, bx1]
+    d01 = depth[by1, bx0]; d11 = depth[by1, bx1]
+    sampled = ((d00 * (1 - fx) + d10 * fx) * (1 - fy)
+               + (d01 * (1 - fx) + d11 * fx) * fy)
+    sampled = np.where(in_buf, sampled, 0.0)
+
+    valid = (sampled > 0) & np.isfinite(sampled)
+    if not valid.any():
+        norm = np.zeros_like(sampled, dtype=np.uint8)
+    else:
+        d_min = float(np.percentile(sampled[valid], 2))
+        d_max = float(np.percentile(sampled[valid], 98))
+        d_max = max(d_max, d_min + 1e-3)
+        norm = np.clip((sampled - d_min) / (d_max - d_min), 0.0, 1.0) * 255.0
+        norm = np.where(valid, norm, 0).astype(np.uint8)
+    # Sampling grid above had v=0 at the colour image's bottom (matching the
+    # GL-convention buffer). Vertical-flip for natural top-down display.
+    img = Image.fromarray(norm[::-1, :], mode="L")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
+def _frame_to_voxel_indices(
+    body: bytes,
+    voxel_size: float,
+    world_min: list,
+    shape: list,
+    *,
+    near: float = 0.05,
+    far: float = 8.0,
+) -> tuple[list, list, list]:
+    """Decode a frame, backproject every valid depth pixel to world coords,
+    bin to the supplied voxel grid, return the list of unique flat voxel
+    indices the frame "claims" — plus the camera pose and four frustum
+    corners (at far_thumb m) so the caller can draw the camera viewport.
+
+    Subsamples the depth pixels to FRAME_VOXELS_PIXEL_CAP at most so the
+    response stays small even for high-res refined depth maps."""
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+
+    frame = parse_frame(body)
+    dw = int(frame["width"]); dh = int(frame["height"])
+    depth = fusion.decode_depth(
+        frame["depth"], dw, dh,
+        int(frame["format"]), float(frame["rawValueToMeters"]),
+    )
+    V  = fusion._mat4_from_column_major(frame["viewMatrix"])
+    P  = fusion._mat4_from_column_major(frame["projectionMatrix"])
+    Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+    Bv = np.linalg.inv(Bd)
+    P_inv = np.linalg.inv(P)
+    cam = V[:3, 3].astype(np.float64)
+
+    # Subsample stride so npix/stride² ≤ cap.
+    stride = max(1, int(np.ceil(np.sqrt(dw * dh / FRAME_VOXELS_PIXEL_CAP))))
+    bx_g, by_g = np.meshgrid(
+        np.arange(0, dw, stride, dtype=np.float64),
+        np.arange(0, dh, stride, dtype=np.float64),
+        indexing="xy",
+    )
+    by_int = by_g.astype(np.int32); bx_int = bx_g.astype(np.int32)
+    d = depth[by_int, bx_int]
+    valid = (d > near) & (d < far)
+    if not valid.any():
+        return [], cam.tolist(), _frustum_corners(P_inv, V, near=0.1, far=2.0)
+    bx_v = bx_g[valid]; by_v = by_g[valid]; d_v = d[valid]
+
+    # depth-buffer pixel → norm-view UV via Bd⁻¹.
+    u_d = 1.0 - (bx_v + 0.5) / dw
+    v_d = (by_v + 0.5) / dh
+    nd_h = np.stack([u_d, v_d, np.zeros_like(u_d), np.ones_like(u_d)], axis=-1)
+    nv_h = nd_h @ Bv.T
+    safe = np.where(np.abs(nv_h[..., 3]) > 1e-12, nv_h[..., 3], 1.0)
+    u = nv_h[..., 0] / safe
+    v = nv_h[..., 1] / safe
+
+    # norm-view UV → view-space ray direction via P⁻¹.
+    x_ndc = 2.0 * u - 1.0
+    y_ndc = 2.0 * v - 1.0
+    clip = np.stack([x_ndc, y_ndc, -np.ones_like(x_ndc), np.ones_like(x_ndc)], axis=-1)
+    view4 = clip @ P_inv.T
+    view3 = view4[:, :3] / np.where(np.abs(view4[:, 3:4]) < 1e-12, 1.0, view4[:, 3:4])
+    rays = view3 / np.linalg.norm(view3, axis=-1, keepdims=True)
+    rays_world = rays @ V[:3, :3].T
+
+    pts = cam[None, :] + d_v[:, None] * rays_world
+    wmin = np.asarray(world_min, dtype=np.float64)
+    Nx, Ny, Nz = int(shape[0]), int(shape[1]), int(shape[2])
+
+    ix = np.floor((pts[:, 0] - wmin[0]) / voxel_size).astype(np.int64)
+    iy = np.floor((pts[:, 1] - wmin[1]) / voxel_size).astype(np.int64)
+    iz = np.floor((pts[:, 2] - wmin[2]) / voxel_size).astype(np.int64)
+    in_grid = (
+        (ix >= 0) & (ix < Nx)
+        & (iy >= 0) & (iy < Ny)
+        & (iz >= 0) & (iz < Nz)
+    )
+    ix = ix[in_grid]; iy = iy[in_grid]; iz = iz[in_grid]
+    flat = (ix * Ny * Nz + iy * Nz + iz).astype(np.int64)
+    uniq = np.unique(flat)
+    # Pack as [ix, iy, iz] triples for the JS to render.
+    iz_o = uniq % Nz
+    iy_o = (uniq // Nz) % Ny
+    ix_o = uniq // (Ny * Nz)
+    triples = np.stack([ix_o, iy_o, iz_o], axis=-1).astype(int).tolist()
+
+    pose = [float(cam[0]), float(cam[1]), float(cam[2])]
+    return triples, pose, _frustum_corners(P_inv, V, near=0.1, far=2.0)
+
+
+def _frustum_corners(P_inv, V, near: float, far: float) -> list:
+    """Compute 8 frustum-edge corners in world coords (4 at near, 4 at far)
+    plus the camera origin, for the JS to draw a wireframe pyramid."""
+    import numpy as np
+    corners = []
+    for d_clip in (-1.0, 1.0):  # -1 = near, +1 = far in clip z (after /w)
+        for u, v in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)):
+            clip = np.array([2*u - 1, 2*v - 1, d_clip, 1.0], dtype=np.float64)
+            view = P_inv @ clip
+            view3 = view[:3] / (view[3] if abs(view[3]) > 1e-12 else 1.0)
+            ray = view3 / max(np.linalg.norm(view3), 1e-12)
+            ray_w = V[:3, :3] @ ray
+            t = near if d_clip < 0 else far
+            world = V[:3, 3] + t * ray_w
+            corners.append([float(world[0]), float(world[1]), float(world[2])])
+    return corners
+
+
+# --------------------------------------------------------------------------
 
 def build_ssl_context(cert: Path, key: Path) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

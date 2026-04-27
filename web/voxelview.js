@@ -18,6 +18,11 @@ const stSize = document.getElementById("stSize");
 const stMsg = document.getElementById("stMsg");
 const sessionSel = document.getElementById("sessionSel");
 const variantSel = document.getElementById("variantSel");
+const panelToggleBtn = document.getElementById("panelToggleBtn");
+const framePanel = document.getElementById("framePanel");
+const framePanelList = document.getElementById("framePanelList");
+const framePanelCount = document.getElementById("framePanelCount");
+const panelClearBtn = document.getElementById("panelClearBtn");
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x101015);
@@ -88,6 +93,10 @@ let voxMesh = null;
 let lastBBox = null;
 
 function rebuildMesh(payload) {
+  // Stash for the frame-debug overlays so they know the voxel grid params
+  // (world_min, voxel_size, shape) to use when projecting the selected
+  // frames into voxel space.
+  lastVoxelPayload = payload;
   if (voxMesh) {
     scene.remove(voxMesh);
     voxMesh.dispose();
@@ -456,6 +465,290 @@ renderer.setAnimationLoop(() => {
   updateCamera(dtSec);
   composer.render();
 });
+
+// =====================================================================
+// Frame-debug panel: thumbnails on the left, multi-select, frustum + voxel
+// highlight overlays in the 3D scene.
+// =====================================================================
+//
+// State: which frames are checked, the manifest cached for the current
+// session, and a map of frame_idx → THREE objects added to the scene
+// (one entry per selected frame, removed on deselect).
+const selectedFrames = new Set();
+let frameManifest = null;
+let lastVoxelPayload = null;
+const frameOverlays = new Map();   // idx → { frustum: LineSegments, highlight: InstancedMesh }
+let panelOpen = false;
+
+// Map a UI variant ("refined_aligned", etc.) to the corresponding frames-dir
+// name used by the server's frame-debug endpoints. The colour thumbnails
+// always come from `frames/` (colour is identical across variants); only
+// depth + voxel-projection care about the variant.
+function variantToFramesDir(v) {
+  switch (v) {
+    case "original":         return "frames";
+    case "refined":          return "frames_refined";
+    case "aligned":          return "frames_aligned";
+    case "refined_aligned":  return "frames_refined_aligned";
+    case "refined_mv":       return "frames_refined_mv";
+    default:                 return "frames";
+  }
+}
+
+function colorForFrame(idx) {
+  // Golden-ratio hue spread keeps adjacent indices visually distinct.
+  const hue = ((idx * 0.6180339887) % 1.0);
+  const c = new THREE.Color();
+  c.setHSL(hue, 0.7, 0.6);
+  return c;
+}
+
+async function refreshFrameManifest() {
+  const sid = sessionSel.value;
+  if (!sid) { frameManifest = null; renderFramePanel(); return; }
+  try {
+    const r = await fetch(
+      `/captures/${encodeURIComponent(sid)}/frame-manifest?variant=frames`,
+    );
+    if (!r.ok) {
+      console.warn(`frame-manifest HTTP ${r.status}`);
+      frameManifest = null;
+    } else {
+      frameManifest = await r.json();
+    }
+  } catch (e) {
+    console.warn("frame-manifest fetch failed", e);
+    frameManifest = null;
+  }
+  renderFramePanel();
+}
+
+function renderFramePanel() {
+  if (!framePanel) return;
+  framePanelList.innerHTML = "";
+  const frames = frameManifest?.frames ?? [];
+  framePanelCount.textContent = `${frames.length} frames · ${selectedFrames.size} selected`;
+  if (!frames.length) {
+    const empty = document.createElement("div");
+    empty.style.padding = "0.6rem";
+    empty.style.opacity = "0.55";
+    empty.textContent = "(no frames in this session)";
+    framePanelList.appendChild(empty);
+    return;
+  }
+  const sid = sessionSel.value;
+  // Pick the depth-thumbnail source: prefer the model-derived depth in
+  // `frames_refined/` (i.e. what depth_refine.py wrote out — that's the
+  // depth the user actually wants to inspect for debugging), fall back
+  // to the phone's lowres ARCore depth in `frames/` if the session hasn't
+  // been through the refiner yet.
+  const sessInfo = availableSessions.find((s) => s.id === sid);
+  const depthDir = (sessInfo && (sessInfo.n_frames_refined ?? 0) > 0)
+                   ? "frames_refined" : "frames";
+  const depthLabel = depthDir === "frames_refined" ? "model depth" : "phone depth";
+  // Render in batches to keep the DOM responsive on long sessions.
+  const frag = document.createDocumentFragment();
+  for (const f of frames) {
+    const item = document.createElement("div");
+    item.className = "frame-item";
+    item.dataset.idx = String(f.idx);
+    if (selectedFrames.has(f.idx)) item.classList.add("selected");
+    const c = colorForFrame(f.idx);
+    item.style.setProperty("--swatch-color",
+                           `rgb(${(c.r*255)|0},${(c.g*255)|0},${(c.b*255)|0})`);
+
+    // Grid layout: [swatch] [info column] [colour thumb] [depth thumb]
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    item.appendChild(swatch);
+
+    const info = document.createElement("div");
+    info.className = "info";
+    const idx = document.createElement("div");
+    idx.className = "idx";
+    idx.textContent = `#${f.idx}`;
+    info.appendChild(idx);
+    const pose = document.createElement("div");
+    pose.className = "pose";
+    pose.textContent = `(${f.pose[0].toFixed(2)},\n${f.pose[1].toFixed(2)},\n${f.pose[2].toFixed(2)})`;
+    pose.style.whiteSpace = "pre";
+    info.appendChild(pose);
+    const labelRgb = document.createElement("div");
+    labelRgb.className = "label";
+    labelRgb.textContent = `rgb · ${depthLabel}`;
+    info.appendChild(labelRgb);
+    item.appendChild(info);
+
+    const colorImg = document.createElement("img");
+    colorImg.loading = "lazy";
+    colorImg.alt = `rgb #${f.idx}`;
+    colorImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=frames&kind=color`;
+    item.appendChild(colorImg);
+
+    const depthImg = document.createElement("img");
+    depthImg.loading = "lazy";
+    depthImg.alt = `depth #${f.idx}`;
+    depthImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=${encodeURIComponent(depthDir)}&kind=depth`;
+    item.appendChild(depthImg);
+
+    item.addEventListener("click", () => toggleFrameSelection(f.idx, item));
+    frag.appendChild(item);
+  }
+  framePanelList.appendChild(frag);
+}
+
+async function toggleFrameSelection(idx, itemEl) {
+  if (selectedFrames.has(idx)) {
+    selectedFrames.delete(idx);
+    itemEl?.classList.remove("selected");
+    removeFrameOverlay(idx);
+  } else {
+    selectedFrames.add(idx);
+    itemEl?.classList.add("selected");
+    await addFrameOverlay(idx);
+  }
+  framePanelCount.textContent = `${frameManifest?.frames?.length ?? 0} frames · ${selectedFrames.size} selected`;
+}
+
+async function addFrameOverlay(idx) {
+  const sid = sessionSel.value;
+  const variant = variantSel.value || "original";
+  if (!sid || !lastVoxelPayload) return;
+  const variantDir = variantToFramesDir(variant);
+  const wm = lastVoxelPayload.world_min;
+  const sz = lastVoxelPayload.voxel_size;
+  const sh = lastVoxelPayload.shape;
+  const url = `/captures/${encodeURIComponent(sid)}/frame-voxels/${idx}.json`
+            + `?variant=${encodeURIComponent(variantDir)}`
+            + `&voxel_size=${sz}`
+            + `&world_min=${wm.join(",")}`
+            + `&shape=${sh.join(",")}`;
+  let payload;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      console.warn(`frame-voxels HTTP ${r.status} for #${idx}`);
+      return;
+    }
+    payload = await r.json();
+  } catch (e) {
+    console.warn("frame-voxels fetch failed", e);
+    return;
+  }
+  const colour = colorForFrame(idx);
+  const frustum = buildFrustumLines(payload.frustum_world, payload.pose, colour);
+  scene.add(frustum);
+  const highlight = buildHighlightMesh(payload.indices, colour, sz, wm);
+  if (highlight) scene.add(highlight);
+  frameOverlays.set(idx, { frustum, highlight });
+}
+
+function removeFrameOverlay(idx) {
+  const o = frameOverlays.get(idx);
+  if (!o) return;
+  if (o.frustum) {
+    scene.remove(o.frustum);
+    o.frustum.geometry.dispose();
+    o.frustum.material.dispose();
+  }
+  if (o.highlight) {
+    scene.remove(o.highlight);
+    o.highlight.geometry.dispose();
+    o.highlight.material.dispose();
+  }
+  frameOverlays.delete(idx);
+}
+
+function clearAllFrameOverlays() {
+  for (const idx of [...frameOverlays.keys()]) removeFrameOverlay(idx);
+  selectedFrames.clear();
+  for (const el of framePanelList.querySelectorAll(".frame-item.selected")) {
+    el.classList.remove("selected");
+  }
+  framePanelCount.textContent = `${frameManifest?.frames?.length ?? 0} frames · 0 selected`;
+}
+
+function buildFrustumLines(corners, pose, colour) {
+  // corners = 8 entries: [0..3] near plane, [4..7] far plane (in CCW order
+  // around the image). pose = camera origin in world. We connect:
+  //   - 4 edges of the near rectangle
+  //   - 4 edges of the far rectangle
+  //   - 4 edges from each near corner to the matching far corner
+  //   - 4 apex lines from cam origin to far corners (pyramid)
+  const positions = [];
+  const push = (a, b) => positions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+  for (const [a, b] of [[0,1],[1,2],[2,3],[3,0]]) push(corners[a], corners[b]);
+  for (const [a, b] of [[4,5],[5,6],[6,7],[7,4]]) push(corners[a], corners[b]);
+  for (let i = 0; i < 4; i++) push(corners[i], corners[i+4]);
+  for (let i = 4; i < 8; i++) push(pose, corners[i]);
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  const mat = new THREE.LineBasicMaterial({
+    color: colour,
+    transparent: true,
+    opacity: 0.85,
+    depthTest: true,
+    depthWrite: false,
+  });
+  return new THREE.LineSegments(geom, mat);
+}
+
+const _highlightGeom = new THREE.BoxGeometry(1, 1, 1);
+function buildHighlightMesh(triples, colour, voxelSize, worldMin) {
+  if (!triples || triples.length === 0) return null;
+  // Slightly larger than the original voxels so the highlight rim peeks out;
+  // additive transparency keeps occluded voxels visible behind the surface.
+  const mat = new THREE.MeshBasicMaterial({
+    color: colour,
+    transparent: true,
+    opacity: 0.30,
+    depthWrite: false,
+  });
+  const mesh = new THREE.InstancedMesh(_highlightGeom, mat, triples.length);
+  const tmpMat = new THREE.Matrix4();
+  const tmpQuat = new THREE.Quaternion();
+  const tmpScale = new THREE.Vector3(voxelSize * 1.04, voxelSize * 1.04, voxelSize * 1.04);
+  const tmpPos = new THREE.Vector3();
+  for (let k = 0; k < triples.length; k++) {
+    const [ix, iy, iz] = triples[k];
+    tmpPos.set(
+      worldMin[0] + (ix + 0.5) * voxelSize,
+      worldMin[1] + (iy + 0.5) * voxelSize,
+      worldMin[2] + (iz + 0.5) * voxelSize,
+    );
+    tmpMat.compose(tmpPos, tmpQuat, tmpScale);
+    mesh.setMatrixAt(k, tmpMat);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.renderOrder = 5;
+  return mesh;
+}
+
+function setPanelOpen(open) {
+  panelOpen = open;
+  framePanel.hidden = !open;
+  panelToggleBtn.textContent = open ? "Frames ◂" : "Frames ▸";
+  if (open && !frameManifest) refreshFrameManifest();
+  // Three.js renderer needs to re-fit when the stage's width changes.
+  if (renderer) {
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    composer?.setSize(stage.clientWidth, stage.clientHeight);
+    camera.aspect = stage.clientWidth / Math.max(1, stage.clientHeight);
+    camera.updateProjectionMatrix();
+  }
+}
+
+panelToggleBtn.addEventListener("click", () => setPanelOpen(!panelOpen));
+panelClearBtn.addEventListener("click", clearAllFrameOverlays);
+
+// Re-fetch the manifest whenever the session changes; clear overlays whenever
+// session OR variant changes (the voxel grid params and depth source change
+// underneath the existing overlays).
+sessionSel.addEventListener("change", () => {
+  clearAllFrameOverlays();
+  refreshFrameManifest();
+});
+variantSel.addEventListener("change", () => clearAllFrameOverlays());
 
 // Boot: fetch the session list first so the dropdowns are populated before
 // the initial fetch picks the latest session + refined variant.
