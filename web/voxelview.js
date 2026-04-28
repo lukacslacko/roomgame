@@ -646,13 +646,15 @@ async function addFrameOverlay(idx) {
   const wm = lastVoxelPayload.world_min;
   const sz = lastVoxelPayload.voxel_size;
   const sh = lastVoxelPayload.shape;
-  // The "features" variant comes from feature_ray_reconstruct.py — its
+  // Any `features*` variant comes from feature_ray_reconstruct.py — its
   // per-frame voxels are not derived from depth backprojection but from
   // which feature tracks were observed in this frame, so we hit a
-  // dedicated endpoint instead of `frame-voxels`.
+  // dedicated endpoint instead of `frame-voxels`. The query param picks
+  // which features_meta sidecar (raw poses vs ICP-aligned poses).
   let url;
-  if (variant === "features") {
-    url = `/captures/${encodeURIComponent(sid)}/frame-feature-voxels/${idx}.json`;
+  if (isFeaturesVariant(variant)) {
+    url = `/captures/${encodeURIComponent(sid)}/frame-feature-voxels/${idx}.json`
+        + `?variant=${encodeURIComponent(variant)}`;
   } else {
     const variantDir = variantToFramesDir(variant);
     url = `/captures/${encodeURIComponent(sid)}/frame-voxels/${idx}.json`
@@ -800,13 +802,21 @@ sessionSel.addEventListener("change", () => {
   clearActiveVoxel();
   featuresMeta = null;
   featuresLookup = null;
+  featuresMetaVariant = null;
   refreshFrameManifest();
-  if (variantSel.value === "features") prefetchFeaturesMeta();
+  if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
 });
 variantSel.addEventListener("change", () => {
   clearAllFrameOverlays();
   clearActiveVoxel();
-  if (variantSel.value === "features") prefetchFeaturesMeta();
+  // Different features variants point at different meta sidecars; drop
+  // the cache so the next click pulls the right one.
+  if (featuresMetaVariant !== variantSel.value) {
+    featuresMeta = null;
+    featuresLookup = null;
+    featuresMetaVariant = null;
+  }
+  if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
 });
 
 // =====================================================================
@@ -820,22 +830,38 @@ let activeVoxelKey = null;     // currently-clicked "ix,iy,iz", or null
 let activeVoxelMesh = null;    // outline mesh highlighting the clicked voxel
 let frameMarkers = new Map();  // frame_idx → [{u, v}, ...] (drives SVG overlays)
 
+// Any voxelview variant emitted by feature_ray_reconstruct.py — the base
+// `features` plus optional suffixes (e.g. `features_aligned` from
+// --frames-variant frames_aligned). The dropdown auto-discovers them
+// from voxels_<v>.json on disk; the JS just needs to know which subset
+// to route through the per-feature endpoint.
+function isFeaturesVariant(v) {
+  return v === "features" || v.startsWith("features_");
+}
+
+let featuresMetaVariant = null;  // which variant the cached meta belongs to
+
 async function prefetchFeaturesMeta() {
   const sid = sessionSel.value;
+  const variant = variantSel.value || "features";
   if (!sid) return;
-  if (featuresMeta && featuresLookup) return;
+  if (!isFeaturesVariant(variant)) return;
+  if (featuresMeta && featuresLookup && featuresMetaVariant === variant) return;
   try {
     const r = await fetch(
-      `/captures/${encodeURIComponent(sid)}/features_meta.json?t=${Date.now()}`,
+      `/captures/${encodeURIComponent(sid)}/features_meta.json`
+      + `?variant=${encodeURIComponent(variant)}`
+      + `&t=${Date.now()}`,
     );
     if (!r.ok) {
-      featuresMeta = null; featuresLookup = null;
+      featuresMeta = null; featuresLookup = null; featuresMetaVariant = null;
       console.warn(`features_meta HTTP ${r.status}`);
       return;
     }
     featuresMeta = await r.json();
+    featuresMetaVariant = variant;
   } catch (e) {
-    featuresMeta = null; featuresLookup = null;
+    featuresMeta = null; featuresLookup = null; featuresMetaVariant = null;
     console.warn("features_meta fetch failed", e);
     return;
   }
@@ -897,9 +923,9 @@ async function handleSceneClick(ev) {
     }
   }
 
-  // 2. Voxel click — only meaningful for the features variant.
+  // 2. Voxel click — only meaningful for any features* variant.
   if (!voxMesh) return;
-  if (variantSel.value !== "features") return;
+  if (!isFeaturesVariant(variantSel.value)) return;
   await prefetchFeaturesMeta();
   if (!featuresLookup) return;
 
@@ -1075,5 +1101,5 @@ function applyKeypointMarkersToItem(item, idx) {
 // Boot: fetch the session list first so the dropdowns are populated before
 // the initial fetch picks the latest session + refined variant.
 refreshSessionList().then(loadVoxels).then(() => {
-  if (variantSel.value === "features") prefetchFeaturesMeta();
+  if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
 });

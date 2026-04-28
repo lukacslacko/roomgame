@@ -142,32 +142,95 @@ def _frame_features(frame_path: str, n_features: int, downscale: float):
 # Pairwise matcher worker — descriptors only, runs in a subprocess.
 # ---------------------------------------------------------------------------
 
+def _verify_pair(o_a: np.ndarray, d_a: np.ndarray,
+                 o_b: np.ndarray, d_b: np.ndarray,
+                 max_dist_m: float) -> np.ndarray:
+    """Per-match 2-view geometric verification. Inputs:
+      o_a, o_b : (3,)   camera origins for frames a, b
+      d_a, d_b : (M, 3) unit ray directions for the M candidate matches
+    Returns a boolean mask (M,). A match is kept iff:
+      • the two rays come within max_dist_m of each other in 3D, and
+      • the closest-point on each ray sits in front of its camera (t > 0).
+    Nearly-parallel pairs (|d_a × d_b| ≈ 0) are rejected: the constraint
+    can't see depth at all, so a descriptor-only match isn't verifiable
+    and the match shouldn't be allowed to seed a track."""
+    w = (o_a - o_b).astype(np.float64)
+    da = d_a.astype(np.float64)
+    db = d_b.astype(np.float64)
+    cross = np.cross(da, db)                         # (M, 3)
+    cross_n2 = (cross ** 2).sum(axis=1)              # (M,)
+    parallel = cross_n2 < 1e-8
+    # Skew-line minimum distance² via |w · (d_a × d_b)|² / |d_a × d_b|².
+    safe_n2 = np.maximum(cross_n2, 1e-12)
+    d_min_sq = (cross @ w) ** 2 / safe_n2
+    # Closed-form midpoint depths along each ray. (1 - c²) ≈ 0 ⇒ rays are
+    # parallel and we'll reject anyway via the `parallel` mask.
+    c = (da * db).sum(axis=1)
+    da_w = da @ w
+    db_w = db @ w
+    denom = 1.0 - c * c
+    safe_denom = np.where(np.abs(denom) < 1e-9, 1.0, denom)
+    t_a = (-da_w + c * db_w) / safe_denom
+    t_b = (db_w - c * da_w) / safe_denom
+    ok_dist = d_min_sq < max_dist_m * max_dist_m
+    ok_chir = (t_a > 0.0) & (t_b > 0.0)
+    return (~parallel) & ok_dist & ok_chir
+
+
 def _match_pairs(args):
-    """args = (i, des_i, list_of (j, des_j), ratio).
-    Returns list of (i, j, kp_a_array, kp_b_array). The arrays are the
-    Lowe-ratio-passing match indices into frames[i] and frames[j]."""
-    i, des_i, others, ratio = args
+    """args = (i, des_i, o_i, dirs_i, list_of (j, des_j, o_j, dirs_j),
+                ratio, cross_check, max_pair_dist_m).
+    Returns list of (i, j, kp_a_array, kp_b_array). Per-pair filters in
+    order:
+      1. Lowe ratio test on knnMatch(i → j).
+      2. Optional mutual cross-check via Lowe-ratio knnMatch(j → i),
+         intersection only.
+      3. Optional 2-view geometric verification (`_verify_pair`) on the
+         surviving descriptor matches.
+    """
+    (i, des_i, o_i, dirs_i, others,
+     ratio, cross_check, max_pair_dist) = args
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     out = []
-    for j, des_j in others:
+    for j, des_j, o_j, dirs_j in others:
         if des_i is None or des_j is None:
             continue
         try:
-            knn = matcher.knnMatch(des_i, des_j, k=2)
+            knn_ij = matcher.knnMatch(des_i, des_j, k=2)
         except cv2.error:
             continue
-        a_idx = []
-        b_idx = []
-        for pair in knn:
-            if len(pair) < 2:
+        fwd: list[tuple[int, int]] = []
+        for pair in knn_ij:
+            if len(pair) >= 2 and pair[0].distance < ratio * pair[1].distance:
+                fwd.append((pair[0].queryIdx, pair[0].trainIdx))
+        if not fwd:
+            continue
+
+        if cross_check:
+            try:
+                knn_ji = matcher.knnMatch(des_j, des_i, k=2)
+            except cv2.error:
                 continue
-            m, n = pair
-            if m.distance < ratio * n.distance:
-                a_idx.append(m.queryIdx)
-                b_idx.append(m.trainIdx)
-        if a_idx:
-            out.append((i, j, np.array(a_idx, dtype=np.int32),
-                              np.array(b_idx, dtype=np.int32)))
+            rev: dict[int, int] = {}
+            for pair in knn_ji:
+                if len(pair) >= 2 and pair[0].distance < ratio * pair[1].distance:
+                    rev[pair[0].queryIdx] = pair[0].trainIdx
+            kept = [(a, b) for a, b in fwd if rev.get(b) == a]
+        else:
+            kept = fwd
+        if not kept:
+            continue
+
+        a_idx = np.fromiter((p[0] for p in kept), dtype=np.int32, count=len(kept))
+        b_idx = np.fromiter((p[1] for p in kept), dtype=np.int32, count=len(kept))
+        if np.isfinite(max_pair_dist) and max_pair_dist > 0:
+            d_a = dirs_i[a_idx]
+            d_b = dirs_j[b_idx]
+            mask = _verify_pair(o_i, d_a, o_j, d_b, float(max_pair_dist))
+            a_idx = a_idx[mask]
+            b_idx = b_idx[mask]
+        if a_idx.size:
+            out.append((i, j, a_idx, b_idx))
     return out
 
 
@@ -260,6 +323,8 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
                 max_residual_m: float = 0.05,
                 max_sensitivity_m: float = float("inf"),
                 min_depth_m: float = 0.0,
+                cross_check: bool = True,
+                pair_max_dist_m: float = 0.05,
                 world_min: tuple[float, float, float] = (-2.5, -0.3, -2.5),
                 world_max: tuple[float, float, float] = ( 2.5,  4.7,  2.5),
                 cube_size: float = 0.03,
@@ -322,14 +387,26 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
             if j - i > win:
                 continue
             pairs.append((i, j))
-    print(f"  matching {len(pairs):,} frame pairs (window={win})")
+    print(f"  matching {len(pairs):,} frame pairs (window={win}); "
+          f"cross_check={cross_check}, pair_max_dist={pair_max_dist_m:.3f} m")
 
     # Group pairs by i so each worker handles one source frame against many
-    # targets — saves the cost of re-shipping descriptors to each call.
-    grouped: dict[int, list[tuple[int, np.ndarray]]] = {}
+    # targets — saves the cost of re-shipping descriptors + ray data to
+    # each call. The per-pair geometric verifier needs the camera origin
+    # and per-keypoint ray direction for both frames in each match, so we
+    # ship those alongside the descriptor.
+    grouped: dict[int, list] = {}
     for i, j in pairs:
-        grouped.setdefault(i, []).append((j, features[j]["des"]))
-    args_list = [(i, features[i]["des"], grouped[i], ratio) for i in grouped]
+        grouped.setdefault(i, []).append(
+            (j, features[j]["des"],
+             features[j]["cam_origin"], features[j]["rays_dirs"])
+        )
+    args_list = [
+        (i, features[i]["des"],
+         features[i]["cam_origin"], features[i]["rays_dirs"],
+         grouped[i], ratio, cross_check, pair_max_dist_m)
+        for i in grouped
+    ]
 
     t0 = time.time()
     n_match = 0
@@ -620,6 +697,21 @@ def main() -> None:
                          "(1.0 = native res; 0.5 ≈ 4× faster)")
     ap.add_argument("--ratio", type=float, default=0.75,
                     help="Lowe ratio test cutoff")
+    ap.add_argument("--cross-check", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Mutual cross-check matching: a match a→b is kept "
+                         "only if Lowe-ratio knnMatch in both directions "
+                         "agrees (i.e. b's nearest is a as well). Catches "
+                         "asymmetric near-duplicates that the one-directional "
+                         "ratio test alone lets through. Default: enabled.")
+    ap.add_argument("--match-max-distance", type=float, default=0.05,
+                    help="Per-pair geometric verification cutoff (m). For "
+                         "every descriptor match, triangulate the two rays "
+                         "and reject the match if the closest-line distance "
+                         "exceeds this threshold OR either depth is "
+                         "non-positive. Set to 0 or inf to disable. "
+                         "Default: 0.05 m — handheld scans rarely justify "
+                         "looser; tighten to 0.02 m for very strict.")
     ap.add_argument("--window", type=int, default=0,
                     help="match each frame only against its next N frames "
                          "(0 = all-pairs). Limit if ARCore drift is high or "
@@ -666,6 +758,15 @@ def main() -> None:
                          "captured_frames/<session>/voxels_<variant>.json. "
                          "Defaults to the best available "
                          "(refined_aligned > aligned > refined > original).")
+    ap.add_argument("--frames-variant", default="frames",
+                    help="Which per-frame .bin directory to read from "
+                         "captured_frames/<session>/. The colour buffers + "
+                         "projection matrices are byte-identical across "
+                         "variants; only viewMatrix differs. Standard "
+                         "values: `frames`, `frames_aligned` and "
+                         "`frames_refined_aligned` (loop_closure_analyze "
+                         "output), `frames_feature_ba` (feature_pose_align "
+                         "output). Any directory under the session works.")
     args = ap.parse_args()
 
     # Resolve --session into concrete paths and (optionally) inherit grid
@@ -685,9 +786,18 @@ def main() -> None:
         session_dir = project_root / "captured_frames" / args.session
         if not session_dir.is_dir():
             raise SystemExit(f"session not found: {session_dir}")
-        frames_dir = session_dir / "frames"
-        voxel_out_path = session_dir / "voxels_features.json"
-        meta_out_path  = session_dir / "features_meta.json"
+        frames_dir = session_dir / args.frames_variant
+        if not frames_dir.is_dir():
+            raise SystemExit(f"frames variant not found: {frames_dir} "
+                             f"(run loop_closure_analyze.py --apply for the "
+                             f"`*_aligned` variants)")
+        # Suffix the output filenames so consuming the aligned poses
+        # produces a separate `voxels_features_aligned` variant in the
+        # voxelview rather than overwriting the raw-pose features.
+        suffix = ("" if args.frames_variant == "frames"
+                  else f"_{args.frames_variant.replace('frames_', '')}")
+        voxel_out_path = session_dir / f"voxels_features{suffix}.json"
+        meta_out_path  = session_dir / f"features_meta{suffix}.json"
 
         ref_variants = ([args.reference_variant] if args.reference_variant
                         else ["refined_aligned", "aligned", "refined", "original"])
@@ -723,6 +833,9 @@ def main() -> None:
         min_views=args.min_views, max_residual_m=args.max_residual,
         max_sensitivity_m=args.max_sensitivity,
         min_depth_m=args.min_depth,
+        cross_check=args.cross_check,
+        pair_max_dist_m=(args.match_max_distance
+                         if args.match_max_distance > 0 else float("inf")),
         world_min=world_min_tuple, world_max=world_max_tuple,
         cube_size=args.cube_size,
         workers=args.workers, max_frames=args.max_frames,

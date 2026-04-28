@@ -302,6 +302,18 @@ _THUMB_CACHE: dict[tuple, bytes] = {}
 _THUMB_CACHE_MAX = 2000  # ~50KB each → ~100MB ceiling
 
 
+def _features_meta_filename(variant: str) -> str:
+    """Map the voxelview variant string to the corresponding features_meta
+    filename written by feature_ray_reconstruct.py. The reconstruct tool
+    emits `features_meta.json` for `--frames-variant frames` and
+    `features_meta_<suffix>.json` for any other frames variant."""
+    if not re.fullmatch(r"features(?:_[A-Za-z0-9_\-]{1,32})?", variant):
+        raise ValueError(f"not a features variant: {variant!r}")
+    if variant == "features":
+        return "features_meta.json"
+    return f"features_meta_{variant[len('features_'):]}.json"
+
+
 def _mint_session_id() -> str:
     return _time.strftime("%Y%m%d_%H%M%S", _time.localtime())
 
@@ -815,13 +827,19 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        # /captures/<id>/features_meta.json — the lookup the JS uses to
-        # resolve voxel-click → frames + per-frame keypoint UVs.
+        # /captures/<id>/features_meta.json[?variant=features|features_aligned|...]
+        # — the lookup the JS uses to resolve voxel-click → frames + per-frame
+        # keypoint UVs. For each `voxels_<v>.json` produced by
+        # feature_ray_reconstruct.py there's a sibling `features_meta<suffix>`
+        # where suffix derives from `<v>` ('features' → '', 'features_aligned'
+        # → '_aligned', etc.). The query param picks which one.
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/features_meta\.json", path,
         )
         if m:
-            f = FRAMES_DIR / m.group(1) / "features_meta.json"
+            qs = parse_qs(purl.query)
+            variant = (qs.get("variant") or ["features"])[0]
+            f = FRAMES_DIR / m.group(1) / _features_meta_filename(variant)
             if not f.exists() or not f.is_file():
                 self.send_response(404); self.end_headers(); return
             try:
@@ -874,15 +892,17 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             )
             return
 
-        # /captures/<id>/frame-feature-voxels/<idx>.json
-        # — voxels for features observed in this frame (uses
-        # features_meta.json written by feature_ray_reconstruct.py --session).
+        # /captures/<id>/frame-feature-voxels/<idx>.json[?variant=features|features_aligned|...]
+        # — voxels for features observed in this frame (uses the right
+        # features_meta<suffix>.json based on which variant the viewer is on).
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/frame-feature-voxels/(\d+)\.json",
             path,
         )
         if m:
-            self._handle_frame_feature_voxels(m.group(1), int(m.group(2)))
+            qs = parse_qs(purl.query)
+            variant = (qs.get("variant") or ["features"])[0]
+            self._handle_frame_feature_voxels(m.group(1), int(m.group(2)), variant)
             return
 
         self.send_response(404); self.end_headers()
@@ -960,20 +980,26 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(png)
 
-    def _handle_frame_feature_voxels(self, session_id: str, idx: int) -> None:
+    def _handle_frame_feature_voxels(self, session_id: str, idx: int,
+                                      variant: str = "features") -> None:
         """Return the voxel triples whose features were observed in frame
         `idx`, plus the camera pose + frustum so the viewer can draw the
-        wireframe pyramid. Reads `features_meta.json` written by
-        feature_ray_reconstruct.py --session. Falls back gracefully if
-        either the meta file or the underlying frame is missing."""
+        wireframe pyramid. `variant` selects which features_meta file to
+        read — `features` → features_meta.json, `features_aligned` →
+        features_meta_aligned.json, etc. Falls back gracefully if either
+        the meta file or the underlying frame is missing."""
         if not SESSION_ID_RE.match(session_id):
             self.send_response(404); self.end_headers(); return
         sess_dir = FRAMES_DIR / session_id
-        meta_path = sess_dir / "features_meta.json"
+        try:
+            meta_name = _features_meta_filename(variant)
+        except ValueError:
+            self.send_response(404); self.end_headers(); return
+        meta_path = sess_dir / meta_name
         if not meta_path.exists():
-            self._send_text(404, "features_meta.json not found — "
+            self._send_text(404, f"{meta_name} not found — "
                                   "run feature_ray_reconstruct.py --session "
-                                  f"{session_id}\n")
+                                  f"{session_id} [--frames-variant frames_aligned]\n")
             return
         try:
             meta = json.loads(meta_path.read_text())
