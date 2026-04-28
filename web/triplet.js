@@ -1,9 +1,11 @@
-// Triplet feature explorer.
-// User picks 3 frames → clicks features in order frame 1 → 2 → 3.
-// Clicks on frame 2/3 snap (NCC patch match) to the latest frame-1
-// click. Phone vs model depth values at the clicked points are
-// scatter-plotted at the bottom so the user can eyeball how
-// affine-or-not the depth correspondence is.
+// Pair feature explorer.
+// User picks 2 frames; clicks land exactly where placed (no snap).
+// Clicking frame 1 starts a feature; clicking frame 2 commits it.
+// Two-mark features are LS-triangulated (midpoint of closest approach
+// between the two world rays). For each frame, we plot model (or
+// phone) depth at the click against the camera-Z distance from that
+// camera to the triangulated point — y=x is "perfect agreement".
+// Scroll to zoom, drag to pan; "0" resets the view.
 
 const sessionSel    = document.getElementById("sessionSel");
 const poseDirSel    = document.getElementById("poseDirSel");
@@ -17,14 +19,17 @@ const stMsg         = document.getElementById("stMsg");
 const thumbsPanel   = document.getElementById("thumbsPanel");
 const slotEls       = [null,
   document.querySelector('.frame-slot[data-slot="1"]'),
-  document.querySelector('.frame-slot[data-slot="2"]'),
-  document.querySelector('.frame-slot[data-slot="3"]')];
+  document.querySelector('.frame-slot[data-slot="2"]')];
 const metaEls = { 1: document.getElementById("meta1"),
-                  2: document.getElementById("meta2"),
-                  3: document.getElementById("meta3") };
-const plotEls = { "12": document.getElementById("plot12"),
-                  "13": document.getElementById("plot13"),
-                  "23": document.getElementById("plot23") };
+                  2: document.getElementById("meta2") };
+const plotEls = { 1: document.getElementById("plot1"),
+                  2: document.getElementById("plot2") };
+const kindTagEls = { 1: document.getElementById("kindTagX1"),
+                     2: document.getElementById("kindTagX2") };
+// All slot iteration goes through this constant so changing the
+// feature size to 3 in the future is a one-line edit (plus adding
+// the slot in HTML).
+const SLOTS = [1, 2];
 
 // ---------------------------------------------------------------------
 // State
@@ -32,23 +37,43 @@ const plotEls = { "12": document.getElementById("plot12"),
 
 let availableSessions = [];
 let frameManifest = null;     // { frames: [{idx, color: [w,h]}, ...] }
-// slotFrames[1..3] = frame index assigned to that slot, or null.
-const slotFrames = { 1: null, 2: null, 3: null };
+// slotFrames[s] = frame index assigned to that slot, or null.
+const slotFrames = { 1: null, 2: null };
 // Per-slot rendered <img> reference so click handlers can read the
 // actual rendered pixel size (object-fit: contain — letterboxed).
-const slotImgs   = { 1: null, 2: null, 3: null };
+const slotImgs   = { 1: null, 2: null };
 // Per-slot color-buffer dimensions (cw, ch) from manifest, so we can
 // convert mouseX/Y → norm-view UV regardless of letterbox aspect.
-const slotImgSize = { 1: null, 2: null, 3: null };
+const slotImgSize = { 1: null, 2: null };
 
-// features[] entries: { id, color, slot1: {u,v} | null, slot2: ..., slot3: ...,
-//                       depths: { phone: [d1,d2,d3], model: [d1,d2,d3] } }
+// features[] entries: { id, hue, slot1: {u,v} | null, slot2: {u,v} | null,
+//                       computed: { world: [x,y,z]|null,
+//                                   marks: { 1: {phone,model,cam}, 2: …} } }
 const features = [];
 // pending feature being defined; when complete it gets pushed to features.
 let pending = null;
-// Which slot is expected next (1, 2, or 3). Always 1 unless we've
-// just clicked frame 1 (then 2) or frame 2 (then 3).
+// Which slot is expected next (1 or 2). Always 1 unless we've just
+// clicked frame 1 (then 2). Two-mark features triangulate to the
+// midpoint of closest approach between the two rays — enough to read
+// off model-vs-truth depth at each frame.
 let nextSlot = 1;
+
+// Per-slot zoom/pan state. zoom=1 means the wrap fills the slot exactly
+// (the image is letterboxed inside it via object-fit: contain). Larger
+// zoom = wrap visually bigger, image enlarged. panX/panY are screen-px
+// offsets applied as `translate(panX, panY) scale(zoom)`. Resetting to
+// zoom=1, panX=panY=0 returns to the fit-to-slot view.
+const slotView = {
+  1: { zoom: 1, panX: 0, panY: 0 },
+  2: { zoom: 1, panX: 0, panY: 0 },
+};
+const ZOOM_MIN = 1.0;
+const ZOOM_MAX = 16.0;
+// Drag-vs-click discrimination: if the cursor moved more than this many
+// pixels between pointerdown and pointerup, treat the gesture as a pan
+// (not a click). Stays small so a deliberate click of an existing
+// marker isn't misclassified as a pan even with a slightly shaky hand.
+const CLICK_MOVE_PX = 4;
 
 // ---------------------------------------------------------------------
 // Session + frame discovery
@@ -135,7 +160,7 @@ async function refreshFrameManifest() {
 // whatever slot it occupies.
 // ---------------------------------------------------------------------
 
-const SLOT_CSS = { 1: "#f87171", 2: "#fbbf24", 3: "#34d399" };
+const SLOT_CSS = { 1: "#f87171", 2: "#34d399" };
 
 function renderThumbsPanel() {
   thumbsPanel.innerHTML = "";
@@ -178,7 +203,7 @@ function renderThumbsPanel() {
 }
 
 function slotForFrame(idx) {
-  for (const s of [1, 2, 3]) if (slotFrames[s] === idx) return s;
+  for (const s of SLOTS) if (slotFrames[s] === idx) return s;
   return 0;
 }
 
@@ -188,14 +213,13 @@ function onThumbClick(idx) {
     // Already assigned → unassign that slot.
     setSlotFrame(existing, null);
   } else {
-    // Find first empty slot; if none, replace slot 1 (and shift).
-    for (const s of [1, 2, 3]) {
+    // Find first empty slot; if none, overwrite slot 1.
+    for (const s of SLOTS) {
       if (slotFrames[s] === null) {
         setSlotFrame(s, idx);
         return;
       }
     }
-    // All filled — overwrite slot 1.
     setSlotFrame(1, idx);
   }
 }
@@ -227,6 +251,13 @@ function renderSlot(slot) {
     }
   }
   slotImgs[slot] = null;
+  // Reset zoom/pan whenever the assigned frame changes — fresh image,
+  // fresh view. (Reassigning to the same frame still resets, which is
+  // the friendlier behaviour: clicking a thumb feels like a "load".)
+  slotView[slot].zoom = 1;
+  slotView[slot].panX = 0;
+  slotView[slot].panY = 0;
+
   const idx = slotFrames[slot];
   const sid = sessionSel.value;
   if (idx == null || !sid) {
@@ -234,6 +265,7 @@ function renderSlot(slot) {
     empty.className = "slot-empty";
     empty.textContent = "click a thumbnail to assign";
     slotEl.appendChild(empty);
+    updateZoomTag(slot);
     return;
   }
   const wrap = document.createElement("div");
@@ -241,32 +273,173 @@ function renderSlot(slot) {
   const img = document.createElement("img");
   img.draggable = false;
   img.alt = `frame ${idx}`;
-  img.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${idx}.png?variant=frames&kind=color&long_edge=1200`;
+  img.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${idx}.png?variant=frames&kind=color&long_edge=1600`;
   wrap.appendChild(img);
-  // SVG marker layer; sized to match the rendered image area only,
-  // not the letterbox bars. We rely on `object-fit: contain` keeping
-  // the image centred; placing the SVG over the entire slot is fine
-  // because we convert pixel coords on the *rendered image* into
-  // norm-view UVs in the click handler.
+  // SVG marker layer with the image's color-buffer pixel size as
+  // viewBox so circle coords are easy to author. preserveAspectRatio
+  // matches `object-fit: contain` on the <img>, keeping markers
+  // aligned with the rendered image — including under the panzoom
+  // transform (which scales the wrap; SVG and IMG inherit the same).
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("class", "fmarkers");
   svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
-  // viewBox set later when we know the image's natural size.
   wrap.appendChild(svg);
   slotEl.appendChild(wrap);
   slotImgs[slot] = img;
 
+  // Zoom indicator pinned bottom-right of the slot.
+  let zt = slotEl.querySelector(".zoom-tag");
+  if (!zt) {
+    zt = document.createElement("span");
+    zt.className = "zoom-tag";
+    slotEl.appendChild(zt);
+  }
+  updateZoomTag(slot);
+
   img.addEventListener("load", () => {
-    // Use the manifest-provided color buffer dims so SVG viewBox
-    // matches whatever resolution the rendered PNG happened to be.
     const finfo = frameManifest?.frames?.find((f) => f.idx === idx);
     const cw = finfo?.color?.[0] ?? img.naturalWidth;
     const ch = finfo?.color?.[1] ?? img.naturalHeight;
     slotImgSize[slot] = [cw, ch];
     svg.setAttribute("viewBox", `0 0 ${cw} ${ch}`);
+    applySlotTransform(slot);
     redrawSlotMarkers(slot);
   });
-  img.addEventListener("click", (e) => onSlotClick(slot, e));
+
+  // Pointer/wheel handlers attached at the SLOT level so the wrap can
+  // be transformed without losing event capture. img has
+  // `pointer-events: none` so the slot reliably owns the gestures.
+  attachSlotPanZoom(slot);
+}
+
+function applySlotTransform(slot) {
+  const slotEl = slotEls[slot];
+  const wrap = slotEl.querySelector(".slot-img-wrap");
+  if (!wrap) return;
+  const v = slotView[slot];
+  wrap.style.transform = `translate(${v.panX}px, ${v.panY}px) scale(${v.zoom})`;
+}
+
+function updateZoomTag(slot) {
+  const slotEl = slotEls[slot];
+  const zt = slotEl.querySelector(".zoom-tag");
+  if (!zt) return;
+  const v = slotView[slot];
+  if (slotFrames[slot] == null) { zt.textContent = ""; return; }
+  zt.textContent = v.zoom > 1.001
+    ? `${v.zoom.toFixed(1)}× · drag to pan · 0=reset`
+    : `1× · scroll=zoom · drag=pan`;
+}
+
+function attachSlotPanZoom(slot) {
+  const slotEl = slotEls[slot];
+  if (slotEl.dataset.panzoomAttached === "1") return;
+  slotEl.dataset.panzoomAttached = "1";
+
+  // Wheel: zoom around cursor.
+  slotEl.addEventListener("wheel", (ev) => {
+    if (slotFrames[slot] == null) return;
+    ev.preventDefault();
+    const v = slotView[slot];
+    // 1.15 per "tick" — feels right with both wheel mice and trackpads.
+    const factor = Math.exp(-ev.deltaY * 0.0025);
+    let newZoom = v.zoom * factor;
+    if (newZoom < ZOOM_MIN) newZoom = ZOOM_MIN;
+    if (newZoom > ZOOM_MAX) newZoom = ZOOM_MAX;
+    if (newZoom === v.zoom) return;
+    const slotRect = slotEl.getBoundingClientRect();
+    const mx = ev.clientX - slotRect.left;
+    const my = ev.clientY - slotRect.top;
+    // Wrap-local coord under cursor (pre-transform) at current zoom.
+    const xL = (mx - v.panX) / v.zoom;
+    const yL = (my - v.panY) / v.zoom;
+    // Choose new pan so the same wrap-local point stays under cursor.
+    v.panX = mx - xL * newZoom;
+    v.panY = my - yL * newZoom;
+    v.zoom = newZoom;
+    clampPan(slot);
+    applySlotTransform(slot);
+    updateZoomTag(slot);
+  }, { passive: false });
+
+  // Pointer down/move/up: pan if motion exceeds threshold; otherwise
+  // treat as a click that places a feature mark.
+  let downX = 0, downY = 0;
+  let startPanX = 0, startPanY = 0;
+  let panning = false;
+  let pressed = false;
+
+  slotEl.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
+    if (slotFrames[slot] == null) return;
+    pressed = true;
+    panning = false;
+    downX = ev.clientX; downY = ev.clientY;
+    startPanX = slotView[slot].panX;
+    startPanY = slotView[slot].panY;
+    slotEl.setPointerCapture(ev.pointerId);
+  });
+  slotEl.addEventListener("pointermove", (ev) => {
+    if (!pressed) return;
+    const dx = ev.clientX - downX;
+    const dy = ev.clientY - downY;
+    if (!panning && (Math.abs(dx) > CLICK_MOVE_PX || Math.abs(dy) > CLICK_MOVE_PX)) {
+      panning = true;
+      slotEl.classList.add("panning");
+    }
+    if (panning) {
+      slotView[slot].panX = startPanX + dx;
+      slotView[slot].panY = startPanY + dy;
+      clampPan(slot);
+      applySlotTransform(slot);
+    }
+  });
+  const finishPointer = (ev) => {
+    if (!pressed) return;
+    const wasPanning = panning;
+    pressed = false;
+    panning = false;
+    slotEl.classList.remove("panning");
+    try { slotEl.releasePointerCapture(ev.pointerId); } catch (_) {}
+    if (!wasPanning) {
+      onSlotClick(slot, ev);
+    }
+  };
+  slotEl.addEventListener("pointerup", finishPointer);
+  slotEl.addEventListener("pointercancel", finishPointer);
+}
+
+function clampPan(slot) {
+  // Keep at least a thin sliver of the wrap on-screen so the user
+  // can't pan it entirely out of the slot. Allowance grows with zoom
+  // so the user can sweep across the whole image at high zoom.
+  const slotEl = slotEls[slot];
+  const v = slotView[slot];
+  const slotRect = slotEl.getBoundingClientRect();
+  // Wrap visual size at current zoom is slotRect.width × zoom (and same
+  // for height), positioned at (panX, panY) within the slot. Edges:
+  //   left   = panX
+  //   right  = panX + zoom * slotRect.width
+  // We want at least 60 px visible: right > 60 and left < slotRect.width - 60.
+  const margin = Math.min(60, slotRect.width / 4);
+  const wrapVisualW = slotRect.width  * v.zoom;
+  const wrapVisualH = slotRect.height * v.zoom;
+  const minPanX = -(wrapVisualW - margin);
+  const maxPanX = slotRect.width  - margin;
+  const minPanY = -(wrapVisualH - margin);
+  const maxPanY = slotRect.height - margin;
+  if (v.panX < minPanX) v.panX = minPanX;
+  if (v.panX > maxPanX) v.panX = maxPanX;
+  if (v.panY < minPanY) v.panY = minPanY;
+  if (v.panY > maxPanY) v.panY = maxPanY;
+}
+
+function resetSlotView(slot) {
+  slotView[slot].zoom = 1;
+  slotView[slot].panX = 0;
+  slotView[slot].panY = 0;
+  applySlotTransform(slot);
+  updateZoomTag(slot);
 }
 
 // Convert mouseX/Y on a slot's <img> to norm-view UV (0..1)² with
@@ -302,10 +475,13 @@ function clickToUV(slot, ev) {
   return { u, v };
 }
 
-async function onSlotClick(slot, ev) {
+function onSlotClick(slot, ev) {
   if (slotFrames[slot] == null) return;
   const uv = clickToUV(slot, ev);
   if (!uv) return;
+  // Per the user's spec: clicks land EXACTLY where placed — no NCC
+  // auto-snap. The point of zoom/pan is to let the user dial in the
+  // location precisely instead of having the algorithm second-guess.
   if (slot === 1) {
     // Always starts a new feature; finalise any in-progress one first.
     if (pending) commitPending();
@@ -313,7 +489,7 @@ async function onSlotClick(slot, ev) {
     pending.slot1 = { u: uv.u, v: uv.v };
     nextSlot = 2;
     redrawSlotMarkers(1);
-    fetchPendingDepths();
+    refreshAllPlots();
     updateUI();
     return;
   }
@@ -322,24 +498,8 @@ async function onSlotClick(slot, ev) {
       stMsg.textContent = "click frame 1 first";
       return;
     }
-    if (nextSlot > 2) {
-      // Allow re-clicking frame 2 to override an earlier snap.
-    }
-    const refined = await snapFrom(slot, pending.slot1, uv);
-    pending.slot2 = refined;
-    nextSlot = 3;
-    redrawSlotMarkers(2);
-    fetchPendingDepths();
-    updateUI();
-    return;
-  }
-  if (slot === 3) {
-    if (!pending || !pending.slot1) {
-      stMsg.textContent = "click frame 1 first";
-      return;
-    }
-    const refined = await snapFrom(slot, pending.slot1, uv);
-    pending.slot3 = refined;
+    pending.slot2 = { u: uv.u, v: uv.v };
+    // Two marks → triangulation possible → commit and ready for next.
     commitPending();
     updateUI();
     return;
@@ -351,9 +511,9 @@ function newPending() {
   const hue = ((id * 0.6180339887) % 1.0);
   return {
     id, hue,
-    slot1: null, slot2: null, slot3: null,
-    depths: { phone: [null, null, null], model: [null, null, null] },
-    snapScore: { 2: null, 3: null },
+    slot1: null, slot2: null,
+    // Filled by /triplet-distances after the feature has ≥ 2 marks.
+    computed: { world: null, marks: { 1: null, 2: null } },
   };
 }
 
@@ -366,28 +526,6 @@ function commitPending() {
   refreshAllPlots();
 }
 
-async function snapFrom(targetSlot, refUV, initUV) {
-  const refFrame = slotFrames[1];
-  const tgtFrame = slotFrames[targetSlot];
-  const sid = sessionSel.value;
-  if (refFrame == null || tgtFrame == null) {
-    return { u: initUV.u, v: initUV.v, score: 0, snapped: false };
-  }
-  const url = `/captures/${encodeURIComponent(sid)}/snap-feature`
-    + `?ref_frame=${refFrame}&target_frame=${tgtFrame}`
-    + `&ref_u=${refUV.u.toFixed(5)}&ref_v=${refUV.v.toFixed(5)}`
-    + `&init_u=${initUV.u.toFixed(5)}&init_v=${initUV.v.toFixed(5)}`
-    + `&pose_dir=${encodeURIComponent(poseDirSel.value || "frames")}`
-    + `&patch=0.025&radius=0.06`;
-  let r;
-  try { r = await fetch(url); }
-  catch (e) { console.warn("snap fetch failed", e); return { u: initUV.u, v: initUV.v, score: 0, snapped: false }; }
-  if (!r.ok) return { u: initUV.u, v: initUV.v, score: 0, snapped: false };
-  const j = await r.json();
-  if (pending) pending.snapScore[targetSlot] = j.score;
-  return { u: j.u, v: j.v, score: j.score, snapped: !!j.snapped };
-}
-
 // ---------------------------------------------------------------------
 // Markers on the big frame panels — one circle per feature on each
 // slot it has a click in. Numbered, hue-coded. Pending feature drawn
@@ -395,7 +533,7 @@ async function snapFrom(targetSlot, refUV, initUV) {
 // ---------------------------------------------------------------------
 
 function redrawAllSlotMarkers() {
-  for (const s of [1, 2, 3]) redrawSlotMarkers(s);
+  for (const s of SLOTS) redrawSlotMarkers(s);
 }
 
 function redrawSlotMarkers(slot) {
@@ -418,12 +556,16 @@ function redrawSlotMarkers(slot) {
     ring.setAttribute("cx", x); ring.setAttribute("cy", y);
     ring.setAttribute("r", r);
     ring.setAttribute("stroke", isPending ? "#ffffff" : `hsl(${hue*360}deg, 80%, 60%)`);
+    // Keep stroke width constant in screen px regardless of zoom so the
+    // ring stays a clear, thin outline rather than a thick blob at 10×.
+    ring.setAttribute("vector-effect", "non-scaling-stroke");
     svg.appendChild(ring);
     const dot = document.createElementNS(NS, "circle");
     dot.setAttribute("class", "dot");
     dot.setAttribute("cx", x); dot.setAttribute("cy", y);
     dot.setAttribute("r", Math.max(2, r * 0.18));
     dot.setAttribute("fill", isPending ? "#ffffff" : `hsl(${hue*360}deg, 80%, 60%)`);
+    dot.setAttribute("vector-effect", "non-scaling-stroke");
     svg.appendChild(dot);
     const txt = document.createElementNS(NS, "text");
     txt.setAttribute("x", x + r + 4);
@@ -442,89 +584,91 @@ function redrawSlotMarkers(slot) {
 }
 
 // ---------------------------------------------------------------------
-// Depth fetch + scatter plots
+// Triangulation-based plots
 // ---------------------------------------------------------------------
+//
+// For every feature with ≥ 2 marks the server triangulates a 3D world
+// point (LS over the rays) and reports per-mark (phone_depth, model_depth,
+// cam_distance). We plot one panel per frame slot:
+//   X = depth-source value at the click on that frame
+//   Y = camera-Z distance from that frame's camera to the triangulated
+//       world point
+// The y=x diagonal is the "perfect agreement" reference. Drift away
+// from it shows where the depth source overshoots / undershoots
+// reality at that frame.
 
-async function fetchDepthsFor(featuresToFetch, kind) {
-  // Build parallel arrays: (frames[], us[], vs[]) and a backref map so
-  // we can splat results back into features[*].depths.
+async function refreshAllPlots() {
   const sid = sessionSel.value;
-  if (!sid) return;
-  const queryFrames = [];
-  const queryUs = [];
-  const queryVs = [];
-  // Each entry: { feat, slot } — telling us where to write the result.
-  const slots = [];
-  for (const f of featuresToFetch) {
-    for (const s of [1, 2, 3]) {
+  const all = pending ? [...features, pending] : features.slice();
+  if (!sid || !all.length) {
+    for (const slot of SLOTS) drawSlotPlot(slot, []);
+    return;
+  }
+  // Build the request body — features with their (frame, u, v) marks.
+  const featuresPayload = all.map((f) => {
+    const marks = [];
+    for (const s of SLOTS) {
       const uv = f[`slot${s}`];
       const fi = slotFrames[s];
-      if (uv && fi != null) {
-        queryFrames.push(fi);
-        queryUs.push(uv.u.toFixed(5));
-        queryVs.push(uv.v.toFixed(5));
-        slots.push({ feat: f, slot: s });
+      if (uv && fi != null) marks.push({ frame: fi, u: uv.u, v: uv.v });
+    }
+    return { id: f.id, marks };
+  });
+  const url = `/captures/${encodeURIComponent(sid)}/triplet-distances`
+    + `?pose_dir=${encodeURIComponent(poseDirSel.value || "frames")}`
+    + `&features=${encodeURIComponent(JSON.stringify(featuresPayload))}`;
+  let r;
+  try { r = await fetch(url); }
+  catch (e) { console.warn("triplet-distances failed", e); return; }
+  if (!r.ok) {
+    console.warn("triplet-distances HTTP", r.status);
+    return;
+  }
+  const j = await r.json();
+  // Splat results back into features[*].computed.
+  const featsOut = j.features || [];
+  for (let i = 0; i < all.length; i++) {
+    const f = all[i];
+    const out = featsOut[i];
+    if (!out) continue;
+    f.computed.world = out.world ?? null;
+    f.computed.marks = { 1: null, 2: null, 3: null };
+    for (const m of (out.marks || [])) {
+      // Find which slot this mark belongs to (by frame index).
+      for (const s of SLOTS) {
+        if (slotFrames[s] === m.frame) {
+          f.computed.marks[s] = m;
+          break;
+        }
       }
     }
   }
-  if (!slots.length) return;
-  const url = `/captures/${encodeURIComponent(sid)}/frame-depth-at`
-    + `?frames=${queryFrames.join(",")}`
-    + `&us=${queryUs.join(",")}`
-    + `&vs=${queryVs.join(",")}`
-    + `&kind=${encodeURIComponent(kind)}`
-    + `&pose_dir=${encodeURIComponent(poseDirSel.value || "frames")}`;
-  let r;
-  try { r = await fetch(url); }
-  catch (e) { console.warn("depth-at failed", e); return; }
-  if (!r.ok) return;
-  const j = await r.json();
-  const depths = j.depths || [];
-  for (let i = 0; i < slots.length; i++) {
-    const { feat, slot } = slots[i];
-    feat.depths[kind][slot - 1] = depths[i];
-  }
-}
-
-async function refreshAllPlots() {
-  // Refetch depths for both kinds (so toggling is instant) for every
-  // committed feature plus the pending one if any.
-  const all = pending ? [...features, pending] : features.slice();
-  if (!all.length) {
-    drawScatter("12", []); drawScatter("13", []); drawScatter("23", []);
-    return;
-  }
-  await Promise.all([fetchDepthsFor(all, "phone"),
-                     fetchDepthsFor(all, "model")]);
-  redrawPlots();
-}
-
-async function fetchPendingDepths() {
-  // Only the pending feature; fast path while the user is mid-click.
-  if (!pending) return;
-  await Promise.all([fetchDepthsFor([pending], "phone"),
-                     fetchDepthsFor([pending], "model")]);
   redrawPlots();
 }
 
 function redrawPlots() {
-  const kind = depthKindSel.value;
-  // For each pair (i, j), gather (depths[i-1], depths[j-1], hue).
-  const pairs = ["12", "13", "23"];
-  for (const p of pairs) {
-    const i = Number(p[0]), j = Number(p[1]);
+  const kind = depthKindSel.value;   // "phone" | "model"
+  const fieldName = (kind === "phone") ? "phone_depth" : "model_depth";
+  for (const slot of SLOTS) {
+    kindTagEls[slot].textContent = kind;
     const pts = [];
     for (const f of features) {
-      const di = f.depths[kind][i - 1];
-      const dj = f.depths[kind][j - 1];
-      if (di != null && dj != null) pts.push({ x: di, y: dj, hue: f.hue, id: f.id });
+      const m = f.computed.marks[slot];
+      if (!m) continue;
+      const x = m[fieldName];
+      const y = m.cam_distance;
+      if (x != null && y != null) pts.push({ x, y, hue: f.hue, id: f.id });
     }
-    drawScatter(p, pts);
+    drawSlotPlot(slot, pts);
   }
 }
 
-function drawScatter(pairKey, points) {
-  const svg = plotEls[pairKey];
+// Backwards-compat shim: old name still referenced by depthKindSel
+// listeners and resize handler.
+function drawScatter(slot, points) { drawSlotPlot(slot, points); }
+
+function drawSlotPlot(slot, points) {
+  const svg = plotEls[slot];
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   const rect = svg.getBoundingClientRect();
   const W = Math.max(120, rect.width);
@@ -616,10 +760,10 @@ function makeLine(NS, x1, y1, x2, y2, cls) {
 // ---------------------------------------------------------------------
 
 function updateUI() {
-  for (const s of [1, 2, 3]) {
+  for (const s of SLOTS) {
     slotEls[s].classList.toggle("next-click", nextSlot === s);
   }
-  const labels = { 1: "frame 1", 2: "frame 2", 3: "frame 3" };
+  const labels = { 1: "frame 1", 2: "frame 2" };
   nextSlotIndicator.textContent = labels[nextSlot] || "—";
   stFeatures.textContent = String(features.length + (pending ? 1 : 0));
   redrawAllSlotMarkers();
@@ -627,7 +771,7 @@ function updateUI() {
 }
 
 function refreshSlotMetas() {
-  for (const s of [1, 2, 3]) {
+  for (const s of SLOTS) {
     const idx = slotFrames[s];
     if (idx == null) { metaEls[s].textContent = "—"; continue; }
     const f = frameManifest?.frames?.find((fr) => fr.idx === idx);
@@ -643,18 +787,15 @@ function refreshSlotMetas() {
 // ---------------------------------------------------------------------
 
 function skipNextSlot() {
+  // 2-frame mode: skipping after frame 1 commits a single-mark feature
+  // (no triangulation possible, but the click on frame 1 is still
+  // recorded; the plots simply won't have a Y for it). Useful when
+  // the corresponding point falls outside frame 2's view.
   if (!pending) return;
   if (nextSlot === 2) {
-    nextSlot = 3;
-    stMsg.textContent = `feature #${pending.id}: skipped frame 2 — click frame 3 or skip again`;
-    updateUI();
-    return;
-  }
-  if (nextSlot === 3) {
     commitPending();
-    stMsg.textContent = "skipped frame 3 — feature committed";
+    stMsg.textContent = "skipped frame 2 — feature committed (no triangulation possible)";
     updateUI();
-    return;
   }
 }
 
@@ -679,6 +820,16 @@ window.addEventListener("keydown", (e) => {
       || e.target.tagName === "SELECT") return;
   if (e.code === "Space") { e.preventDefault(); skipNextSlot(); }
   else if (e.code === "Escape") cancelPending();
+  else if (e.code === "Digit0" || e.code === "Numpad0") {
+    // Reset zoom/pan on whichever slot the cursor is over (or all if
+    // outside any slot).
+    let target = -1;
+    for (const s of SLOTS) {
+      if (slotEls[s].matches(":hover")) { target = s; break; }
+    }
+    if (target > 0) resetSlotView(target);
+    else for (const s of SLOTS) resetSlotView(s);
+  }
 });
 
 // ---------------------------------------------------------------------
@@ -690,11 +841,11 @@ reloadBtn.addEventListener("click", () => {
 });
 sessionSel.addEventListener("change", () => {
   // New session — wipe everything.
-  for (const s of [1, 2, 3]) slotFrames[s] = null;
+  for (const s of SLOTS) slotFrames[s] = null;
   features.length = 0; pending = null; nextSlot = 1;
   populatePosePicker();
   refreshFrameManifest().then(() => {
-    for (const s of [1, 2, 3]) renderSlot(s);
+    for (const s of SLOTS) renderSlot(s);
     refreshAllPlots();
     updateUI();
   });
@@ -714,7 +865,7 @@ window.addEventListener("resize", () => redrawPlots());
 // Boot.
 refreshSessionList().then(() => {
   refreshFrameManifest().then(() => {
-    for (const s of [1, 2, 3]) renderSlot(s);
+    for (const s of SLOTS) renderSlot(s);
     updateUI();
   });
 });

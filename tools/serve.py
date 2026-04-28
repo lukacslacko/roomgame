@@ -1018,6 +1018,26 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             )
             return
 
+        # /captures/<id>/triplet-distances?pose_dir=…
+        #     &features=<URL-encoded JSON list>
+        # — For each feature in the JSON list (each with `marks: [{frame, u, v}, ...]`)
+        # compute an LS-triangulated 3D world point from the rays
+        # defined by the user's clicks. For every mark, return the
+        # model-depth and phone-depth at the (u, v) plus the camera-Z
+        # perpendicular distance from that frame's camera to the
+        # triangulated point. Used by the triplet editor's plots.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/triplet-distances", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            pose_dir = (qs.get("pose_dir") or ["frames"])[0]
+            features_json = (qs.get("features") or ["[]"])[0]
+            self._handle_triplet_distances(
+                m.group(1), pose_dir, features_json,
+            )
+            return
+
         # /captures/<id>/snap-feature?ref_frame=15&ref_u=…&ref_v=…
         #     &target_frame=16&init_u=…&init_v=…&patch=0.025&radius=0.06
         # — Refine `init_u, init_v` on `target_frame` so the local
@@ -1403,6 +1423,29 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             "pose_dir": pose_dir,
             "depths": depths,   # list of float|null in input order
         })
+
+    def _handle_triplet_distances(self, session_id: str,
+                                   pose_dir: str, features_json: str) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        try:
+            features_in = json.loads(features_json)
+        except json.JSONDecodeError as e:
+            self._send_text(400, f"bad features JSON: {e}\n"); return
+        if not isinstance(features_in, list):
+            self._send_text(400, "features must be a list\n"); return
+
+        try:
+            payload = _triplet_distances_payload(
+                session_id=session_id,
+                pose_dir=pose_dir,
+                features_in=features_in,
+            )
+        except FileNotFoundError as e:
+            self._send_text(409, f"{e}\n"); return
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"triplet-distances failed: {type(e).__name__}: {e}\n"); return
+        self._send_json(200, payload)
 
     def _handle_snap_feature(self, session_id: str, *,
                               ref_frame: int, target_frame: int,
@@ -1965,6 +2008,186 @@ def _snap_feature_match(*, ref_body: bytes, tgt_body: bytes,
             "score": best_score, "snapped": True,
             "patch_px": int(2 * hp_r + 1), "radius_px": int(sr),
             "ref_size": [cw_r, ch_r], "target_size": [cw_t, ch_t]}
+
+
+def _ray_for_uv(frame: dict, u: float, v: float):
+    """Return (origin_world (3,), dir_world (3,) unit) for a ray from
+    the frame's camera through norm-view UV (u, v). Mirrors the camera-Z
+    convention used everywhere else in the project."""
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+    V = fusion._mat4_from_column_major(frame["viewMatrix"])
+    P = fusion._mat4_from_column_major(frame["projectionMatrix"])
+    P_inv = np.linalg.inv(P)
+    cam = V[:3, 3].astype(np.float64)
+    x_ndc = 2.0 * float(u) - 1.0
+    y_ndc = 2.0 * float(v) - 1.0
+    clip = np.array([x_ndc, y_ndc, -1.0, 1.0], dtype=np.float64)
+    view4 = P_inv @ clip
+    w = view4[3] if abs(view4[3]) > 1e-12 else 1.0
+    view3 = view4[:3] / w
+    n = np.linalg.norm(view3)
+    if n < 1e-12:
+        return cam, np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    unit_view = view3 / n
+    dir_world = V[:3, :3] @ unit_view
+    # Re-normalise (V[:3,:3] should be a rotation, so it preserves
+    # length, but we hedge against accumulated float drift).
+    nd = np.linalg.norm(dir_world)
+    if nd > 1e-12:
+        dir_world = dir_world / nd
+    return cam, dir_world
+
+
+def _triangulate_rays(rays):
+    """LS triangulation: minimise sum_i |proj_perp_to_ray_i (P - O_i)|².
+    Solves (sum_i M_i) P = sum_i M_i O_i, where M_i = I - D_i D_iᵀ.
+    `rays` is a list of (origin, unit_dir). Returns world point or None
+    if the system is rank-deficient (e.g. <2 rays, or all parallel)."""
+    import numpy as np
+    if len(rays) < 2:
+        return None
+    A = np.zeros((3, 3), dtype=np.float64)
+    b = np.zeros(3, dtype=np.float64)
+    for o, d in rays:
+        M = np.eye(3) - np.outer(d, d)
+        A += M
+        b += M @ o
+    try:
+        # Use solve, which raises on singular; fall back to lstsq.
+        return np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        return sol
+
+
+def _triplet_distances_payload(*, session_id: str, pose_dir: str,
+                                features_in: list) -> dict:
+    """Compute, per feature, an LS-triangulated world point from the
+    user's clicked marks, plus per-mark (model_depth, phone_depth,
+    cam_distance_to_world_pt). Frames are decoded once and cached."""
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+
+    frame_cache: dict[int, dict] = {}
+    model_meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
+    model_meta: dict | None = None
+    if model_meta_path.exists():
+        try:
+            model_meta = json.loads(model_meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            model_meta = None
+    model_arr_cache: dict[int, np.ndarray] = {}
+
+    def get_frame(idx: int) -> dict:
+        if idx in frame_cache:
+            return frame_cache[idx]
+        f = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
+        if not f.exists():
+            raise FileNotFoundError(f"missing {pose_dir}/frame_{idx:06d}.bin")
+        frame = parse_frame(f.read_bytes())
+        dw = int(frame["width"]); dh = int(frame["height"])
+        depth = fusion.decode_depth(
+            frame["depth"], dw, dh,
+            int(frame["format"]), float(frame["rawValueToMeters"]),
+        )
+        Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+        V  = fusion._mat4_from_column_major(frame["viewMatrix"])
+        V_w2c = np.linalg.inv(V)
+        frame_cache[idx] = {
+            "frame": frame, "dw": dw, "dh": dh,
+            "phone_depth": depth, "Bd": Bd, "V_w2c": V_w2c,
+        }
+        return frame_cache[idx]
+
+    def get_model(idx: int):
+        if idx in model_arr_cache:
+            arr = model_arr_cache[idx]
+            return arr, arr.shape[1], arr.shape[0]
+        if model_meta is None:
+            return None, 0, 0
+        entry = model_meta.get(str(idx))
+        if entry is None:
+            return None, 0, 0
+        cw_c = int(entry["w"]); ch_c = int(entry["h"])
+        raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+        if not raw_path.exists():
+            return None, 0, 0
+        arr = (np.frombuffer(raw_path.read_bytes(), dtype=np.float16)
+                 .astype(np.float32, copy=False).reshape(ch_c, cw_c))
+        model_arr_cache[idx] = arr
+        return arr, cw_c, ch_c
+
+    out_features = []
+    for f in features_in:
+        marks = f.get("marks", []) if isinstance(f, dict) else []
+        rays = []
+        ray_marks = []   # parallel — same indices to map back
+        for m in marks:
+            try:
+                idx = int(m["frame"])
+                u   = float(m["u"]); v = float(m["v"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            try:
+                fr = get_frame(idx)
+            except FileNotFoundError:
+                continue
+            o, d = _ray_for_uv(fr["frame"], u, v)
+            rays.append((o, d))
+            ray_marks.append((idx, u, v))
+        world = _triangulate_rays(rays)
+        per_mark_out = []
+        for (idx, u, v) in ray_marks:
+            fr = get_frame(idx)
+            # phone depth at (u, v)
+            Bd = fr["Bd"]; dw = fr["dw"]; dh = fr["dh"]
+            nv = np.array([u, v, 0.0, 1.0], dtype=np.float64)
+            nd = Bd @ nv
+            wd = nd[3] if abs(nd[3]) > 1e-12 else 1.0
+            u_d = nd[0] / wd; v_d = nd[1] / wd
+            bx = (1.0 - u_d) * dw - 0.5
+            by = v_d * dh - 0.5
+            ph = _bilinear_sample_2d(fr["phone_depth"],
+                                       np.asarray([bx]), np.asarray([by]))
+            phone_d = float(ph[0])
+            phone_d = phone_d if (np.isfinite(phone_d) and phone_d > 1e-3) else None
+            # model depth at (u, v)
+            arr, cw_c, ch_c = get_model(idx)
+            if arr is None:
+                model_d = None
+            else:
+                sx = u * cw_c - 0.5; sy = v * ch_c - 0.5
+                ms = _bilinear_sample_2d(arr, np.asarray([sx]), np.asarray([sy]))
+                m_val = float(ms[0])
+                model_d = m_val if (np.isfinite(m_val) and m_val > 1e-3) else None
+            # cam-Z distance from this frame's camera to triangulated P.
+            cam_d = None
+            if world is not None:
+                Ph = np.array([world[0], world[1], world[2], 1.0])
+                p_view = fr["V_w2c"] @ Ph
+                cam_z = -float(p_view[2])
+                if np.isfinite(cam_z) and cam_z > 0:
+                    cam_d = cam_z
+            per_mark_out.append({
+                "frame": idx, "u": u, "v": v,
+                "phone_depth": phone_d,
+                "model_depth": model_d,
+                "cam_distance": cam_d,
+            })
+        out_features.append({
+            "world": ([float(world[0]), float(world[1]), float(world[2])]
+                      if world is not None else None),
+            "marks": per_mark_out,
+            "n_rays": len(rays),
+        })
+    return {
+        "session": session_id,
+        "pose_dir": pose_dir,
+        "features": out_features,
+    }
 
 
 def _build_frame_rays_and_raw(session_id: str, pose_dir: str, idx: int,
