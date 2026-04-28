@@ -267,14 +267,14 @@ impl Args {
             frames_root: PathBuf::from("captured_frames"),
             frames_dir: None,
             out: None,
-            voxel_size: 0.05,
+            voxel_size: 0.02,
             world_min: [-2.5, -0.3, -2.5],
             world_max: [ 2.5,  4.7,  2.5],
             near: 0.05,
             far: 8.0,
-            tol: 0.20,
-            threshold: 0.10,
-            min_color_count: 1,
+            tol: 0.03,
+            threshold: 0.20,
+            min_color_count: 3,
             max_frames: None,
         };
         let args: Vec<String> = env::args().skip(1).collect();
@@ -508,8 +508,18 @@ fn main() {
     println!("rayon threads: {}", rayon::current_num_threads());
 
     if let Some(session_id) = &args.session {
-        // Session mode: produce both voxels_original.json and (if refined
-        // frames exist) voxels_refined.json into the session dir.
+        // Session mode: produce voxels_original.json from frames/, plus
+        // voxels_refined.json (from frames_refined/) and voxels_aligned.json
+        // (from frames_feature_ba/, the bundle-adjustment output) if those
+        // sibling directories exist.
+        //
+        // Note: voxels_aligned.json now sources from frames_feature_ba/ —
+        // i.e. the per-frame SE(3) corrections produced by
+        // tools/feature_pose_align.py — rather than the depth-ICP-derived
+        // frames_aligned/ that loop_closure_analyze.py used to write.
+        // BA on feature reprojection error gives sub-cm pose corrections
+        // that are tighter than ICP-on-depth, especially on captures with
+        // good parallax (orthogonal-to-motion handheld scans).
         let session_dir = args.frames_root.join(session_id);
         let mut wrote_any = false;
         let original_dir = session_dir.join("frames");
@@ -529,6 +539,35 @@ fn main() {
             }
         } else {
             println!("(no frames_refined/ — run tools/depth_refine.py first to add it)");
+        }
+        let aligned_dir = session_dir.join("frames_feature_ba");
+        if aligned_dir.exists() {
+            let out = session_dir.join("voxels_aligned.json");
+            if run_pass("aligned (BA)", &aligned_dir, &out, &args) {
+                wrote_any = true;
+            }
+        } else {
+            println!("(no frames_feature_ba/ — run \
+                     tools/feature_ray_reconstruct.py --session <id> and then \
+                     tools/feature_pose_align.py --session <id> to produce it)");
+        }
+        // Refined depth + BA poses: depth_refine.py with
+        // --frames-variant frames_feature_ba --anchor features writes
+        // here. The depth maps are dense (colour-resolution) Depth-Anything
+        // outputs that have been per-frame-affine-aligned to the
+        // BA-triangulated 3D feature points — i.e. a metric scale that
+        // matches the BA reconstruction rather than ARCore's own depth.
+        let refined_aligned_dir = session_dir.join("frames_refined_feature_ba");
+        if refined_aligned_dir.exists() {
+            let out = session_dir.join("voxels_refined_aligned.json");
+            if run_pass("refined+aligned (model depth, BA poses, feature anchors)",
+                        &refined_aligned_dir, &out, &args) {
+                wrote_any = true;
+            }
+        } else {
+            println!("(no frames_refined_feature_ba/ — run \
+                     tools/depth_refine.py --session <id> --frames-variant \
+                     frames_feature_ba --anchor features to produce it)");
         }
         if !wrote_any {
             std::process::exit(1);

@@ -114,6 +114,15 @@ function rebuildMesh(payload) {
   m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   m.castShadow = true;
   m.receiveShadow = true;
+  // InstancedMesh's default frustum cull uses the *base geometry's* bounding
+  // sphere (the unit cube ⇒ radius ≈ 0.87 at origin), which doesn't reflect
+  // where the instance matrices actually place each voxel. With dense variants
+  // the room geometry happens to keep that sphere in view, so it doesn't bite;
+  // with the sparse `features` variant the camera often looks at voxels far
+  // from origin while the sphere is off-screen, causing the entire mesh to be
+  // culled and big chunks of voxels to disappear. Disable per-mesh culling and
+  // let the GPU draw — the instance count stays bounded by the room.
+  m.frustumCulled = false;
 
   const tmpMat = new THREE.Matrix4();
   const tmpQuat = new THREE.Quaternion();
@@ -141,6 +150,9 @@ function rebuildMesh(payload) {
   }
   m.instanceMatrix.needsUpdate = true;
   if (m.instanceColor) m.instanceColor.needsUpdate = true;
+  // Stash the index list so the raycast click handler can map an
+  // intersection.instanceId back to the (ix, iy, iz) voxel triple.
+  m.userData.voxelIndices = indices;
   scene.add(m);
   voxMesh = m;
   lastBBox = bbox.isEmpty() ? null : bbox;
@@ -503,6 +515,30 @@ function colorForFrame(idx) {
   return c;
 }
 
+// Pick the on-disk frames_*/ directory whose depth payload was the
+// input to the currently-selected voxel variant. We can't always tell
+// which one the rust voxeliser actually used (filename collisions
+// between the legacy depth-ICP path and the new BA path), so prefer
+// the BA-aligned sibling when present and fall back along the chain.
+function pickDepthDir(variant, dirsAvail) {
+  const want = (variant || "").toLowerCase();
+  const has = (d) => dirsAvail.has(d);
+  // Refined variants → look for a frames_refined*/ source.
+  if (want.includes("refined") || want === "refined_aligned") {
+    if (has("frames_refined_feature_ba")) return "frames_refined_feature_ba";
+    if (has("frames_refined_aligned"))    return "frames_refined_aligned";
+    if (has("frames_refined_mv"))         return "frames_refined_mv";
+    if (has("frames_refined"))            return "frames_refined";
+    // No refined depth on disk; fall through to phone depth.
+  }
+  // Everything else (original, aligned, features*) shows raw phone
+  // depth. The pose-corrected siblings (frames_aligned, frames_feature_ba)
+  // carry byte-identical depth, so we prefer the simpler `frames/` source.
+  if (has("frames")) return "frames";
+  if (has("frames_feature_ba")) return "frames_feature_ba";
+  return "frames";
+}
+
 async function refreshFrameManifest() {
   const sid = sessionSel.value;
   if (!sid) { frameManifest = null; renderFramePanel(); return; }
@@ -537,15 +573,20 @@ function renderFramePanel() {
     return;
   }
   const sid = sessionSel.value;
-  // Pick the depth-thumbnail source: prefer the model-derived depth in
-  // `frames_refined/` (i.e. what depth_refine.py wrote out — that's the
-  // depth the user actually wants to inspect for debugging), fall back
-  // to the phone's lowres ARCore depth in `frames/` if the session hasn't
-  // been through the refiner yet.
   const sessInfo = availableSessions.find((s) => s.id === sid);
-  const depthDir = (sessInfo && (sessInfo.n_frames_refined ?? 0) > 0)
-                   ? "frames_refined" : "frames";
-  const depthLabel = depthDir === "frames_refined" ? "model depth" : "phone depth";
+  // Pick the depth-thumbnail source so it matches the depth that
+  // actually went into the voxel variant the user is looking at —
+  // otherwise refined-aligned voxels in 3D look nothing like the
+  // (blurry, lowres, phone-WebXR) depth thumbnail next to each frame.
+  // Mapping: `refined*` variants want model depth from a
+  // `frames_refined*` dir (preferring the BA-aligned `_feature_ba`
+  // sibling when present), everything else wants the raw phone depth
+  // payload that lives in `frames/` (and is byte-identical in the
+  // pose-only siblings like `frames_feature_ba/`).
+  const dirsAvail = new Set(sessInfo?.frame_dirs ?? []);
+  const depthDir = pickDepthDir(variantSel.value || "", dirsAvail);
+  const depthLabel = depthDir.startsWith("frames_refined")
+    ? "model depth" : "phone depth";
   // Render in batches to keep the DOM responsive on long sessions.
   const frag = document.createDocumentFragment();
   for (const f of frames) {
@@ -579,17 +620,34 @@ function renderFramePanel() {
     info.appendChild(labelRgb);
     item.appendChild(info);
 
+    const colorWrap = document.createElement("div");
+    colorWrap.className = "thumb-wrap";
+    colorWrap.dataset.kind = "color";
     const colorImg = document.createElement("img");
     colorImg.loading = "lazy";
     colorImg.alt = `rgb #${f.idx}`;
     colorImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=frames&kind=color`;
-    item.appendChild(colorImg);
+    colorWrap.appendChild(colorImg);
+    item.appendChild(colorWrap);
 
+    const depthWrap = document.createElement("div");
+    depthWrap.className = "thumb-wrap";
+    depthWrap.dataset.kind = "depth";
     const depthImg = document.createElement("img");
     depthImg.loading = "lazy";
     depthImg.alt = `depth #${f.idx}`;
     depthImg.src = `/captures/${encodeURIComponent(sid)}/frame-thumb/${f.idx}.png?variant=${encodeURIComponent(depthDir)}&kind=depth`;
-    item.appendChild(depthImg);
+    depthWrap.appendChild(depthImg);
+    item.appendChild(depthWrap);
+
+    // Stash the colour-buffer pixel size so the SVG-marker overlay can use
+    // a viewBox of (cw × ch); preserveAspectRatio="xMidYMid meet" then
+    // letterboxes identically to the img's `object-fit: contain`.
+    item.dataset.cw = String(f.color?.[0] ?? 0);
+    item.dataset.ch = String(f.color?.[1] ?? 0);
+
+    // Re-apply markers (if any) for this frame after creating the item.
+    applyKeypointMarkersToItem(item, f.idx);
 
     item.addEventListener("click", () => toggleFrameSelection(f.idx, item));
     frag.appendChild(item);
@@ -614,15 +672,26 @@ async function addFrameOverlay(idx) {
   const sid = sessionSel.value;
   const variant = variantSel.value || "original";
   if (!sid || !lastVoxelPayload) return;
-  const variantDir = variantToFramesDir(variant);
   const wm = lastVoxelPayload.world_min;
   const sz = lastVoxelPayload.voxel_size;
   const sh = lastVoxelPayload.shape;
-  const url = `/captures/${encodeURIComponent(sid)}/frame-voxels/${idx}.json`
-            + `?variant=${encodeURIComponent(variantDir)}`
-            + `&voxel_size=${sz}`
-            + `&world_min=${wm.join(",")}`
-            + `&shape=${sh.join(",")}`;
+  // Any `features*` variant comes from feature_ray_reconstruct.py — its
+  // per-frame voxels are not derived from depth backprojection but from
+  // which feature tracks were observed in this frame, so we hit a
+  // dedicated endpoint instead of `frame-voxels`. The query param picks
+  // which features_meta sidecar (raw poses vs ICP-aligned poses).
+  let url;
+  if (isFeaturesVariant(variant)) {
+    url = `/captures/${encodeURIComponent(sid)}/frame-feature-voxels/${idx}.json`
+        + `?variant=${encodeURIComponent(variant)}`;
+  } else {
+    const variantDir = variantToFramesDir(variant);
+    url = `/captures/${encodeURIComponent(sid)}/frame-voxels/${idx}.json`
+        + `?variant=${encodeURIComponent(variantDir)}`
+        + `&voxel_size=${sz}`
+        + `&world_min=${wm.join(",")}`
+        + `&shape=${sh.join(",")}`;
+  }
   let payload;
   try {
     const r = await fetch(url);
@@ -636,8 +705,17 @@ async function addFrameOverlay(idx) {
     return;
   }
   const colour = colorForFrame(idx);
-  const frustum = buildFrustumLines(payload.frustum_world, payload.pose, colour);
-  scene.add(frustum);
+  // The features endpoint may return an empty pose/frustum if the original
+  // frame file isn't on disk anymore; skip the wireframe in that case.
+  let frustum = null;
+  if (Array.isArray(payload.frustum_world) && payload.frustum_world.length === 8
+      && Array.isArray(payload.pose) && payload.pose.length === 3) {
+    frustum = buildFrustumLines(payload.frustum_world, payload.pose, colour);
+    // Tag with the frame id so the click handler can identify which frame
+    // this wireframe belongs to and jump the flycam to that pose.
+    frustum.userData.frameIdx = idx;
+    scene.add(frustum);
+  }
   const highlight = buildHighlightMesh(payload.indices, colour, sz, wm);
   if (highlight) scene.add(highlight);
   frameOverlays.set(idx, { frustum, highlight });
@@ -665,6 +743,9 @@ function clearAllFrameOverlays() {
   for (const el of framePanelList.querySelectorAll(".frame-item.selected")) {
     el.classList.remove("selected");
   }
+  // Active-voxel highlight + per-thumb keypoint markers are tied to the
+  // frame selection's "voxel-driven" mode; clearing one clears the other.
+  if (typeof clearActiveVoxel === "function") clearActiveVoxel();
   framePanelCount.textContent = `${frameManifest?.frames?.length ?? 0} frames · 0 selected`;
 }
 
@@ -705,6 +786,7 @@ function buildHighlightMesh(triples, colour, voxelSize, worldMin) {
     depthWrite: false,
   });
   const mesh = new THREE.InstancedMesh(_highlightGeom, mat, triples.length);
+  mesh.frustumCulled = false;   // see voxMesh comment — same culling caveat
   const tmpMat = new THREE.Matrix4();
   const tmpQuat = new THREE.Quaternion();
   const tmpScale = new THREE.Vector3(voxelSize * 1.04, voxelSize * 1.04, voxelSize * 1.04);
@@ -746,10 +828,311 @@ panelClearBtn.addEventListener("click", clearAllFrameOverlays);
 // underneath the existing overlays).
 sessionSel.addEventListener("change", () => {
   clearAllFrameOverlays();
+  clearActiveVoxel();
+  featuresMeta = null;
+  featuresLookup = null;
+  featuresMetaVariant = null;
   refreshFrameManifest();
+  if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
 });
-variantSel.addEventListener("change", () => clearAllFrameOverlays());
+variantSel.addEventListener("change", () => {
+  clearAllFrameOverlays();
+  clearActiveVoxel();
+  // Different features variants point at different meta sidecars; drop
+  // the cache so the next click pulls the right one.
+  if (featuresMetaVariant !== variantSel.value) {
+    featuresMeta = null;
+    featuresLookup = null;
+    featuresMetaVariant = null;
+  }
+  if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
+  // Depth-thumbnail source depends on the active variant — re-render
+  // the panel so model-vs-phone depth shows up correctly when the user
+  // flips between e.g. `aligned` and `refined_aligned`.
+  if (frameManifest) renderFramePanel();
+});
+
+// =====================================================================
+// Voxel-click → feature lookup → frame selection + per-thumb keypoint marker.
+// Only meaningful for the "features" variant; harmless otherwise.
+// =====================================================================
+
+let featuresMeta = null;       // raw features_meta.json payload for the session
+let featuresLookup = null;     // Map<"ix,iy,iz", voxelMetaEntry>
+let activeVoxelKey = null;     // currently-clicked "ix,iy,iz", or null
+let activeVoxelMesh = null;    // outline mesh highlighting the clicked voxel
+let frameMarkers = new Map();  // frame_idx → [{u, v}, ...] (drives SVG overlays)
+
+// Any voxelview variant emitted by feature_ray_reconstruct.py — the base
+// `features` plus optional suffixes (e.g. `features_aligned` from
+// --frames-variant frames_aligned). The dropdown auto-discovers them
+// from voxels_<v>.json on disk; the JS just needs to know which subset
+// to route through the per-feature endpoint.
+function isFeaturesVariant(v) {
+  return v === "features" || v.startsWith("features_");
+}
+
+let featuresMetaVariant = null;  // which variant the cached meta belongs to
+
+async function prefetchFeaturesMeta() {
+  const sid = sessionSel.value;
+  const variant = variantSel.value || "features";
+  if (!sid) return;
+  if (!isFeaturesVariant(variant)) return;
+  if (featuresMeta && featuresLookup && featuresMetaVariant === variant) return;
+  try {
+    const r = await fetch(
+      `/captures/${encodeURIComponent(sid)}/features_meta.json`
+      + `?variant=${encodeURIComponent(variant)}`
+      + `&t=${Date.now()}`,
+    );
+    if (!r.ok) {
+      featuresMeta = null; featuresLookup = null; featuresMetaVariant = null;
+      console.warn(`features_meta HTTP ${r.status}`);
+      return;
+    }
+    featuresMeta = await r.json();
+    featuresMetaVariant = variant;
+  } catch (e) {
+    featuresMeta = null; featuresLookup = null; featuresMetaVariant = null;
+    console.warn("features_meta fetch failed", e);
+    return;
+  }
+  featuresLookup = new Map();
+  for (const v of (featuresMeta.voxels || [])) {
+    const [ix, iy, iz] = v.idx;
+    featuresLookup.set(`${ix},${iy},${iz}`, v);
+  }
+}
+
+// Distinguish a click from a drag-rotate: only treat mouseup as a click
+// if the pointer barely moved between mousedown and mouseup.
+let downAt = 0;
+let downX = 0, downY = 0;
+const CLICK_DRAG_PX = 4;
+const CLICK_MAX_MS = 350;
+renderer.domElement.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  downAt = performance.now();
+  downX = e.clientX; downY = e.clientY;
+});
+renderer.domElement.addEventListener("mouseup", (e) => {
+  if (e.button !== 0) return;
+  const dt = performance.now() - downAt;
+  const dx = e.clientX - downX, dy = e.clientY - downY;
+  if (dt > CLICK_MAX_MS) return;
+  if (dx*dx + dy*dy > CLICK_DRAG_PX * CLICK_DRAG_PX) return;
+  handleSceneClick(e);
+});
+
+const _raycaster = new THREE.Raycaster();
+// THREE's default Line raycast threshold is 1 world unit — way too loose
+// at our 0.02 m voxel scale. 0.04 m gives the user a forgiving click
+// target on the pyramid wireframes without bleeding into nearby ones.
+_raycaster.params.Line = _raycaster.params.Line || {};
+_raycaster.params.Line.threshold = 0.04;
+const _ndc = new THREE.Vector2();
+
+async function handleSceneClick(ev) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  _ndc.x =  ((ev.clientX - rect.left) / rect.width)  * 2 - 1;
+  _ndc.y = -((ev.clientY - rect.top)  / rect.height) * 2 + 1;
+  _raycaster.setFromCamera(_ndc, camera);
+
+  // 1. Frustum click — works on every variant. Loops over the wireframe
+  //    pyramids currently in the scene; the closest hit wins.
+  const frustumObjs = [];
+  for (const ov of frameOverlays.values()) {
+    if (ov.frustum) frustumObjs.push(ov.frustum);
+  }
+  if (frustumObjs.length) {
+    const fHits = _raycaster.intersectObjects(frustumObjs, false);
+    if (fHits.length) {
+      const idx = fHits[0].object.userData.frameIdx;
+      if (idx != null) {
+        jumpCameraToFrame(idx);
+        return;
+      }
+    }
+  }
+
+  // 2. Voxel click — only meaningful for any features* variant.
+  if (!voxMesh) return;
+  if (!isFeaturesVariant(variantSel.value)) return;
+  await prefetchFeaturesMeta();
+  if (!featuresLookup) return;
+
+  const hits = _raycaster.intersectObject(voxMesh, false);
+  if (!hits.length) return;
+  const triple = voxMesh.userData.voxelIndices?.[hits[0].instanceId];
+  if (!triple) return;
+  selectVoxel(triple);
+}
+
+// Move the flycam to the clicked frame's pose + viewing direction (using
+// the manifest's `pose` and `forward`) and scroll the panel so the frame's
+// thumbnail is centred. Forward → (yaw, pitch) inverts the same YXZ Euler
+// formula used by updateCamera().
+function jumpCameraToFrame(idx) {
+  const f = frameManifest?.frames?.find((fr) => fr.idx === idx);
+  if (!f || !f.pose || !f.forward) return;
+  const [px, py, pz] = f.pose;
+  const [fx_, fy_, fz_] = f.forward;
+  const len = Math.hypot(fx_, fy_, fz_) || 1;
+  const nx = fx_ / len, ny = fy_ / len, nz = fz_ / len;
+  camera.position.set(px, py, pz);
+  yaw   = Math.atan2(-nx, -nz);
+  pitch = Math.atan2(ny, Math.hypot(nx, nz));
+  if (pitch >  PITCH_LIMIT) pitch =  PITCH_LIMIT;
+  if (pitch < -PITCH_LIMIT) pitch = -PITCH_LIMIT;
+  camera.rotation.set(pitch, yaw, 0, "YXZ");
+  if (!panelOpen) setPanelOpen(true);
+  scrollToFrameItem(idx);
+}
+
+function selectVoxel(triple) {
+  const key = `${triple[0]},${triple[1]},${triple[2]}`;
+  // Toggle off if the user re-clicks the same voxel.
+  if (activeVoxelKey === key) {
+    clearActiveVoxel();
+    return;
+  }
+  const entry = featuresLookup?.get(key);
+  if (!entry) {
+    clearActiveVoxel();
+    return;
+  }
+
+  // Replace current selection with the union of frames the voxel's features
+  // were observed in, and stash per-frame keypoint UVs for the SVG overlay.
+  // Each `entry.features[k].obs[j]` is `{frame, u, v}` in colour-buffer
+  // bottom-up coords.
+  for (const idx of [...frameOverlays.keys()]) removeFrameOverlay(idx);
+  selectedFrames.clear();
+  frameMarkers.clear();
+  for (const feat of (entry.features || [])) {
+    for (const ob of (feat.obs || [])) {
+      if (!frameMarkers.has(ob.frame)) frameMarkers.set(ob.frame, []);
+      frameMarkers.get(ob.frame).push({ u: ob.u, v: ob.v });
+    }
+  }
+
+  activeVoxelKey = key;
+  drawActiveVoxelHighlight(triple);
+
+  // Open the panel if hidden and add a frustum overlay per selected frame.
+  if (!panelOpen) setPanelOpen(true);
+  // Frame ids the voxel touches, in the order they were observed.
+  const frames = [...frameMarkers.keys()].sort((a, b) => a - b);
+  for (const fi of frames) {
+    selectedFrames.add(fi);
+    addFrameOverlay(fi);   // fire-and-forget; per-frame frustum + voxel highlight
+  }
+
+  // Re-apply marker DOM and selected styling to all visible frame items,
+  // and scroll the first selected one into view so the user can immediately
+  // see what they clicked on.
+  rerenderPanelMarkersAndSelection();
+  if (frames.length) scrollToFrameItem(frames[0]);
+  framePanelCount.textContent =
+    `${frameManifest?.frames?.length ?? 0} frames · ${selectedFrames.size} selected · voxel ${triple.join(",")}`;
+}
+
+function clearActiveVoxel() {
+  activeVoxelKey = null;
+  if (activeVoxelMesh) {
+    scene.remove(activeVoxelMesh);
+    activeVoxelMesh.geometry.dispose();
+    activeVoxelMesh.material.dispose();
+    activeVoxelMesh = null;
+  }
+  frameMarkers.clear();
+  rerenderPanelMarkersAndSelection();
+}
+
+function drawActiveVoxelHighlight(triple) {
+  if (activeVoxelMesh) {
+    scene.remove(activeVoxelMesh);
+    activeVoxelMesh.geometry.dispose();
+    activeVoxelMesh.material.dispose();
+    activeVoxelMesh = null;
+  }
+  if (!lastVoxelPayload) return;
+  const wm = lastVoxelPayload.world_min;
+  const sz = lastVoxelPayload.voxel_size;
+  // Wireframe edges around the voxel cell, sized 1.10× so the lines clearly
+  // peek out from the underlying coloured cube.
+  const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(sz*1.10, sz*1.10, sz*1.10));
+  const mat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2,
+                                            depthTest: false, transparent: true, opacity: 0.95 });
+  const mesh = new THREE.LineSegments(edges, mat);
+  mesh.position.set(
+    wm[0] + (triple[0] + 0.5) * sz,
+    wm[1] + (triple[1] + 0.5) * sz,
+    wm[2] + (triple[2] + 0.5) * sz,
+  );
+  mesh.renderOrder = 10;
+  scene.add(mesh);
+  activeVoxelMesh = mesh;
+}
+
+function scrollToFrameItem(idx) {
+  const el = framePanelList.querySelector(`.frame-item[data-idx="${idx}"]`);
+  if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+// Rebuild SVG markers for every visible frame item + sync selected styling.
+// Cheap: walks the DOM, no re-layout of the list itself.
+function rerenderPanelMarkersAndSelection() {
+  for (const item of framePanelList.querySelectorAll(".frame-item")) {
+    const idx = Number(item.dataset.idx);
+    if (selectedFrames.has(idx)) item.classList.add("selected");
+    else                          item.classList.remove("selected");
+    applyKeypointMarkersToItem(item, idx);
+  }
+}
+
+// Build/replace the SVG marker layers for one frame-item. Creates one SVG
+// overlay per thumb-wrap (rgb + depth). The viewBox is the colour buffer's
+// natural pixel size (cw × ch); circles placed at (u·cw, (1−v)·ch) line up
+// with the displayed image because the SVG uses the same `xMidYMid meet`
+// aspect rule as `object-fit: contain`. Depth thumbs are resampled into the
+// colour image's pixel grid by the server, so the same coords work for both.
+function applyKeypointMarkersToItem(item, idx) {
+  const cw = Number(item.dataset.cw) || 0;
+  const ch = Number(item.dataset.ch) || 0;
+  const marks = frameMarkers.get(idx) || [];
+  for (const wrap of item.querySelectorAll(".thumb-wrap")) {
+    const old = wrap.querySelector("svg.kp-overlay");
+    if (old) old.remove();
+    if (!marks.length || cw <= 0 || ch <= 0) continue;
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("class", "kp-overlay");
+    svg.setAttribute("viewBox", `0 0 ${cw} ${ch}`);
+    svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    // Marker radius scales with image diagonal so it looks the same on
+    // landscape vs portrait captures.
+    const r = Math.max(8, Math.round(Math.hypot(cw, ch) * 0.014));
+    for (const m of marks) {
+      const x = m.u * cw;
+      const y = (1 - m.v) * ch;
+      const ring = document.createElementNS(NS, "circle");
+      ring.setAttribute("cx", x); ring.setAttribute("cy", y);
+      ring.setAttribute("r", r);
+      svg.appendChild(ring);
+      const dot = document.createElementNS(NS, "circle");
+      dot.setAttribute("class", "dot");
+      dot.setAttribute("cx", x); dot.setAttribute("cy", y);
+      dot.setAttribute("r", Math.max(2, r * 0.18));
+      svg.appendChild(dot);
+    }
+    wrap.appendChild(svg);
+  }
+}
 
 // Boot: fetch the session list first so the dropdowns are populated before
 // the initial fetch picks the latest session + refined variant.
-refreshSessionList().then(loadVoxels);
+refreshSessionList().then(loadVoxels).then(() => {
+  if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
+});

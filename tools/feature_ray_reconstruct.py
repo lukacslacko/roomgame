@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -118,12 +119,22 @@ def _frame_features(frame_path: str, n_features: int, downscale: float):
     cy = np.clip(np.floor(pts_full[:, 1]).astype(np.int32), 0, ch - 1)
     colours = color_arr[cy, cx, :3].copy()
 
+    # Effective focal length in pixels for the colour buffer. For an OpenGL
+    # symmetric-frustum projection, P[0,0] = (cw / 2) / f_x in NDC units,
+    # i.e. f_x = (cw / 2) * P[0,0]. We use the average of f_x and f_y so
+    # downstream code can model 1-pixel-of-noise as ≈ (1 / focal_pix) rad
+    # of angular ray noise — that's what powers the per-feature sensitivity
+    # score below.
+    focal_pix = float(0.5 * (abs(P[0, 0]) * cw + abs(P[1, 1]) * ch) * 0.5)
+
     return {
         "des": des,                                  # (N, 32) uint8
         "rays_dirs": dirs.astype(np.float32),        # (N, 3)
         "cam_origin": cam_origin.astype(np.float32), # (3,)
         "colours": colours,                          # (N, 3) uint8
+        "kp_uv": np.stack([u, v], axis=-1).astype(np.float32),  # (N, 2)
         "kp_count": len(kp),
+        "focal_pix": focal_pix,
     }
 
 
@@ -131,32 +142,95 @@ def _frame_features(frame_path: str, n_features: int, downscale: float):
 # Pairwise matcher worker — descriptors only, runs in a subprocess.
 # ---------------------------------------------------------------------------
 
+def _verify_pair(o_a: np.ndarray, d_a: np.ndarray,
+                 o_b: np.ndarray, d_b: np.ndarray,
+                 max_dist_m: float) -> np.ndarray:
+    """Per-match 2-view geometric verification. Inputs:
+      o_a, o_b : (3,)   camera origins for frames a, b
+      d_a, d_b : (M, 3) unit ray directions for the M candidate matches
+    Returns a boolean mask (M,). A match is kept iff:
+      • the two rays come within max_dist_m of each other in 3D, and
+      • the closest-point on each ray sits in front of its camera (t > 0).
+    Nearly-parallel pairs (|d_a × d_b| ≈ 0) are rejected: the constraint
+    can't see depth at all, so a descriptor-only match isn't verifiable
+    and the match shouldn't be allowed to seed a track."""
+    w = (o_a - o_b).astype(np.float64)
+    da = d_a.astype(np.float64)
+    db = d_b.astype(np.float64)
+    cross = np.cross(da, db)                         # (M, 3)
+    cross_n2 = (cross ** 2).sum(axis=1)              # (M,)
+    parallel = cross_n2 < 1e-8
+    # Skew-line minimum distance² via |w · (d_a × d_b)|² / |d_a × d_b|².
+    safe_n2 = np.maximum(cross_n2, 1e-12)
+    d_min_sq = (cross @ w) ** 2 / safe_n2
+    # Closed-form midpoint depths along each ray. (1 - c²) ≈ 0 ⇒ rays are
+    # parallel and we'll reject anyway via the `parallel` mask.
+    c = (da * db).sum(axis=1)
+    da_w = da @ w
+    db_w = db @ w
+    denom = 1.0 - c * c
+    safe_denom = np.where(np.abs(denom) < 1e-9, 1.0, denom)
+    t_a = (-da_w + c * db_w) / safe_denom
+    t_b = (db_w - c * da_w) / safe_denom
+    ok_dist = d_min_sq < max_dist_m * max_dist_m
+    ok_chir = (t_a > 0.0) & (t_b > 0.0)
+    return (~parallel) & ok_dist & ok_chir
+
+
 def _match_pairs(args):
-    """args = (i, des_i, list_of (j, des_j), ratio).
-    Returns list of (i, j, kp_a_array, kp_b_array). The arrays are the
-    Lowe-ratio-passing match indices into frames[i] and frames[j]."""
-    i, des_i, others, ratio = args
+    """args = (i, des_i, o_i, dirs_i, list_of (j, des_j, o_j, dirs_j),
+                ratio, cross_check, max_pair_dist_m).
+    Returns list of (i, j, kp_a_array, kp_b_array). Per-pair filters in
+    order:
+      1. Lowe ratio test on knnMatch(i → j).
+      2. Optional mutual cross-check via Lowe-ratio knnMatch(j → i),
+         intersection only.
+      3. Optional 2-view geometric verification (`_verify_pair`) on the
+         surviving descriptor matches.
+    """
+    (i, des_i, o_i, dirs_i, others,
+     ratio, cross_check, max_pair_dist) = args
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     out = []
-    for j, des_j in others:
+    for j, des_j, o_j, dirs_j in others:
         if des_i is None or des_j is None:
             continue
         try:
-            knn = matcher.knnMatch(des_i, des_j, k=2)
+            knn_ij = matcher.knnMatch(des_i, des_j, k=2)
         except cv2.error:
             continue
-        a_idx = []
-        b_idx = []
-        for pair in knn:
-            if len(pair) < 2:
+        fwd: list[tuple[int, int]] = []
+        for pair in knn_ij:
+            if len(pair) >= 2 and pair[0].distance < ratio * pair[1].distance:
+                fwd.append((pair[0].queryIdx, pair[0].trainIdx))
+        if not fwd:
+            continue
+
+        if cross_check:
+            try:
+                knn_ji = matcher.knnMatch(des_j, des_i, k=2)
+            except cv2.error:
                 continue
-            m, n = pair
-            if m.distance < ratio * n.distance:
-                a_idx.append(m.queryIdx)
-                b_idx.append(m.trainIdx)
-        if a_idx:
-            out.append((i, j, np.array(a_idx, dtype=np.int32),
-                              np.array(b_idx, dtype=np.int32)))
+            rev: dict[int, int] = {}
+            for pair in knn_ji:
+                if len(pair) >= 2 and pair[0].distance < ratio * pair[1].distance:
+                    rev[pair[0].queryIdx] = pair[0].trainIdx
+            kept = [(a, b) for a, b in fwd if rev.get(b) == a]
+        else:
+            kept = fwd
+        if not kept:
+            continue
+
+        a_idx = np.fromiter((p[0] for p in kept), dtype=np.int32, count=len(kept))
+        b_idx = np.fromiter((p[1] for p in kept), dtype=np.int32, count=len(kept))
+        if np.isfinite(max_pair_dist) and max_pair_dist > 0:
+            d_a = dirs_i[a_idx]
+            d_b = dirs_j[b_idx]
+            mask = _verify_pair(o_i, d_a, o_j, d_b, float(max_pair_dist))
+            a_idx = a_idx[mask]
+            b_idx = b_idx[mask]
+        if a_idx.size:
+            out.append((i, j, a_idx, b_idx))
     return out
 
 
@@ -183,11 +257,13 @@ def _uf_union(parent, x, y):
 # ---------------------------------------------------------------------------
 
 def triangulate_rays(origins: np.ndarray, dirs: np.ndarray):
-    """origins (N, 3), dirs (N, 3, unit). Returns (P, residuals).
+    """origins (N, 3), dirs (N, 3, unit). Returns (P, residuals, A, M).
 
-    Each ray contributes the projection matrix M_i = I - d_i d_i^T (project
-    perpendicular to the ray). The point closest to all rays in the L²
-    sense satisfies (Σ M_i) P = Σ M_i o_i.
+    Each ray contributes M_i = I - d_i d_i^T (project perpendicular to the
+    ray). The point closest to all rays in the L² sense satisfies
+    (Σ M_i) P = Σ M_i o_i. We return A and M alongside P so the caller can
+    plug them into the analytical 1-pixel-sensitivity formula without
+    re-deriving the same outer products.
     """
     M = np.eye(3)[None, :, :] - dirs[:, :, None] * dirs[:, None, :]  # (N, 3, 3)
     A = M.sum(axis=0)
@@ -195,12 +271,43 @@ def triangulate_rays(origins: np.ndarray, dirs: np.ndarray):
     try:
         P = np.linalg.solve(A, b)
     except np.linalg.LinAlgError:
-        return None, None
+        return None, None, None, None
     diffs = P[None, :] - origins
     proj_lens = (diffs * dirs).sum(axis=1)
     perps = diffs - proj_lens[:, None] * dirs
     residuals = np.linalg.norm(perps, axis=1)
-    return P, residuals
+    return P, residuals, A, M
+
+
+def pixel_sensitivity_m(P: np.ndarray, A: np.ndarray, M: np.ndarray,
+                        origins: np.ndarray, dirs: np.ndarray,
+                        focal_pixels: np.ndarray) -> float:
+    """RMS 3D displacement (meters) of the triangulated point P under
+    independent isotropic 1-pixel observation noise on every contributing
+    ray.
+
+    Derivation. Each ray's keypoint-shift δθᵢ ≈ 1/fᵢ rad rotates dᵢ
+    perpendicular to itself; to first order this shifts P by
+        δP ≈ A⁻¹ · tᵢ · δdᵢ
+    where tᵢ = dᵢᵀ(P − oᵢ) is the depth along ray i and δdᵢ ⊥ dᵢ. With iid
+    isotropic noise the position covariance is
+        Σ_P = A⁻¹ · ( Σᵢ (tᵢ/fᵢ)² · Mᵢ ) · A⁻¹.
+    The scalar √trace(Σ_P) collapses that to a single number with units of
+    meters per 1-px-of-noise — high score = ill-conditioned, e.g. all rays
+    near-parallel because the camera mostly rotated between observations.
+    """
+    diffs = P[None, :] - origins
+    ts = (diffs * dirs).sum(axis=1)             # (N,) depth along each ray
+    alphas = 1.0 / np.maximum(focal_pixels, 1e-9)
+    weights = (alphas * ts) ** 2                # (N,)
+    B = (weights[:, None, None] * M).sum(axis=0)
+    try:
+        A_inv = np.linalg.inv(A)
+    except np.linalg.LinAlgError:
+        return float("inf")
+    Sigma = A_inv @ B @ A_inv
+    tr = float(np.trace(Sigma))
+    return float(np.sqrt(tr)) if tr > 0.0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +321,19 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
                 window: int = 0,
                 min_views: int = 3,
                 max_residual_m: float = 0.05,
+                max_sensitivity_m: float = float("inf"),
+                min_depth_m: float = 0.0,
+                cross_check: bool = True,
+                pair_max_dist_m: float = 0.05,
                 world_min: tuple[float, float, float] = (-2.5, -0.3, -2.5),
                 world_max: tuple[float, float, float] = ( 2.5,  4.7,  2.5),
                 cube_size: float = 0.03,
                 workers: int = 1,
-                max_frames: int | None = None) -> None:
+                max_frames: int | None = None,
+                voxel_out_path: Path | None = None,
+                meta_out_path: Path | None = None,
+                voxel_size: float | None = None,
+                grid_shape: tuple[int, int, int] | None = None) -> None:
     frame_paths = sorted(frames_dir.glob("frame_*.bin"))
     if max_frames:
         frame_paths = frame_paths[:max_frames]
@@ -272,14 +387,26 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
             if j - i > win:
                 continue
             pairs.append((i, j))
-    print(f"  matching {len(pairs):,} frame pairs (window={win})")
+    print(f"  matching {len(pairs):,} frame pairs (window={win}); "
+          f"cross_check={cross_check}, pair_max_dist={pair_max_dist_m:.3f} m")
 
     # Group pairs by i so each worker handles one source frame against many
-    # targets — saves the cost of re-shipping descriptors to each call.
-    grouped: dict[int, list[tuple[int, np.ndarray]]] = {}
+    # targets — saves the cost of re-shipping descriptors + ray data to
+    # each call. The per-pair geometric verifier needs the camera origin
+    # and per-keypoint ray direction for both frames in each match, so we
+    # ship those alongside the descriptor.
+    grouped: dict[int, list] = {}
     for i, j in pairs:
-        grouped.setdefault(i, []).append((j, features[j]["des"]))
-    args_list = [(i, features[i]["des"], grouped[i], ratio) for i in grouped]
+        grouped.setdefault(i, []).append(
+            (j, features[j]["des"],
+             features[j]["cam_origin"], features[j]["rays_dirs"])
+        )
+    args_list = [
+        (i, features[i]["des"],
+         features[i]["cam_origin"], features[i]["rays_dirs"],
+         grouped[i], ratio, cross_check, pair_max_dist_m)
+        for i in grouped
+    ]
 
     t0 = time.time()
     n_match = 0
@@ -323,13 +450,28 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
     wmin = np.asarray(world_min, dtype=np.float64)
     wmax = np.asarray(world_max, dtype=np.float64)
 
+    # Map each frame's array index back to the integer parsed from its
+    # filename (`frame_NNNNNN.bin`) — that's the `frame_idx` the manifest
+    # exposes and that the voxelview sends back when the user clicks a
+    # frame thumbnail. Falls back to the array index if the filename
+    # doesn't follow the convention.
+    frame_idx_for_array_pos: list[int] = []
+    for p in frame_paths:
+        m = re.match(r"frame_(\d+)\.bin", Path(p).name)
+        frame_idx_for_array_pos.append(int(m.group(1)) if m else len(frame_idx_for_array_pos))
+
     out_pos: list[list[float]] = []
     out_col: list[list[int]] = []
     out_views: list[int] = []
     out_residual: list[float] = []
+    out_sensitivity: list[float] = []        # meters of P-shift per 1-px iid keypoint noise
+    out_frame_idxs: list[list[int]] = []     # parallel to out_pos: frame ids the track was seen in
+    out_obs: list[list[tuple[int, float, float]]] = []  # parallel: (frame_idx, u, v) per observation
     n_kept = 0
     n_rejected_residual = 0
+    n_rejected_sensitivity = 0
     n_rejected_oob = 0
+    n_rejected_behind = 0
     n_rejected_singleframe = 0
 
     for members in candidate_tracks:
@@ -344,36 +486,68 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
         origins = []
         dirs = []
         cols = []
+        focals = []
+        track_obs: list[tuple[int, float, float]] = []
         for fi, node in seen_frames.items():
             f = features[fi]
             li = int(node_to_local[node])
             origins.append(f["cam_origin"])
             dirs.append(f["rays_dirs"][li])
             cols.append(f["colours"][li])
+            focals.append(float(f["focal_pix"]))
+            uv = f["kp_uv"][li]
+            track_obs.append((int(frame_idx_for_array_pos[fi]),
+                              float(uv[0]), float(uv[1])))
         origins = np.asarray(origins, dtype=np.float64)
         dirs = np.asarray(dirs, dtype=np.float64)
         cols = np.asarray(cols, dtype=np.uint8)
+        focals = np.asarray(focals, dtype=np.float64)
 
-        P, residuals = triangulate_rays(origins, dirs)
+        P, residuals, A_mat, M_stack = triangulate_rays(origins, dirs)
         if P is None:
             continue
         if (P < wmin).any() or (P > wmax).any():
             n_rejected_oob += 1
             continue
+        # Cheirality: every contributing observation must see P in front of
+        # its camera. Spurious matches (e.g. two unrelated keypoints in
+        # repeated textures) frequently triangulate to a point whose
+        # least-squares fit lands behind one of the views — geometrically
+        # impossible for a real feature, so we drop those whole tracks.
+        depths = ((P[None, :] - origins) * dirs).sum(axis=1)
+        if (depths < min_depth_m).any():
+            n_rejected_behind += 1
+            continue
         mean_res = float(residuals.mean())
         if mean_res > max_residual_m:
             n_rejected_residual += 1
+            continue
+        sensitivity = pixel_sensitivity_m(P, A_mat, M_stack, origins, dirs, focals)
+        if sensitivity > max_sensitivity_m:
+            n_rejected_sensitivity += 1
             continue
 
         out_pos.append([float(P[0]), float(P[1]), float(P[2])])
         out_col.append([int(c) for c in np.median(cols, axis=0)])
         out_views.append(int(len(seen_frames)))
         out_residual.append(mean_res)
+        out_sensitivity.append(sensitivity)
+        out_frame_idxs.append(sorted(int(frame_idx_for_array_pos[fi]) for fi in seen_frames))
+        out_obs.append(sorted(track_obs))
         n_kept += 1
 
     print(f"  kept {n_kept:,}; rejected {n_rejected_residual:,} (residual) "
+          f"+ {n_rejected_sensitivity:,} (1-px sensitivity > {max_sensitivity_m} m) "
+          f"+ {n_rejected_behind:,} (point behind a camera, depth < {min_depth_m} m) "
           f"+ {n_rejected_oob:,} (out of bbox) "
           f"+ {n_rejected_singleframe:,} (single-frame track)")
+    if n_kept:
+        s_arr = np.asarray(out_sensitivity, dtype=np.float64)
+        print(f"  sensitivity (m / 1px): "
+              f"p50={np.percentile(s_arr, 50):.4f} "
+              f"p90={np.percentile(s_arr, 90):.4f} "
+              f"p99={np.percentile(s_arr, 99):.4f} "
+              f"max={s_arr.max():.4f}")
 
     if n_kept == 0:
         print("Nothing to write.")
@@ -386,14 +560,128 @@ def reconstruct(frames_dir: Path, out_path: Path, *,
         "world_max": wmax.tolist(),
         "min_views": min_views,
         "max_residual": max_residual_m,
+        "max_sensitivity": (max_sensitivity_m
+                             if max_sensitivity_m != float("inf") else None),
         "positions": out_pos,
         "colors": out_col,
         "n_views": out_views,
         "residuals": out_residual,
+        "sensitivities": out_sensitivity,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload))
     print(f"Wrote {out_path}  ({out_path.stat().st_size/1e6:.1f} MB)")
+
+    # ----- voxel-binned output (for the voxelview's "features" variant) ----
+    if voxel_out_path is not None:
+        if voxel_size is None or voxel_size <= 0:
+            raise ValueError("voxel_size must be a positive float for voxel output")
+        # Default the grid shape to whatever (world_max - world_min) / voxel_size
+        # rounds to. Caller may override (e.g. to match an existing variant on
+        # disk) so the voxel grids overlay 1:1 in the viewer.
+        if grid_shape is None:
+            grid_shape = tuple(
+                int(np.ceil((wmax[i] - wmin[i]) / voxel_size)) for i in range(3)
+            )
+        Nx, Ny, Nz = int(grid_shape[0]), int(grid_shape[1]), int(grid_shape[2])
+        # Bin each kept feature into its (ix, iy, iz). Multiple features in
+        # the same voxel collapse into one entry (mean colour, union of
+        # frame ids, summed feature count).
+        positions = np.asarray(out_pos, dtype=np.float64)
+        colors_arr = np.asarray(out_col, dtype=np.float64)
+        ix = np.floor((positions[:, 0] - wmin[0]) / voxel_size).astype(np.int64)
+        iy = np.floor((positions[:, 1] - wmin[1]) / voxel_size).astype(np.int64)
+        iz = np.floor((positions[:, 2] - wmin[2]) / voxel_size).astype(np.int64)
+        in_grid = (
+            (ix >= 0) & (ix < Nx)
+            & (iy >= 0) & (iy < Ny)
+            & (iz >= 0) & (iz < Nz)
+        )
+        per_voxel: dict[tuple[int, int, int], dict] = {}
+        for k in np.flatnonzero(in_grid):
+            key = (int(ix[k]), int(iy[k]), int(iz[k]))
+            entry = per_voxel.get(key)
+            if entry is None:
+                entry = {
+                    "color_sum": np.zeros(3, dtype=np.float64),
+                    "n": 0,
+                    "frames": set(),
+                    "residual_sum": 0.0,
+                    "sensitivity_min": float("inf"),
+                    "features": [],
+                }
+                per_voxel[key] = entry
+            entry["color_sum"] += colors_arr[k]
+            entry["n"] += 1
+            entry["frames"].update(out_frame_idxs[k])
+            entry["residual_sum"] += float(out_residual[k])
+            sens_k = float(out_sensitivity[k])
+            if sens_k < entry["sensitivity_min"]:
+                entry["sensitivity_min"] = sens_k
+            entry["features"].append({
+                "world": [float(positions[k, 0]),
+                           float(positions[k, 1]),
+                           float(positions[k, 2])],
+                "n_views": int(out_views[k]),
+                "residual_mean": float(out_residual[k]),
+                "sensitivity": sens_k,
+                "obs": [
+                    {"frame": int(fi), "u": float(uu), "v": float(vv)}
+                    for (fi, uu, vv) in out_obs[k]
+                ],
+            })
+
+        v_indices: list[list[int]] = []
+        v_colors: list[list[int]] = []
+        v_meta: list[dict] = []
+        for key in sorted(per_voxel.keys()):
+            e = per_voxel[key]
+            avg = (e["color_sum"] / max(e["n"], 1)).round().clip(0, 255).astype(int)
+            v_indices.append([key[0], key[1], key[2]])
+            v_colors.append([int(avg[0]), int(avg[1]), int(avg[2])])
+            # The voxel's "sensitivity" is the *best* (smallest) sensitivity
+            # across the features that fell inside it: if any single
+            # contributing track was well-conditioned, the voxel position is
+            # reliable even when other contributors are noisy.
+            v_meta.append({
+                "idx": [key[0], key[1], key[2]],
+                "frames": sorted(e["frames"]),
+                "n_features": int(e["n"]),
+                "residual_mean": float(e["residual_sum"] / max(e["n"], 1)),
+                "sensitivity_min": float(e["sensitivity_min"]),
+                "features": e["features"],
+            })
+
+        wmax_eff = (wmin + np.array([Nx, Ny, Nz]) * voxel_size).tolist()
+        voxels_payload = {
+            "voxel_size": float(voxel_size),
+            "world_min": wmin.tolist(),
+            "world_max": wmax_eff,
+            "shape": [Nx, Ny, Nz],
+            "n_voxels": len(v_indices),
+            "indices": v_indices,
+            "colors": v_colors,
+            "source": "feature_ray_reconstruct",
+            "min_views": int(min_views),
+            "max_residual": float(max_residual_m),
+        }
+        voxel_out_path.parent.mkdir(parents=True, exist_ok=True)
+        voxel_out_path.write_text(json.dumps(voxels_payload))
+        print(f"Wrote {voxel_out_path}  ({voxel_out_path.stat().st_size/1e6:.1f} MB)  "
+              f"({len(v_indices)} occupied voxels from {n_kept} features)")
+
+        if meta_out_path is not None:
+            meta_payload = {
+                "voxel_size": float(voxel_size),
+                "world_min": wmin.tolist(),
+                "world_max": wmax_eff,
+                "shape": [Nx, Ny, Nz],
+                "n_voxels": len(v_meta),
+                "voxels": v_meta,
+            }
+            meta_out_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_out_path.write_text(json.dumps(meta_payload))
+            print(f"Wrote {meta_out_path}  ({meta_out_path.stat().st_size/1e6:.1f} MB)")
 
 
 def main() -> None:
@@ -409,6 +697,21 @@ def main() -> None:
                          "(1.0 = native res; 0.5 ≈ 4× faster)")
     ap.add_argument("--ratio", type=float, default=0.75,
                     help="Lowe ratio test cutoff")
+    ap.add_argument("--cross-check", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Mutual cross-check matching: a match a→b is kept "
+                         "only if Lowe-ratio knnMatch in both directions "
+                         "agrees (i.e. b's nearest is a as well). Catches "
+                         "asymmetric near-duplicates that the one-directional "
+                         "ratio test alone lets through. Default: enabled.")
+    ap.add_argument("--match-max-distance", type=float, default=0.05,
+                    help="Per-pair geometric verification cutoff (m). For "
+                         "every descriptor match, triangulate the two rays "
+                         "and reject the match if the closest-line distance "
+                         "exceeds this threshold OR either depth is "
+                         "non-positive. Set to 0 or inf to disable. "
+                         "Default: 0.05 m — handheld scans rarely justify "
+                         "looser; tighten to 0.02 m for very strict.")
     ap.add_argument("--window", type=int, default=0,
                     help="match each frame only against its next N frames "
                          "(0 = all-pairs). Limit if ARCore drift is high or "
@@ -417,6 +720,21 @@ def main() -> None:
     ap.add_argument("--max-residual", type=float, default=0.05,
                     help="reject tracks whose mean perpendicular ray-distance "
                          "to the triangulated point exceeds this (m)")
+    ap.add_argument("--max-sensitivity", type=float, default=float("inf"),
+                    help="reject tracks whose 1-pixel-noise sensitivity "
+                         "(σ_1px = √trace(A⁻¹ Σᵢ (tᵢ/fᵢ)² Mᵢ A⁻¹)) exceeds "
+                         "this many meters. Filters out features that come "
+                         "from frames where the camera mostly rotated, since "
+                         "near-parallel rays leave the triangulated depth "
+                         "underdetermined. Try 0.05–0.10 m for the kind of "
+                         "floating mid-air voxels you see in handheld scans.")
+    ap.add_argument("--min-depth", type=float, default=0.0,
+                    help="reject a track if the triangulated point sits "
+                         "closer than this (m) along any contributing ray "
+                         "— including behind the camera. The default 0.0 "
+                         "enforces strict cheirality (in front of every "
+                         "camera); raise to e.g. 0.05 if you also want to "
+                         "discard near-clipping triangulations.")
     ap.add_argument("--world-min", type=float, nargs=3, default=[-2.5, -0.3, -2.5])
     ap.add_argument("--world-max", type=float, nargs=3, default=[ 2.5,  4.7,  2.5])
     ap.add_argument("--cube-size", type=float, default=0.03,
@@ -424,16 +742,107 @@ def main() -> None:
     ap.add_argument("--workers", type=int,
                     default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument("--max-frames", type=int, default=None)
+    ap.add_argument("--session", default=None,
+                    help="If set, source frames from "
+                         "captured_frames/<session>/frames/ and additionally "
+                         "write voxels_features.json + features_meta.json into "
+                         "captured_frames/<session>/ — these power the "
+                         "voxelview's 'features' variant and per-frame voxel "
+                         "highlight overlay.")
+    ap.add_argument("--voxel-size", type=float, default=None,
+                    help="Voxel grid edge (m) for voxels_features.json. "
+                         "Defaults to whatever the reference voxels_<variant>.json "
+                         "in the session uses; falls back to 0.05.")
+    ap.add_argument("--reference-variant", default=None,
+                    help="Take voxel_size, world_min, shape from "
+                         "captured_frames/<session>/voxels_<variant>.json. "
+                         "Defaults to the best available "
+                         "(refined_aligned > aligned > refined > original).")
+    ap.add_argument("--frames-variant", default="frames",
+                    help="Which per-frame .bin directory to read from "
+                         "captured_frames/<session>/. The colour buffers + "
+                         "projection matrices are byte-identical across "
+                         "variants; only viewMatrix differs. Standard "
+                         "values: `frames`, `frames_aligned` and "
+                         "`frames_refined_aligned` (loop_closure_analyze "
+                         "output), `frames_feature_ba` (feature_pose_align "
+                         "output). Any directory under the session works.")
     args = ap.parse_args()
 
+    # Resolve --session into concrete paths and (optionally) inherit grid
+    # parameters from a reference voxel JSON so the features lay over the
+    # depth-derived voxels 1:1 in the viewer.
+    project_root = Path(__file__).resolve().parent.parent
+    voxel_out_path = None
+    meta_out_path = None
+    voxel_size = args.voxel_size
+    grid_shape = None
+    world_min_tuple = tuple(args.world_min)
+    world_max_tuple = tuple(args.world_max)
+    frames_dir = Path(args.frames_dir)
+    out_path = Path(args.out)
+
+    if args.session is not None:
+        session_dir = project_root / "captured_frames" / args.session
+        if not session_dir.is_dir():
+            raise SystemExit(f"session not found: {session_dir}")
+        frames_dir = session_dir / args.frames_variant
+        if not frames_dir.is_dir():
+            raise SystemExit(f"frames variant not found: {frames_dir} "
+                             f"(run loop_closure_analyze.py --apply for the "
+                             f"`*_aligned` variants)")
+        # Suffix the output filenames so consuming the aligned poses
+        # produces a separate `voxels_features_aligned` variant in the
+        # voxelview rather than overwriting the raw-pose features.
+        suffix = ("" if args.frames_variant == "frames"
+                  else f"_{args.frames_variant.replace('frames_', '')}")
+        voxel_out_path = session_dir / f"voxels_features{suffix}.json"
+        meta_out_path  = session_dir / f"features_meta{suffix}.json"
+
+        ref_variants = ([args.reference_variant] if args.reference_variant
+                        else ["refined_aligned", "aligned", "refined", "original"])
+        ref = None
+        for v in ref_variants:
+            cand = session_dir / f"voxels_{v}.json"
+            if cand.exists():
+                try:
+                    ref = json.loads(cand.read_text())
+                    print(f"Inheriting grid from {cand.name}: "
+                          f"voxel_size={ref.get('voxel_size')} "
+                          f"world_min={ref.get('world_min')} "
+                          f"shape={ref.get('shape')}")
+                    break
+                except (OSError, json.JSONDecodeError) as e:
+                    print(f"  failed to read {cand}: {e}")
+        if ref is not None:
+            if voxel_size is None and ref.get("voxel_size"):
+                voxel_size = float(ref["voxel_size"])
+            if ref.get("world_min"):
+                world_min_tuple = tuple(float(x) for x in ref["world_min"])
+            if ref.get("world_max"):
+                world_max_tuple = tuple(float(x) for x in ref["world_max"])
+            if ref.get("shape"):
+                grid_shape = tuple(int(x) for x in ref["shape"])
+        if voxel_size is None:
+            voxel_size = 0.05
+
     reconstruct(
-        Path(args.frames_dir), Path(args.out),
+        frames_dir, out_path,
         n_features=args.n_features, downscale=args.downscale,
         ratio=args.ratio, window=args.window,
         min_views=args.min_views, max_residual_m=args.max_residual,
-        world_min=tuple(args.world_min), world_max=tuple(args.world_max),
+        max_sensitivity_m=args.max_sensitivity,
+        min_depth_m=args.min_depth,
+        cross_check=args.cross_check,
+        pair_max_dist_m=(args.match_max_distance
+                         if args.match_max_distance > 0 else float("inf")),
+        world_min=world_min_tuple, world_max=world_max_tuple,
         cube_size=args.cube_size,
         workers=args.workers, max_frames=args.max_frames,
+        voxel_out_path=voxel_out_path,
+        meta_out_path=meta_out_path,
+        voxel_size=voxel_size,
+        grid_shape=grid_shape,
     )
 
 
