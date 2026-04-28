@@ -815,6 +815,27 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # /captures/<id>/features_meta.json — the lookup the JS uses to
+        # resolve voxel-click → frames + per-frame keypoint UVs.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/features_meta\.json", path,
+        )
+        if m:
+            f = FRAMES_DIR / m.group(1) / "features_meta.json"
+            if not f.exists() or not f.is_file():
+                self.send_response(404); self.end_headers(); return
+            try:
+                body = f.read_bytes()
+            except OSError as e:
+                self._send_text(500, f"read failed: {e}\n"); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         # /captures/<id>/frame-manifest?variant=<vd>
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/frame-manifest", path,
@@ -851,6 +872,17 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 m.group(1), variant_dir, int(m.group(2)),
                 voxel_size, world_min, shape,
             )
+            return
+
+        # /captures/<id>/frame-feature-voxels/<idx>.json
+        # — voxels for features observed in this frame (uses
+        # features_meta.json written by feature_ray_reconstruct.py --session).
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/frame-feature-voxels/(\d+)\.json",
+            path,
+        )
+        if m:
+            self._handle_frame_feature_voxels(m.group(1), int(m.group(2)))
             return
 
         self.send_response(404); self.end_headers()
@@ -927,6 +959,58 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
         self.wfile.write(png)
+
+    def _handle_frame_feature_voxels(self, session_id: str, idx: int) -> None:
+        """Return the voxel triples whose features were observed in frame
+        `idx`, plus the camera pose + frustum so the viewer can draw the
+        wireframe pyramid. Reads `features_meta.json` written by
+        feature_ray_reconstruct.py --session. Falls back gracefully if
+        either the meta file or the underlying frame is missing."""
+        if not SESSION_ID_RE.match(session_id):
+            self.send_response(404); self.end_headers(); return
+        sess_dir = FRAMES_DIR / session_id
+        meta_path = sess_dir / "features_meta.json"
+        if not meta_path.exists():
+            self._send_text(404, "features_meta.json not found — "
+                                  "run feature_ray_reconstruct.py --session "
+                                  f"{session_id}\n")
+            return
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            self._send_text(500, f"features_meta read failed: {e}\n"); return
+
+        triples = []
+        for v in meta.get("voxels", []):
+            if idx in v.get("frames", ()):
+                triples.append(v["idx"])
+
+        # Read the source frame for pose + frustum so the wireframe lines up
+        # with the depth-derived overlay.
+        f = sess_dir / "frames" / f"frame_{idx:06d}.bin"
+        pose: list = []
+        frustum: list = []
+        if f.exists():
+            try:
+                import numpy as np
+                sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+                import fusion  # noqa: E402
+                frame = parse_frame(f.read_bytes())
+                V = fusion._mat4_from_column_major(frame["viewMatrix"])
+                P = fusion._mat4_from_column_major(frame["projectionMatrix"])
+                P_inv = np.linalg.inv(P)
+                cam = V[:3, 3].astype(np.float64)
+                pose = [float(cam[0]), float(cam[1]), float(cam[2])]
+                frustum = _frustum_corners(P_inv, V, near=0.1, far=2.0)
+            except Exception as e:  # noqa: BLE001
+                self._send_text(500, f"frame parse failed: {e}\n"); return
+
+        self._send_json(200, {
+            "idx": idx,
+            "pose": pose,
+            "frustum_world": frustum,
+            "indices": triples,
+        })
 
     def _handle_frame_voxels(self, session_id: str, variant_dir: str, idx: int,
                               voxel_size: float, world_min: list,

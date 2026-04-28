@@ -94,6 +94,25 @@
       border-radius: 3px;
       background: #111;
       align-self: start;       /* don't stretch — preserve aspect */
+      display: block;
+    }
+    /* Wrap so we can overlay an SVG with the same `xMidYMid meet` aspect
+       behaviour as `object-fit: contain`. The SVG's viewBox matches the
+       camera buffer's natural pixel size, so circle markers placed at the
+       buffer-native (u·cw, (1−v)·ch) automatically letterbox the same way
+       as the underlying PNG. */
+    .frame-item .thumb-wrap { position: relative; align-self: start; }
+    .frame-item .thumb-wrap svg.kp-overlay {
+      position: absolute; left: 0; top: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+    }
+    .frame-item .thumb-wrap svg.kp-overlay circle {
+      fill: none; stroke: #ffe066; stroke-width: 4;
+      filter: drop-shadow(0 0 2px rgba(0,0,0,0.95));
+    }
+    .frame-item .thumb-wrap svg.kp-overlay circle.dot {
+      fill: #ffe066; stroke: #111; stroke-width: 1.5;
     }
     .frame-item .info { line-height: 1.3; padding-top: 0.1rem; }
     .frame-item .info .idx { color: #d8e1ff; font-weight: 500; }
