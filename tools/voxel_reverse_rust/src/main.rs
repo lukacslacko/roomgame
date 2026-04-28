@@ -508,8 +508,18 @@ fn main() {
     println!("rayon threads: {}", rayon::current_num_threads());
 
     if let Some(session_id) = &args.session {
-        // Session mode: produce both voxels_original.json and (if refined
-        // frames exist) voxels_refined.json into the session dir.
+        // Session mode: produce voxels_original.json from frames/, plus
+        // voxels_refined.json (from frames_refined/) and voxels_aligned.json
+        // (from frames_feature_ba/, the bundle-adjustment output) if those
+        // sibling directories exist.
+        //
+        // Note: voxels_aligned.json now sources from frames_feature_ba/ —
+        // i.e. the per-frame SE(3) corrections produced by
+        // tools/feature_pose_align.py — rather than the depth-ICP-derived
+        // frames_aligned/ that loop_closure_analyze.py used to write.
+        // BA on feature reprojection error gives sub-cm pose corrections
+        // that are tighter than ICP-on-depth, especially on captures with
+        // good parallax (orthogonal-to-motion handheld scans).
         let session_dir = args.frames_root.join(session_id);
         let mut wrote_any = false;
         let original_dir = session_dir.join("frames");
@@ -529,6 +539,17 @@ fn main() {
             }
         } else {
             println!("(no frames_refined/ — run tools/depth_refine.py first to add it)");
+        }
+        let aligned_dir = session_dir.join("frames_feature_ba");
+        if aligned_dir.exists() {
+            let out = session_dir.join("voxels_aligned.json");
+            if run_pass("aligned (BA)", &aligned_dir, &out, &args) {
+                wrote_any = true;
+            }
+        } else {
+            println!("(no frames_feature_ba/ — run \
+                     tools/feature_ray_reconstruct.py --session <id> and then \
+                     tools/feature_pose_align.py --session <id> to produce it)");
         }
         if !wrote_any {
             std::process::exit(1);
