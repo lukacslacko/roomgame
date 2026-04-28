@@ -200,20 +200,29 @@ def _fit_affine_features(model_pred_full: np.ndarray,
                          cw: int, ch_: int,
                          near: float, far: float
                          ) -> tuple[float, float, int]:
-    """Fit  true_depth ≈ a · model_depth + b  on the BA feature anchors
-    of one frame.
+    """Fit the per-frame model→true depth correction in **disparity
+    (1/d) space**:
+
+        1 / true_depth  ≈  a · (1 / model_depth)  +  b
+
+    even though Depth-Anything V2 metric outputs are nominally already
+    in metres, monocular depth predictions are approximately linear in
+    inverse-depth at the pixel level (the natural representation for
+    DPT-style models pre-metric-head). Fitting in depth space gives
+    OLS where far anchors dominate the variance — a ~5% relative model
+    error at d=4 m contributes 16× the squared residual of the same
+    error at d=1 m — and a single noisy far anchor can run away with
+    the fit. In disparity space the residual budget is roughly
+    constant per anchor and the fit is far more stable, especially
+    with the ~150 anchors per frame the BA features give us.
 
     For each anchor (u, v, P_world):
-      • true_depth = camera-space Z of P under the corrected pose:
-            true_depth = −(V_w2c · [P; 1])[z]
-        (OpenGL convention — camera looks down −z, so a point in front
-         lands at negative view-z, and depth is its negation.)
-      • model_depth = bilinear sample of the model's predicted depth at
-        the keypoint pixel (cw, ch — colour-buffer bottom-up grid, same
-        as how `_resample_model_to_depth_grid` indexes the same array).
+      • true_depth = −(V_w2c · [P; 1])[z]   (camera-Z, +ve in front)
+      • model_depth = bilinear sample of the model's prediction at the
+        keypoint pixel (colour-buffer bottom-up grid).
 
-    Returns (a, b, n_used). Falls back to (1.0, 0.0, n) if there are too
-    few inliers to fit a stable affine (caller decides what to do)."""
+    Returns (a, b, n_used) of the disparity-space fit. The caller
+    inverts back to depth as  d_refined = M / (a + b · M)."""
     if not anchors:
         return 1.0, 0.0, 0
     M = len(anchors)
@@ -236,17 +245,35 @@ def _fit_affine_features(model_pred_full: np.ndarray,
     n = int(mask.sum())
     if n < 5:
         return 1.0, 0.0, n
-    x = model_at_kp[mask].astype(np.float64)
-    y = true_depth[mask].astype(np.float64)
+    x = 1.0 / model_at_kp[mask].astype(np.float64)    # disparity_model
+    y = 1.0 / true_depth[mask].astype(np.float64)     # disparity_true
     a, b = _ols(x, y)
     resid = y - (a * x + b)
     mad = float(np.median(np.abs(resid)))
-    if mad > 1e-6 and n >= 10:
+    if mad > 1e-9 and n >= 10:
         keep = np.abs(resid) < 3.0 * mad * 1.4826
         if int(keep.sum()) >= 5:
             a2, b2 = _ols(x[keep], y[keep])
             return a2, b2, int(keep.sum())
     return a, b, n
+
+
+def _apply_disparity_affine(pred: np.ndarray,
+                            a: float, b: float,
+                            near: float, far: float) -> np.ndarray:
+    """Map model depth `M` to refined depth via the disparity-space fit:
+
+            d_refined = M / (a + b · M)
+
+    Pixels where `(a + b · M)` is not strictly positive — degenerate
+    after the affine — are zeroed out so the rust voxeliser treats them
+    as missing measurements (its `d > near` gate then drops them).
+    Output is clipped to [0, far]."""
+    denom = a + b * pred
+    safe = denom > 1e-3
+    out = np.where(safe, pred / np.where(safe, denom, 1.0), 0.0)
+    out = np.clip(out, 0.0, far).astype(np.float32)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -345,17 +372,14 @@ def refine_session(
         Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
         dw = int(frame["width"]); dh = int(frame["height"])
 
+        # `fit_space` records whether (a, b) live in depth space or
+        # disparity space, so the application formula matches the fit.
         if anchor == "features":
-            # BA-feature anchor fit: ~50–500 high-quality 3D anchors per
-            # frame. Falls back to phone-depth OLS if a frame has too few
-            # feature observations or the resulting scale is implausibly
-            # small/large/negative (anchors clustered too tightly in
-            # either the model-output range or the world-depth range and
-            # OLS latched onto noise). If *both* fits give a non-sane
-            # scale — usually a frame whose model depth is near-constant
-            # — the source bin is copied through unchanged so the
-            # voxeliser still sees this frame's phone depth + BA pose
-            # rather than a corrupted refinement.
+            # BA-feature anchor fit (disparity space — see
+            # _fit_affine_features). Falls back to phone-depth OLS in
+            # depth space if too few anchors or the resulting scale is
+            # implausibly small/large/negative; "copy bytes through" if
+            # both fits fail.
             m = _FRAME_BIN_RE.match(fp.name)
             idx = int(m.group(1)) if m else -1
             anchors = feature_anchors.get(idx, [])
@@ -364,6 +388,7 @@ def refine_session(
             a, b, n_used = _fit_affine_features(
                 pred_full, anchors, V_w2c, cw, ch_, near, far,
             )
+            fit_space = "disparity"
             sane_a = 0.2 <= a <= 5.0
             if n_used < 5 or not sane_a:
                 model_on_phone = _resample_model_to_depth_grid(pred_full, cw, ch_, Bd, dw, dh)
@@ -372,6 +397,7 @@ def refine_session(
                     int(frame["format"]), float(frame["rawValueToMeters"]),
                 )
                 a, b, n_used = _fit_affine(model_on_phone, phone_depth, near, far)
+                fit_space = "depth"
                 if not (0.2 <= a <= 5.0):
                     # Both fits unstable; preserve the source frame's
                     # phone depth verbatim by copying the bytes through.
@@ -385,23 +411,22 @@ def refine_session(
                               f"elapsed {elapsed:5.1f}s ETA {eta:5.1f}s")
                     continue
         else:
-            # Phone-depth fit (original behaviour).
-            #
-            # Fit at phone-depth resolution (~90×160) — small, stable,
-            # and the only resolution at which the phone depth exists.
-            # Apply the same (a, b) at colour resolution where the model
-            # actually has detail.
+            # Phone-depth fit (original behaviour, depth space).
             model_on_phone = _resample_model_to_depth_grid(pred_full, cw, ch_, Bd, dw, dh)
             phone_depth = fusion.decode_depth(
                 frame["depth"], dw, dh,
                 int(frame["format"]), float(frame["rawValueToMeters"]),
             )
             a, b, n_used = _fit_affine(model_on_phone, phone_depth, near, far)
+            fit_space = "depth"
 
-        # Apply the affine at colour resolution, then re-grid into the
-        # original Bd coordinate frame (still the same Bd, just a denser
-        # output buffer — Rust reads dw/dh from the header).
-        refined_color = (a * pred_full + b).astype(np.float32)
+        # Apply the fit at colour resolution. Disparity-space fit gets
+        # inverted to depth via d = M / (a + b·M); depth-space fit is
+        # the original a·M + b.
+        if fit_space == "disparity":
+            refined_color = _apply_disparity_affine(pred_full, a, b, near, far)
+        else:
+            refined_color = (a * pred_full + b).astype(np.float32)
         target_dw, target_dh = cw, ch_
         refined_hi = _resample_model_to_depth_grid(
             refined_color, cw, ch_, Bd, target_dw, target_dh,
