@@ -13,6 +13,7 @@ const stage = document.getElementById("stage");
 const reloadBtn = document.getElementById("reloadBtn");
 const recenterBtn = document.getElementById("recenterBtn");
 const lightingBtn = document.getElementById("lightingBtn");
+const voxMeshToggle = document.getElementById("voxMeshToggle");
 const stVoxels = document.getElementById("stVoxels");
 const stSize = document.getElementById("stSize");
 const stMsg = document.getElementById("stMsg");
@@ -23,6 +24,23 @@ const framePanel = document.getElementById("framePanel");
 const framePanelList = document.getElementById("framePanelList");
 const framePanelCount = document.getElementById("framePanelCount");
 const panelClearBtn = document.getElementById("panelClearBtn");
+const pixelCloudBtn = document.getElementById("pixelCloudBtn");
+const pcToolbar = document.getElementById("pcToolbar");
+const pcDepthKindSel = document.getElementById("pcDepthKindSel");
+const pcPoseDirSel = document.getElementById("pcPoseDirSel");
+const pcStrideSel = document.getElementById("pcStrideSel");
+const pcASlider = document.getElementById("pcASlider");
+const pcBSlider = document.getElementById("pcBSlider");
+const pcAVal = document.getElementById("pcAVal");
+const pcBVal = document.getElementById("pcBVal");
+const pcFitSpaceSel = document.getElementById("pcFitSpaceSel");
+const pcResetBtn = document.getElementById("pcResetBtn");
+const pcAffineGroup = document.getElementById("pcAffineGroup");
+const pcStatus = document.getElementById("pcStatus");
+const pcAutotuneBtn = document.getElementById("pcAutotuneBtn");
+const pcAutotuneVoxelBtn = document.getElementById("pcAutotuneVoxelBtn");
+const pcAutotuneChamferBtn = document.getElementById("pcAutotuneChamferBtn");
+const pcFeaturesToggle = document.getElementById("pcFeaturesToggle");
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x101015);
@@ -153,12 +171,24 @@ function rebuildMesh(payload) {
   // Stash the index list so the raycast click handler can map an
   // intersection.instanceId back to the (ix, iy, iz) voxel triple.
   m.userData.voxelIndices = indices;
+  // Apply the toolbar checkbox up front so a reload that lands while
+  // the user has the voxel mesh hidden doesn't snap it back into view.
+  m.visible = !voxMeshToggle || voxMeshToggle.checked;
   scene.add(m);
   voxMesh = m;
   lastBBox = bbox.isEmpty() ? null : bbox;
   // Newly-built mesh defaults to lit settings; re-apply current mode so a
   // reload while in flat mode doesn't snap the cubes back to lit.
   applyLightingMode();
+}
+
+// Voxel-mesh visibility: hide the main reconstruction so the user can
+// inspect just the per-frame pixel-cloud overlays. Default ON; toggling
+// only affects the main mesh, not the per-frame frustum/points overlays.
+if (voxMeshToggle) {
+  voxMeshToggle.addEventListener("change", () => {
+    if (voxMesh) voxMesh.visible = voxMeshToggle.checked;
+  });
 }
 
 // State: which session/variant the dropdowns are pointing at, plus the
@@ -405,6 +435,15 @@ const PITCH_LIMIT = Math.PI / 2 - 0.05;
 
 let dragging = false;
 let lastMouse = { x: 0, y: 0 };
+// Clicking into the 3D viewer must unfocus any active slider/dropdown so
+// the keydown handler (which early-returns when the focus is on an input)
+// starts forwarding WASD/arrows to the flycam instead of nudging the
+// pixel-cloud sliders. Use pointerdown so it fires on every mouse button
+// + touch, not just left-click.
+renderer.domElement.addEventListener("pointerdown", () => {
+  const a = document.activeElement;
+  if (a && a !== document.body && a.blur) a.blur();
+});
 renderer.domElement.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
   dragging = true;
@@ -666,9 +705,20 @@ async function toggleFrameSelection(idx, itemEl) {
     await addFrameOverlay(idx);
   }
   framePanelCount.textContent = `${frameManifest?.frames?.length ?? 0} frames · ${selectedFrames.size} selected`;
+  // In pixel-cloud mode the set of common-features depends on which
+  // frames are selected, so refresh the markers + 3D sphere overlay
+  // (debounced inside the helper to coalesce rapid clicks).
+  if (pcMode && typeof scheduleCommonFeaturesRefresh === "function") {
+    scheduleCommonFeaturesRefresh();
+  }
 }
 
 async function addFrameOverlay(idx) {
+  // Pixel-cloud mode replaces the voxel-highlight cubes with a per-pixel
+  // THREE.Points cloud — same frustum wireframe, different content. The
+  // dispatch happens here so existing call sites (toggleFrameSelection,
+  // selectVoxel) reach either renderer.
+  if (pcMode) return addPixelCloudOverlay(idx);
   const sid = sessionSel.value;
   const variant = variantSel.value || "original";
   if (!sid || !lastVoxelPayload) return;
@@ -733,6 +783,11 @@ function removeFrameOverlay(idx) {
     scene.remove(o.highlight);
     o.highlight.geometry.dispose();
     o.highlight.material.dispose();
+  }
+  if (o.points) {
+    scene.remove(o.points);
+    o.points.geometry.dispose();
+    o.points.material.dispose();
   }
   frameOverlays.delete(idx);
 }
@@ -1131,8 +1186,681 @@ function applyKeypointMarkersToItem(item, idx) {
   }
 }
 
+// =====================================================================
+// Pixel-cloud mode — per-pixel projection of selected frames into 3D.
+// Each selected frame is fetched once via /pixel-cloud/<idx>.json (the
+// server returns origin + per-pixel ray dirs + raw depths + colors) and
+// rendered as a THREE.Points cloud. Sliders for the model affine fit
+// `(a, b)` and the depth-vs-disparity space toggle re-compute positions
+// CLIENT-SIDE from the cached payload, so dragging them doesn't go back
+// to the server. Only depth-source / pose-source / stride changes
+// trigger a re-fetch.
+// =====================================================================
+
+let pcMode = false;
+let pcModelStatus = null;   // { ready, frames: { idx: { w, h } } } or null
+// Per-frame affine state survives selection toggles so the user can
+// auto-tune one batch, deselect, re-select, and find the same tuning
+// in place. Slider edits and Reset overwrite *all* currently-selected
+// frames' entries; auto-tune populates them per-frame.
+const frameAffine = new Map();   // idx → { a, b, fit_space }
+// Common features observed in every currently-selected frame, fetched
+// from /common-features. Drives both the per-thumb keypoint overlay
+// and the in-3D sphere markers.
+let pcCommonFeatures = [];       // [{ world: [x,y,z], obs: { idx: [u,v] } }]
+let pcCommonFeaturesMesh = null; // THREE.Points sprites for the 3D markers
+let pcCommonFeaturesShown = true;
+
+function pcParams() {
+  return {
+    depth_kind: pcDepthKindSel.value,
+    pose_dir:   pcPoseDirSel.value || "frames",
+    stride:     parseInt(pcStrideSel.value, 10) || 4,
+    a:          parseFloat(pcASlider.value),
+    b:          parseFloat(pcBSlider.value),
+    fit_space:  pcFitSpaceSel.value,
+  };
+}
+
+function affineForFrame(idx) {
+  // Per-frame tuning if we have it; otherwise the global slider state.
+  // Phone depth is metric and has no slider math attached.
+  const stored = frameAffine.get(idx);
+  if (stored) return stored;
+  const p = pcParams();
+  return { a: p.a, b: p.b, fit_space: p.fit_space };
+}
+
+function syncPcAffineEnabled() {
+  // The (a, b, fit_space, reset) controls only mean something for model
+  // depth — phone depth is already in metres. Grey them out otherwise so
+  // the user can see the mode is recognised but the controls are inert.
+  const en = pcDepthKindSel.value === "model";
+  pcAffineGroup.style.opacity = en ? "1" : "0.45";
+  for (const el of pcAffineGroup.querySelectorAll("input,select,button")) {
+    el.disabled = !en;
+  }
+}
+
+function updatePcStatus() {
+  const p = pcParams();
+  let n = 0;
+  let dMin = Infinity, dMax = -Infinity;
+  for (const ov of frameOverlays.values()) {
+    if (!ov.points || !ov.payload) continue;
+    n += ov.payload.count;
+    const dd = ov.payload.depths;
+    for (let i = 0; i < dd.length; i++) {
+      const x = dd[i];
+      if (x < dMin) dMin = x;
+      if (x > dMax) dMax = x;
+    }
+  }
+  // Report the raw depth range across all selected frames. Useful for
+  // spotting bad frames where ARCore returned a tight band of values
+  // (typical of the first ~15 frames after session start, before the
+  // depth API has stabilised) — in that case the cloud projects onto
+  // a single near-planar surface at the band's distance, which looks
+  // like a "flat plane orthogonal to the central ray" bug but is
+  // really just the data.
+  const depthTag = (n > 0 && isFinite(dMin))
+    ? ` · raw d ${dMin.toFixed(2)}–${dMax.toFixed(2)} m`
+    : "";
+  let cacheTag = "";
+  if (p.depth_kind === "model" && !pcModelStatus?.ready) {
+    cacheTag = " · model cache missing — run cache_model_raw.py";
+  }
+  pcStatus.textContent =
+    `${frameOverlays.size} frames · ${n.toLocaleString()} pts${depthTag} · `
+    + `${p.depth_kind} · ${p.pose_dir}${cacheTag}`;
+}
+
+async function refreshPcModelStatus() {
+  const sid = sessionSel.value;
+  if (!sid) { pcModelStatus = null; updatePcStatus(); return; }
+  try {
+    const r = await fetch(`/captures/${encodeURIComponent(sid)}/pixel-cloud-status`);
+    pcModelStatus = r.ok ? await r.json() : { ready: false, frames: {} };
+  } catch (e) {
+    console.warn("pixel-cloud-status fetch failed", e);
+    pcModelStatus = { ready: false, frames: {} };
+  }
+  // Update the model option in the depth-kind dropdown to reflect cache state.
+  const modelOpt = [...pcDepthKindSel.options].find((o) => o.value === "model");
+  if (modelOpt) {
+    modelOpt.disabled = !pcModelStatus?.ready;
+    const n = Object.keys(pcModelStatus?.frames || {}).length;
+    modelOpt.textContent = pcModelStatus?.ready
+      ? `model (Depth-Anything-V2, ${n} cached)`
+      : "model (no cache — run cache_model_raw.py)";
+  }
+  if (!pcModelStatus?.ready && pcDepthKindSel.value === "model") {
+    pcDepthKindSel.value = "phone";
+    syncPcAffineEnabled();
+  }
+  updatePcStatus();
+}
+
+function populatePosePicker() {
+  // Populate from the currently-selected session's frame_dirs (returned
+  // by /sessions). Sort so the most likely-useful pose dir is first.
+  const sid = sessionSel.value;
+  const sess = availableSessions.find((s) => s.id === sid);
+  let dirs = (sess?.frame_dirs || []).slice();
+  if (!dirs.length) dirs.push("frames");
+  const rank = (d) => {
+    if (d === "frames")               return 0;
+    if (d === "frames_aligned")       return 1;
+    if (d.startsWith("frames_feature_ba")) return 2;
+    if (d.startsWith("frames_refined"))    return 4;
+    return 3;
+  };
+  dirs.sort((a, b) => (rank(a) - rank(b)) || (a < b ? -1 : 1));
+  const previous = pcPoseDirSel.value;
+  pcPoseDirSel.innerHTML = "";
+  for (const d of dirs) {
+    const o = document.createElement("option");
+    o.value = d;
+    o.textContent = d;
+    pcPoseDirSel.appendChild(o);
+  }
+  if (previous && dirs.includes(previous)) pcPoseDirSel.value = previous;
+  else                                     pcPoseDirSel.value = dirs[0];
+}
+
+async function fetchPixelCloud(idx) {
+  const sid = sessionSel.value;
+  const p = pcParams();
+  const url = `/captures/${encodeURIComponent(sid)}/pixel-cloud/${idx}.json`
+    + `?depth_kind=${encodeURIComponent(p.depth_kind)}`
+    + `&pose_dir=${encodeURIComponent(p.pose_dir)}`
+    + `&stride=${p.stride}`;
+  let r;
+  try { r = await fetch(url); }
+  catch (e) { console.warn("pixel-cloud fetch failed", e); return null; }
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    console.warn(`pixel-cloud HTTP ${r.status} for #${idx}: ${txt}`);
+    return null;
+  }
+  return await r.json();
+}
+
+function applyAffineToPositions(payload, positionsBuf, a, b, fitSpace) {
+  // Phone depth is already metric — sliders should be a no-op even if
+  // the user happens to have nudged them while in phone mode.
+  if (payload.depth_kind === "phone") { a = 1.0; b = 0.0; fitSpace = "depth"; }
+  const n = payload.count;
+  const ox = payload.origin[0], oy = payload.origin[1], oz = payload.origin[2];
+  const dirs = payload.dirs;
+  const raw  = payload.depths;
+  for (let i = 0; i < n; i++) {
+    const r = raw[i];
+    let d;
+    if (fitSpace === "disparity") {
+      const denom = a + b * r;
+      d = (denom > 1e-3) ? r / denom : 0.0;
+    } else {
+      d = a * r + b;
+    }
+    if (!(d > 0) || !isFinite(d)) d = 0.0;
+    positionsBuf[3*i  ] = ox + d * dirs[3*i  ];
+    positionsBuf[3*i+1] = oy + d * dirs[3*i+1];
+    positionsBuf[3*i+2] = oz + d * dirs[3*i+2];
+  }
+}
+
+function rebuildOverlayPositions(idx) {
+  // Re-apply this frame's affine to its cached payload's positions buffer.
+  // Used by the auto-tune button + by anything that mutates frameAffine.
+  const ov = frameOverlays.get(idx);
+  if (!ov || !ov.points || !ov.payload) return;
+  const aff = affineForFrame(idx);
+  const posAttr = ov.points.geometry.getAttribute("position");
+  applyAffineToPositions(ov.payload, posAttr.array, aff.a, aff.b, aff.fit_space);
+  posAttr.needsUpdate = true;
+}
+
+function buildPointsMesh(payload) {
+  const n = payload.count;
+  if (!n) return null;
+  const positions = new Float32Array(n * 3);
+  const colors = new Float32Array(n * 3);
+  // Initial fill at identity affine; the caller re-applies the live
+  // slider values right after to match the UI state.
+  applyAffineToPositions(payload, positions, 1.0, 0.0, "depth");
+  for (let i = 0; i < n; i++) {
+    // Convert sRGB-encoded camera bytes to linear so the colour matches
+    // the lit voxel rendering's setRGB().convertSRGBToLinear() path.
+    const r = (payload.colors[3*i  ] / 255);
+    const g = (payload.colors[3*i+1] / 255);
+    const b = (payload.colors[3*i+2] / 255);
+    colors[3*i  ] = r * r;   // cheap sRGB→linear approx (γ ≈ 2.0)
+    colors[3*i+1] = g * g;
+    colors[3*i+2] = b * b;
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position",
+    new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+  geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  // Disable culling — slider-driven depth changes can push points well
+  // outside any precomputed bounding sphere.
+  geom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+  const mat = new THREE.PointsMaterial({
+    size: 0.025,
+    vertexColors: true,
+    sizeAttenuation: true,
+  });
+  const points = new THREE.Points(geom, mat);
+  points.frustumCulled = false;
+  return points;
+}
+
+async function addPixelCloudOverlay(idx) {
+  // The user may have toggled mode off / deselected the frame while the
+  // fetch was in flight — bail out so we don't add stale objects.
+  if (!selectedFrames.has(idx) || !pcMode) return;
+  const colour = colorForFrame(idx);
+  const payload = await fetchPixelCloud(idx);
+  if (!payload) return;
+  if (!selectedFrames.has(idx) || !pcMode) return;
+  let frustum = null;
+  if (Array.isArray(payload.frustum_world) && payload.frustum_world.length === 8
+      && Array.isArray(payload.origin) && payload.origin.length === 3) {
+    frustum = buildFrustumLines(payload.frustum_world, payload.origin, colour);
+    frustum.userData.frameIdx = idx;
+    scene.add(frustum);
+  }
+  const points = buildPointsMesh(payload);
+  if (points) {
+    scene.add(points);
+    // Apply this frame's stored (a, b) — falls back to the global slider
+    // values for frames that haven't been auto-tuned or manually set yet.
+    const aff = affineForFrame(idx);
+    const posAttr = points.geometry.getAttribute("position");
+    applyAffineToPositions(payload, posAttr.array, aff.a, aff.b, aff.fit_space);
+    posAttr.needsUpdate = true;
+  }
+  frameOverlays.set(idx, { frustum, points, payload });
+  updatePcStatus();
+}
+
+async function refetchAllPcOverlays() {
+  // Pose / depth_kind / stride change — payloads are stale, fetch fresh.
+  // Sliders never trigger this (they reuse the cached payload).
+  if (!pcMode) return;
+  const ids = [...frameOverlays.keys()];
+  for (const idx of ids) removeFrameOverlay(idx);
+  for (const idx of ids) await addPixelCloudOverlay(idx);
+  updatePcStatus();
+}
+
+function recomputeAllPcPositions() {
+  // Called on slider input + fit-space toggle. Slider edits write the
+  // new (a, b, fit_space) into every selected frame's frameAffine entry
+  // — i.e. the slider acts as a "bulk apply to all selected" control.
+  // Auto-tune populates per-frame values; sliders are the manual override.
+  const p = pcParams();
+  for (const idx of frameOverlays.keys()) {
+    frameAffine.set(idx, { a: p.a, b: p.b, fit_space: p.fit_space });
+    rebuildOverlayPositions(idx);
+  }
+  pcAVal.textContent = p.a.toFixed(3);
+  pcBVal.textContent = (p.b >= 0 ? "+" : "") + p.b.toFixed(3);
+  updatePcStatus();
+}
+
+function applyPcModeToggle(force) {
+  pcMode = (typeof force === "boolean") ? force : !pcMode;
+  pcToolbar.hidden = !pcMode;
+  pixelCloudBtn.textContent = pcMode ? "Pixel cloud ◂" : "Pixel cloud ▸";
+  // Drop existing overlays so we cleanly switch between modes.
+  const wasSelected = [...selectedFrames];
+  for (const idx of [...frameOverlays.keys()]) removeFrameOverlay(idx);
+  if (pcMode) {
+    populatePosePicker();
+    refreshPcModelStatus();
+  } else {
+    // Leaving pcMode — drop the common-features 3D markers + thumb
+    // keypoint overlays so the non-pcMode UX isn't littered with them.
+    removeCommonFeaturesMesh();
+    pcCommonFeatures = [];
+    frameMarkers.clear();
+    rerenderPanelMarkersAndSelection();
+  }
+  // Re-add overlays under the new mode.
+  for (const idx of wasSelected) addFrameOverlay(idx);
+  syncPcAffineEnabled();
+  if (pcMode) scheduleCommonFeaturesRefresh();
+  updatePcStatus();
+}
+
+pixelCloudBtn.addEventListener("click", () => applyPcModeToggle());
+pcDepthKindSel.addEventListener("change", () => {
+  syncPcAffineEnabled();
+  refetchAllPcOverlays();
+});
+pcPoseDirSel.addEventListener("change", () => {
+  // Different pose set → different features_meta sidecar → refresh
+  // common-features (and the per-thumb keypoint overlays) too.
+  refetchAllPcOverlays();
+  scheduleCommonFeaturesRefresh();
+});
+pcStrideSel.addEventListener("change", refetchAllPcOverlays);
+pcASlider.addEventListener("input", recomputeAllPcPositions);
+pcBSlider.addEventListener("input", recomputeAllPcPositions);
+pcFitSpaceSel.addEventListener("change", recomputeAllPcPositions);
+pcResetBtn.addEventListener("click", () => {
+  pcASlider.value = "1.0";
+  pcBSlider.value = "0.0";
+  pcFitSpaceSel.value = "depth";
+  // Reset clears all selected frames' tuning back to identity.
+  for (const idx of frameOverlays.keys()) frameAffine.delete(idx);
+  recomputeAllPcPositions();
+});
+
+// ---------------------------------------------------------------------
+// Common features (across the currently-selected frames) — drives both
+// the per-thumb keypoint overlay and the 3D sphere markers. Fetched
+// from /captures/<id>/common-features and rebuilt on every selection /
+// pose-dir change. Cached so the auto-tune button can use the same
+// list without a second fetch.
+// ---------------------------------------------------------------------
+
+let pcCommonFetchTimer = null;
+function scheduleCommonFeaturesRefresh() {
+  // 200 ms debounce so rapid multi-click selections only fetch once.
+  if (pcCommonFetchTimer) clearTimeout(pcCommonFetchTimer);
+  pcCommonFetchTimer = setTimeout(() => {
+    pcCommonFetchTimer = null;
+    refreshCommonFeatures();
+  }, 200);
+}
+
+async function refreshCommonFeatures() {
+  // Drop any prior 3D markers + thumb markers so an empty / failed
+  // result clears the previous batch.
+  removeCommonFeaturesMesh();
+  frameMarkers.clear();
+  pcCommonFeatures = [];
+  if (!pcMode || selectedFrames.size < 1) {
+    rerenderPanelMarkersAndSelection();
+    updatePcStatus();
+    return;
+  }
+  const sid = sessionSel.value;
+  const p = pcParams();
+  const frames = [...selectedFrames].sort((a, b) => a - b);
+  const url = `/captures/${encodeURIComponent(sid)}/common-features`
+    + `?frames=${frames.join(",")}`
+    + `&pose_dir=${encodeURIComponent(p.pose_dir)}`;
+  let r;
+  try { r = await fetch(url); }
+  catch (e) { console.warn("common-features fetch failed", e); return; }
+  if (!r.ok) {
+    // 404 = no matching features_meta sidecar; tell the user via status.
+    const txt = await r.text().catch(() => "");
+    pcStatus.textContent = `common-features HTTP ${r.status}: ${txt.split("\n")[0] || "?"}`;
+    return;
+  }
+  const payload = await r.json();
+  pcCommonFeatures = payload.features || [];
+  // Populate thumb markers (existing frameMarkers infrastructure).
+  for (const feat of pcCommonFeatures) {
+    for (const [frameStr, uv] of Object.entries(feat.obs || {})) {
+      const fi = Number(frameStr);
+      if (!frameMarkers.has(fi)) frameMarkers.set(fi, []);
+      frameMarkers.get(fi).push({ u: uv[0], v: uv[1] });
+    }
+  }
+  rerenderPanelMarkersAndSelection();
+  if (pcCommonFeaturesShown) addCommonFeaturesMesh();
+  updatePcStatus();
+}
+
+function addCommonFeaturesMesh() {
+  removeCommonFeaturesMesh();
+  if (!pcCommonFeatures.length) return;
+  // Cyan points at world positions; large enough to spot against the
+  // pixel cloud. depthTest off so they peek through occluding voxels.
+  const positions = new Float32Array(pcCommonFeatures.length * 3);
+  for (let i = 0; i < pcCommonFeatures.length; i++) {
+    const w = pcCommonFeatures[i].world;
+    positions[3*i  ] = w[0];
+    positions[3*i+1] = w[1];
+    positions[3*i+2] = w[2];
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+  const mat = new THREE.PointsMaterial({
+    color: 0x00ffff,
+    size: 0.06,
+    sizeAttenuation: true,
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+    opacity: 0.95,
+  });
+  const points = new THREE.Points(geom, mat);
+  points.frustumCulled = false;
+  points.renderOrder = 12;
+  scene.add(points);
+  pcCommonFeaturesMesh = points;
+}
+
+function removeCommonFeaturesMesh() {
+  if (!pcCommonFeaturesMesh) return;
+  scene.remove(pcCommonFeaturesMesh);
+  pcCommonFeaturesMesh.geometry.dispose();
+  pcCommonFeaturesMesh.material.dispose();
+  pcCommonFeaturesMesh = null;
+}
+
+pcFeaturesToggle.addEventListener("change", () => {
+  pcCommonFeaturesShown = pcFeaturesToggle.checked;
+  if (pcCommonFeaturesShown) addCommonFeaturesMesh();
+  else                       removeCommonFeaturesMesh();
+});
+
+// ---------------------------------------------------------------------
+// Auto-tune: server fits per-frame (a, b) to align cached model_raw
+// depths with BA-feature world positions, then we apply per-frame.
+// ---------------------------------------------------------------------
+
+async function doAutotune() {
+  if (!pcMode || selectedFrames.size < 1) return;
+  const sid = sessionSel.value;
+  const p = pcParams();
+  if (p.depth_kind !== "model") {
+    pcStatus.textContent = "auto-tune only meaningful for depth=model";
+    return;
+  }
+  const frames = [...selectedFrames].sort((a, b) => a - b);
+  pcAutotuneBtn.disabled = true;
+  pcAutotuneBtn.textContent = "tuning…";
+  try {
+    const url = `/captures/${encodeURIComponent(sid)}/pixel-cloud-autotune`
+      + `?frames=${frames.join(",")}`
+      + `&pose_dir=${encodeURIComponent(p.pose_dir)}`
+      + `&fit_space=${encodeURIComponent(p.fit_space)}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      pcStatus.textContent = `auto-tune HTTP ${r.status}: ${txt.split("\n")[0]}`;
+      return;
+    }
+    const payload = await r.json();
+    if (!payload.n_common) {
+      pcStatus.textContent =
+        `auto-tune: no features common to all ${frames.length} frames — `
+        + `pick frames closer in time`;
+      return;
+    }
+    let nFit = 0;
+    let residSum = 0;
+    let residCount = 0;
+    for (const [frameStr, fit] of Object.entries(payload.per_frame)) {
+      const fi = Number(frameStr);
+      if (fit && typeof fit.a === "number" && typeof fit.b === "number") {
+        frameAffine.set(fi, {
+          a: fit.a,
+          b: fit.b,
+          fit_space: fit.fit_space || p.fit_space,
+        });
+        rebuildOverlayPositions(fi);
+        nFit++;
+        if (typeof fit.residual_m === "number") {
+          residSum += fit.residual_m;
+          residCount++;
+        }
+      }
+    }
+    const meanR = residCount ? (residSum / residCount) : NaN;
+    pcStatus.textContent =
+      `auto-tuned ${nFit}/${frames.length} frames · ${payload.n_common} common features · `
+      + `median |Δd| ≈ ${isFinite(meanR) ? (meanR * 100).toFixed(1) + " cm" : "?"} · ${p.fit_space}`;
+  } catch (e) {
+    pcStatus.textContent = `auto-tune error: ${e.message || e}`;
+  } finally {
+    pcAutotuneBtn.disabled = false;
+    pcAutotuneBtn.textContent = "auto-tune";
+  }
+}
+
+pcAutotuneBtn.addEventListener("click", doAutotune);
+
+// ---------------------------------------------------------------------
+// Voxel-overlap auto-tune — feature-free, coarse-to-fine. Sends each
+// frame's current (a, b) as the optimiser's initial point so a second
+// click can refine an earlier run rather than starting from scratch.
+// ---------------------------------------------------------------------
+
+async function doAutotuneVoxel() {
+  if (!pcMode || selectedFrames.size < 2) {
+    pcStatus.textContent = "voxel auto-tune needs ≥ 2 selected frames";
+    return;
+  }
+  const sid = sessionSel.value;
+  const p = pcParams();
+  if (p.depth_kind !== "model") {
+    pcStatus.textContent = "voxel auto-tune only meaningful for depth=model";
+    return;
+  }
+  const frames = [...selectedFrames].sort((a, b) => a - b);
+  // Pack the current per-frame state into the `init=` query so the
+  // optimiser warm-starts from the user's manually set / previously
+  // auto-tuned values rather than from identity (1, 0).
+  const initParts = frames.map((idx) => {
+    const aff = affineForFrame(idx);
+    return `${idx}:${aff.a.toFixed(4)},${aff.b.toFixed(4)}`;
+  }).join(";");
+
+  pcAutotuneVoxelBtn.disabled = true;
+  pcAutotuneVoxelBtn.textContent = "tuning…";
+  pcStatus.textContent =
+    `voxel auto-tune: ${frames.length} frames, coarse→fine 30/15/5 cm…`;
+  try {
+    const url = `/captures/${encodeURIComponent(sid)}/pixel-cloud-autotune-voxel`
+      + `?frames=${frames.join(",")}`
+      + `&pose_dir=${encodeURIComponent(p.pose_dir)}`
+      + `&fit_space=${encodeURIComponent(p.fit_space)}`
+      + `&voxel_sizes=0.30,0.15,0.05`
+      + `&stride=8`
+      + `&init=${encodeURIComponent(initParts)}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      pcStatus.textContent = `voxel auto-tune HTTP ${r.status}: ${txt.split("\n")[0]}`;
+      return;
+    }
+    const payload = await r.json();
+    let nFit = 0;
+    for (const [frameStr, fit] of Object.entries(payload.per_frame || {})) {
+      const fi = Number(frameStr);
+      if (fit && typeof fit.a === "number" && typeof fit.b === "number") {
+        frameAffine.set(fi, {
+          a: fit.a,
+          b: fit.b,
+          fit_space: fit.fit_space || p.fit_space,
+        });
+        rebuildOverlayPositions(fi);
+        nFit++;
+      }
+    }
+    const stages = (payload.stages || [])
+      .map((s) => `${(s.voxel_size*100).toFixed(0)}cm:${s.overlap}`)
+      .join(" → ");
+    pcStatus.textContent =
+      `voxel auto-tuned ${nFit}/${frames.length} frames · ${stages} `
+      + `· ${p.fit_space}`;
+  } catch (e) {
+    pcStatus.textContent = `voxel auto-tune error: ${e.message || e}`;
+  } finally {
+    pcAutotuneVoxelBtn.disabled = false;
+    pcAutotuneVoxelBtn.textContent = "auto-tune (voxel)";
+  }
+}
+
+pcAutotuneVoxelBtn.addEventListener("click", doAutotuneVoxel);
+
+// ---------------------------------------------------------------------
+// Chamfer-distance auto-tune — smooth surrogate. Warm-starts from the
+// current per-frame state, which is critical: a cold (1, 0) start
+// often falls into the "collapse all clouds onto each frame's camera
+// origin" basin (the smooth metric, unlike the discrete voxel count,
+// rewards collapsing). Following auto-tune (features) → auto-tune
+// (chamfer) usually converges to a more honest fit.
+// ---------------------------------------------------------------------
+
+async function doAutotuneChamfer() {
+  if (!pcMode || selectedFrames.size < 2) {
+    pcStatus.textContent = "chamfer auto-tune needs ≥ 2 selected frames";
+    return;
+  }
+  const sid = sessionSel.value;
+  const p = pcParams();
+  if (p.depth_kind !== "model") {
+    pcStatus.textContent = "chamfer auto-tune only meaningful for depth=model";
+    return;
+  }
+  const frames = [...selectedFrames].sort((a, b) => a - b);
+  const initParts = frames.map((idx) => {
+    const aff = affineForFrame(idx);
+    return `${idx}:${aff.a.toFixed(4)},${aff.b.toFixed(4)}`;
+  }).join(";");
+
+  pcAutotuneChamferBtn.disabled = true;
+  pcAutotuneChamferBtn.textContent = "tuning…";
+  pcStatus.textContent =
+    `chamfer auto-tune: ${frames.length} frames, thresholds 30→5 cm…`;
+  try {
+    const url = `/captures/${encodeURIComponent(sid)}/pixel-cloud-autotune-chamfer`
+      + `?frames=${frames.join(",")}`
+      + `&pose_dir=${encodeURIComponent(p.pose_dir)}`
+      + `&fit_space=${encodeURIComponent(p.fit_space)}`
+      + `&thresholds=0.30,0.05`
+      + `&stride=16`
+      + `&init=${encodeURIComponent(initParts)}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      pcStatus.textContent = `chamfer auto-tune HTTP ${r.status}: ${txt.split("\n")[0]}`;
+      return;
+    }
+    const payload = await r.json();
+    let nFit = 0;
+    for (const [frameStr, fit] of Object.entries(payload.per_frame || {})) {
+      const fi = Number(frameStr);
+      if (fit && typeof fit.a === "number" && typeof fit.b === "number") {
+        frameAffine.set(fi, {
+          a: fit.a,
+          b: fit.b,
+          fit_space: fit.fit_space || p.fit_space,
+        });
+        rebuildOverlayPositions(fi);
+        nFit++;
+      }
+    }
+    const stages = (payload.stages || [])
+      .map((s) => `${(s.threshold_m*100).toFixed(0)}cm:${s.loss?.toFixed(4) ?? "?"}`)
+      .join(" → ");
+    pcStatus.textContent =
+      `chamfer auto-tuned ${nFit}/${frames.length} frames · `
+      + `loss ${stages} · ${p.fit_space}`;
+  } catch (e) {
+    pcStatus.textContent = `chamfer auto-tune error: ${e.message || e}`;
+  } finally {
+    pcAutotuneChamferBtn.disabled = false;
+    pcAutotuneChamferBtn.textContent = "auto-tune (chamfer)";
+  }
+}
+
+pcAutotuneChamferBtn.addEventListener("click", doAutotuneChamfer);
+
+// (Common-features refresh is triggered from inside toggleFrameSelection
+// — see the call to scheduleCommonFeaturesRefresh there.)
+
+// Refresh model-cache status + pose dropdown whenever the active session
+// changes. Listeners are independent of the existing session/variant
+// handlers above so the order of registration doesn't matter.
+sessionSel.addEventListener("change", () => {
+  // Per-frame affine entries are tied to frame indices in the *current*
+  // session — drop them when the session changes so they don't bleed
+  // into the next session's frames-of-the-same-numbers.
+  frameAffine.clear();
+  pcCommonFeatures = [];
+  removeCommonFeaturesMesh();
+  refreshPcModelStatus();
+  populatePosePicker();
+});
+
 // Boot: fetch the session list first so the dropdowns are populated before
 // the initial fetch picks the latest session + refined variant.
-refreshSessionList().then(loadVoxels).then(() => {
+refreshSessionList().then(() => {
+  populatePosePicker();
+  refreshPcModelStatus();
+  return loadVoxels();
+}).then(() => {
   if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
 });

@@ -872,7 +872,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_frame_manifest(m.group(1), variant_dir)
             return
 
-        # /captures/<id>/frame-thumb/<idx>.<png|jpg>?variant=<vd>&kind=color|depth
+        # /captures/<id>/frame-thumb/<idx>.<png|jpg>?variant=<vd>&kind=color|depth&long_edge=<n>
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/frame-thumb/(\d+)\.png", path,
         )
@@ -880,7 +880,13 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             qs = parse_qs(purl.query)
             variant_dir = (qs.get("variant") or ["frames"])[0]
             kind = (qs.get("kind") or ["color"])[0]
-            self._handle_frame_thumb(m.group(1), variant_dir, int(m.group(2)), kind)
+            try:
+                long_edge = int((qs.get("long_edge") or ["600"])[0])
+            except ValueError:
+                long_edge = 600
+            long_edge = max(64, min(2400, long_edge))
+            self._handle_frame_thumb(m.group(1), variant_dir, int(m.group(2)),
+                                       kind, long_edge=long_edge)
             return
 
         # /captures/<id>/frame-voxels/<idx>.json?variant=<vd>
@@ -911,6 +917,193 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             qs = parse_qs(purl.query)
             variant = (qs.get("variant") or ["features"])[0]
             self._handle_frame_feature_voxels(m.group(1), int(m.group(2)), variant)
+            return
+
+        # /captures/<id>/pixel-cloud-status — reports whether the model_raw
+        # cache directory exists for this session and which frame indices
+        # are covered. The voxelview uses this to disable the model-depth
+        # toggle (and tell the user to run cache_model_raw.py) when the
+        # cache hasn't been built.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/pixel-cloud-status", path,
+        )
+        if m:
+            self._handle_pixel_cloud_status(m.group(1))
+            return
+
+        # /captures/<id>/common-features?frames=1,17,33&pose_dir=frames
+        # — features observed in every one of `frames`, with per-frame
+        # (u, v) and BA-triangulated world position. The features_meta
+        # sidecar is selected to match `pose_dir` (raw → features_meta.json,
+        # frames_aligned → features_meta_aligned.json, etc.); without a
+        # matching sidecar the response is 404 so the JS can tell the user
+        # to run feature_ray_reconstruct.py for that pose set.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/common-features", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            pose_dir = (qs.get("pose_dir") or ["frames"])[0]
+            frames_csv = (qs.get("frames") or [""])[0]
+            self._handle_common_features(m.group(1), pose_dir, frames_csv)
+            return
+
+        # /captures/<id>/pixel-cloud-autotune?frames=1,17,33&pose_dir=frames
+        #     &fit_space=depth|disparity
+        # — for each frame in `frames`, fits an affine (a, b) so that the
+        # camera-Z depth implied by the cached model_raw at each common
+        # feature's pixel matches the BA-triangulated world point's
+        # camera-Z. Returns per-frame {a, b, n_features, residual}.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/pixel-cloud-autotune", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            pose_dir   = (qs.get("pose_dir")   or ["frames"])[0]
+            fit_space  = (qs.get("fit_space")  or ["depth"])[0]
+            frames_csv = (qs.get("frames") or [""])[0]
+            self._handle_pixel_cloud_autotune(
+                m.group(1), pose_dir, fit_space, frames_csv,
+            )
+            return
+
+        # /captures/<id>/pixel-cloud-autotune-voxel?frames=…&pose_dir=…
+        #     &fit_space=depth|disparity&voxel_sizes=0.30,0.15,0.05
+        #     &init=15:1.0,-0.2;16:0.8,-0.1&stride=8
+        # — feature-free auto-tune. For each frame, fits (a, b) by
+        # MAXIMISING the pairwise voxel-overlap count between the
+        # frames' projected pixel clouds. Coarse-to-fine voxel sizes
+        # smooth out the otherwise-piecewise-constant objective; Powell
+        # is used at each stage. Camera origins anchor the world frame
+        # so there is no gauge ambiguity to break.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/pixel-cloud-autotune-voxel",
+            path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            pose_dir   = (qs.get("pose_dir")    or ["frames"])[0]
+            fit_space  = (qs.get("fit_space")   or ["depth"])[0]
+            frames_csv = (qs.get("frames")      or [""])[0]
+            voxel_csv  = (qs.get("voxel_sizes") or ["0.30,0.15,0.05"])[0]
+            init_csv   = (qs.get("init")        or [""])[0]
+            try:
+                stride = max(1, int((qs.get("stride") or ["8"])[0]))
+            except ValueError:
+                stride = 8
+            self._handle_pixel_cloud_autotune_voxel(
+                m.group(1), pose_dir, fit_space, frames_csv,
+                voxel_csv, init_csv, stride,
+            )
+            return
+
+        # /captures/<id>/frame-depth-at?frames=15,16,17&us=0.5,0.51,0.52
+        #     &vs=0.4,0.4,0.4&kind=phone|model
+        # — Bilinear-sample either depth source at the given norm-view
+        # UVs in each frame. Lengths of frames/us/vs must match (each
+        # entry is one (frame, u, v) sample). Used by the triplet
+        # editor to read off depth values at the user's clicked points.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/frame-depth-at", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            self._handle_frame_depth_at(
+                m.group(1),
+                kind=(qs.get("kind") or ["phone"])[0],
+                pose_dir=(qs.get("pose_dir") or ["frames"])[0],
+                frames_csv=(qs.get("frames") or [""])[0],
+                us_csv=(qs.get("us") or [""])[0],
+                vs_csv=(qs.get("vs") or [""])[0],
+            )
+            return
+
+        # /captures/<id>/snap-feature?ref_frame=15&ref_u=…&ref_v=…
+        #     &target_frame=16&init_u=…&init_v=…&patch=0.025&radius=0.06
+        # — Refine `init_u, init_v` on `target_frame` so the local
+        # patch best matches a same-size patch on `ref_frame` at
+        # `ref_u, ref_v`. Returns refined UV + the NCC score.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/snap-feature", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            try:
+                self._handle_snap_feature(
+                    m.group(1),
+                    ref_frame=int((qs.get("ref_frame") or ["0"])[0]),
+                    target_frame=int((qs.get("target_frame") or ["0"])[0]),
+                    ref_u=float((qs.get("ref_u") or ["0.5"])[0]),
+                    ref_v=float((qs.get("ref_v") or ["0.5"])[0]),
+                    init_u=float((qs.get("init_u") or ["0.5"])[0]),
+                    init_v=float((qs.get("init_v") or ["0.5"])[0]),
+                    patch=float((qs.get("patch") or ["0.025"])[0]),
+                    radius=float((qs.get("radius") or ["0.06"])[0]),
+                    pose_dir=(qs.get("pose_dir") or ["frames"])[0],
+                )
+            except ValueError as e:
+                self._send_text(400, f"bad query: {e}\n")
+            return
+
+        # /captures/<id>/pixel-cloud-autotune-chamfer?frames=…&pose_dir=…
+        #     &fit_space=depth|disparity&thresholds=0.30,0.05
+        #     &init=15:1.0,-0.2;16:0.8,-0.1&stride=16
+        # — smooth-surrogate auto-tune. Minimises the symmetric
+        # truncated-Chamfer distance between every pair of frames'
+        # point clouds. Pixels with no nearest neighbour inside the
+        # threshold contribute a constant (the threshold²), so partial-
+        # overlap regions don't pull the optimiser around. Threshold
+        # is annealed coarse-to-fine.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/pixel-cloud-autotune-chamfer",
+            path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            pose_dir    = (qs.get("pose_dir")   or ["frames"])[0]
+            fit_space   = (qs.get("fit_space")  or ["depth"])[0]
+            frames_csv  = (qs.get("frames")     or [""])[0]
+            thresh_csv  = (qs.get("thresholds") or ["0.30,0.05"])[0]
+            init_csv    = (qs.get("init")       or [""])[0]
+            try:
+                stride = max(1, int((qs.get("stride") or ["16"])[0]))
+            except ValueError:
+                stride = 16
+            self._handle_pixel_cloud_autotune_chamfer(
+                m.group(1), pose_dir, fit_space, frames_csv,
+                thresh_csv, init_csv, stride,
+            )
+            return
+
+        # /captures/<id>/pixel-cloud/<idx>.json — per-pixel rays + depths
+        # for one frame, ready for client-side slider-driven affine application.
+        # Query params:
+        #   pose_dir   = frames | frames_aligned | frames_feature_ba_*    (which
+        #                frame.bin to read for V/P/Bd matrices)
+        #   depth_kind = phone | model
+        #   stride     = pixel skip on the source grid (default 4 for model,
+        #                1 for phone)
+        #   near, far  = depth window for client-side filtering hint
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/pixel-cloud/(\d+)\.json", path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            pose_dir   = (qs.get("pose_dir")   or ["frames"])[0]
+            depth_kind = (qs.get("depth_kind") or ["phone"])[0]
+            try:
+                stride = max(1, int((qs.get("stride") or ["0"])[0]))
+            except ValueError:
+                stride = 0
+            try:
+                near = float((qs.get("near") or ["0.05"])[0])
+                far  = float((qs.get("far")  or ["8.0"])[0])
+            except ValueError:
+                near, far = 0.05, 8.0
+            self._handle_pixel_cloud(
+                m.group(1), int(m.group(2)),
+                pose_dir, depth_kind, stride, near, far,
+            )
             return
 
         self.send_response(404); self.end_headers()
@@ -957,12 +1150,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, {"session": session_id, "variant": variant_dir, "frames": frames})
 
     def _handle_frame_thumb(self, session_id: str, variant_dir: str,
-                             idx: int, kind: str) -> None:
+                             idx: int, kind: str, *, long_edge: int = 600) -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
         if kind not in ("color", "depth"):
             self.send_response(404); self.end_headers(); return
-        cache_key = (session_id, variant_dir, idx, kind)
+        # Cache by long_edge as well so the triplet (full-res) and the
+        # voxelview panel (600 px) thumbs don't evict each other.
+        cache_key = (session_id, variant_dir, idx, kind, long_edge)
         png = _THUMB_CACHE.get(cache_key)
         if png is None:
             f = FRAMES_DIR / session_id / variant_dir / f"frame_{idx:06d}.bin"
@@ -970,8 +1165,10 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(404); self.end_headers(); return
             try:
                 body = f.read_bytes()
-                png = (_render_color_thumb(body) if kind == "color"
-                       else _render_depth_thumb(body))
+                if kind == "color":
+                    png = _render_color_thumb(body, size=long_edge)
+                else:
+                    png = _render_depth_thumb(body, size=long_edge)
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"thumb render failed: {e}\n"); return
             if png is None:
@@ -1067,6 +1264,335 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             "pose": pose,
             "frustum_world": frustum_corners,
             "indices": indices,
+        })
+
+    def _handle_pixel_cloud_status(self, session_id: str) -> None:
+        """Report whether captured_frames/<id>/model_raw/index.json is on
+        disk, plus the list of cached frame indices and the (cw, ch) of
+        each — the client uses this to gate the 'model depth' toggle and
+        to know each frame's color-grid resolution."""
+        if not SESSION_ID_RE.match(session_id):
+            self.send_response(404); self.end_headers(); return
+        sess_dir = FRAMES_DIR / session_id
+        idx_path = sess_dir / "model_raw" / "index.json"
+        if not idx_path.exists():
+            self._send_json(200, {"ready": False, "frames": {}})
+            return
+        try:
+            payload = json.loads(idx_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            self._send_text(500, f"index.json read failed: {e}\n"); return
+        self._send_json(200, {"ready": True, "frames": payload})
+
+    def _handle_pixel_cloud(self, session_id: str, idx: int,
+                            pose_dir: str, depth_kind: str,
+                            stride: int, near: float, far: float) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        if depth_kind not in ("phone", "model"):
+            self._send_text(400, f"bad depth_kind {depth_kind!r}\n"); return
+        f = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
+        if not f.exists():
+            self._send_text(404, f"missing {pose_dir}/frame_{idx:06d}.bin\n"); return
+        # Model-raw cache (only needed for depth_kind=model).
+        model_raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+        model_raw_meta = FRAMES_DIR / session_id / "model_raw" / "index.json"
+        try:
+            payload = _build_pixel_cloud_payload(
+                body=f.read_bytes(),
+                depth_kind=depth_kind,
+                stride=stride,
+                near=near,
+                far=far,
+                model_raw_path=model_raw_path if depth_kind == "model" else None,
+                model_raw_meta=model_raw_meta if depth_kind == "model" else None,
+                idx=idx,
+            )
+        except FileNotFoundError as e:
+            self._send_text(409, f"{e}\n"); return
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"pixel-cloud failed: {type(e).__name__}: {e}\n"); return
+        self._send_json(200, payload)
+
+    def _handle_pixel_cloud_autotune_chamfer(self, session_id: str,
+                                              pose_dir: str, fit_space: str,
+                                              frames_csv: str,
+                                              thresh_csv: str, init_csv: str,
+                                              stride: int) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        if fit_space not in ("depth", "disparity"):
+            self._send_text(400, f"bad fit_space {fit_space!r}\n"); return
+        frames = sorted(_parse_int_csv(frames_csv))
+        if len(frames) < 2:
+            self._send_text(400, "need at least 2 frames for chamfer auto-tune\n"); return
+        try:
+            thresholds = [float(x) for x in thresh_csv.split(",") if x.strip()]
+        except ValueError:
+            self._send_text(400, f"bad thresholds={thresh_csv!r}\n"); return
+        if not thresholds or any(t <= 0 or t > 5 for t in thresholds):
+            self._send_text(400, "thresholds must be a comma list of positive metres\n"); return
+        init_map: dict[int, tuple[float, float]] = {}
+        for part in (init_csv or "").split(";"):
+            part = part.strip()
+            if not part: continue
+            try:
+                key, vals = part.split(":")
+                a_s, b_s = vals.split(",")
+                init_map[int(key)] = (float(a_s), float(b_s))
+            except ValueError:
+                continue
+
+        model_meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
+        if not model_meta_path.exists():
+            self._send_text(409, "model_raw cache missing — run cache_model_raw.py\n"); return
+        try:
+            model_meta = json.loads(model_meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            self._send_text(500, f"model_raw/index.json read failed: {e}\n"); return
+        try:
+            result = _autotune_chamfer(
+                session_id=session_id, pose_dir=pose_dir,
+                frames=frames, fit_space=fit_space,
+                thresholds=thresholds, init_map=init_map,
+                stride=stride, model_meta=model_meta,
+            )
+        except FileNotFoundError as e:
+            self._send_text(409, f"{e}\n"); return
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"autotune-chamfer failed: {type(e).__name__}: {e}\n"); return
+        self._send_json(200, result)
+
+    def _handle_frame_depth_at(self, session_id: str, *,
+                                kind: str, pose_dir: str,
+                                frames_csv: str, us_csv: str, vs_csv: str) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        if kind not in ("phone", "model"):
+            self._send_text(400, f"bad kind {kind!r}\n"); return
+        # Parse parallel arrays. We accept different lengths for frames vs
+        # (us, vs) only if frames has length 1 (broadcast over all UVs);
+        # otherwise lengths must match.
+        try:
+            frames = [int(x) for x in frames_csv.split(",") if x.strip()]
+            us     = [float(x) for x in us_csv.split(",") if x.strip()]
+            vs     = [float(x) for x in vs_csv.split(",") if x.strip()]
+        except ValueError as e:
+            self._send_text(400, f"bad numeric in query: {e}\n"); return
+        if len(us) != len(vs):
+            self._send_text(400, "us and vs must have equal length\n"); return
+        if not frames or not us:
+            self._send_text(400, "frames=, us=, vs= are required\n"); return
+        if len(frames) == 1:
+            frames = frames * len(us)
+        elif len(frames) != len(us):
+            self._send_text(400, "frames must be 1 or len(us)\n"); return
+
+        try:
+            depths = _sample_depth_at(
+                session_id=session_id, pose_dir=pose_dir, kind=kind,
+                frames=frames, us=us, vs=vs,
+            )
+        except FileNotFoundError as e:
+            self._send_text(409, f"{e}\n"); return
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"depth-at failed: {type(e).__name__}: {e}\n"); return
+        self._send_json(200, {
+            "session": session_id,
+            "kind": kind,
+            "pose_dir": pose_dir,
+            "depths": depths,   # list of float|null in input order
+        })
+
+    def _handle_snap_feature(self, session_id: str, *,
+                              ref_frame: int, target_frame: int,
+                              ref_u: float, ref_v: float,
+                              init_u: float, init_v: float,
+                              patch: float, radius: float,
+                              pose_dir: str) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        # Sanity-check params; everything in [0,1]² for UVs,
+        # patch ∈ (0, 0.2], radius ∈ (0, 0.5].
+        for name, val, lo, hi in [("ref_u", ref_u, 0, 1), ("ref_v", ref_v, 0, 1),
+                                   ("init_u", init_u, 0, 1), ("init_v", init_v, 0, 1),
+                                   ("patch", patch, 1e-3, 0.2),
+                                   ("radius", radius, 1e-3, 0.5)]:
+            if not (lo <= val <= hi):
+                self._send_text(400, f"{name}={val} out of [{lo}, {hi}]\n"); return
+        ref_path = FRAMES_DIR / session_id / pose_dir / f"frame_{ref_frame:06d}.bin"
+        tgt_path = FRAMES_DIR / session_id / pose_dir / f"frame_{target_frame:06d}.bin"
+        if not ref_path.exists() or not tgt_path.exists():
+            self._send_text(404, "missing frame.bin for ref or target\n"); return
+        try:
+            refined = _snap_feature_match(
+                ref_body=ref_path.read_bytes(),
+                tgt_body=tgt_path.read_bytes(),
+                ref_uv=(ref_u, ref_v),
+                init_uv=(init_u, init_v),
+                patch_norm=patch,
+                radius_norm=radius,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"snap failed: {type(e).__name__}: {e}\n"); return
+        self._send_json(200, refined)
+
+    def _handle_pixel_cloud_autotune_voxel(self, session_id: str,
+                                            pose_dir: str, fit_space: str,
+                                            frames_csv: str,
+                                            voxel_csv: str, init_csv: str,
+                                            stride: int) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        if fit_space not in ("depth", "disparity"):
+            self._send_text(400, f"bad fit_space {fit_space!r}\n"); return
+        frames = sorted(_parse_int_csv(frames_csv))
+        if len(frames) < 2:
+            self._send_text(400, "need at least 2 frames for voxel-overlap auto-tune\n")
+            return
+        try:
+            voxel_sizes = [float(x) for x in voxel_csv.split(",") if x.strip()]
+        except ValueError:
+            self._send_text(400, f"bad voxel_sizes={voxel_csv!r}\n"); return
+        if not voxel_sizes or any(s <= 0 or s > 5 for s in voxel_sizes):
+            self._send_text(400, "voxel_sizes must be a comma list of positive metres\n"); return
+        # Decode optional init: "idx:a,b;idx:a,b"  →  {idx: (a, b)}
+        init_map: dict[int, tuple[float, float]] = {}
+        for part in (init_csv or "").split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                key, vals = part.split(":")
+                a_s, b_s = vals.split(",")
+                init_map[int(key)] = (float(a_s), float(b_s))
+            except ValueError:
+                continue
+
+        model_meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
+        if not model_meta_path.exists():
+            self._send_text(409, "model_raw cache missing — run cache_model_raw.py\n"); return
+        try:
+            model_meta = json.loads(model_meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            self._send_text(500, f"model_raw/index.json read failed: {e}\n"); return
+
+        try:
+            result = _autotune_voxel_overlap(
+                session_id=session_id,
+                pose_dir=pose_dir,
+                frames=frames,
+                fit_space=fit_space,
+                voxel_sizes=voxel_sizes,
+                init_map=init_map,
+                stride=stride,
+                model_meta=model_meta,
+            )
+        except FileNotFoundError as e:
+            self._send_text(409, f"{e}\n"); return
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"autotune-voxel failed: {type(e).__name__}: {e}\n"); return
+        self._send_json(200, result)
+
+    def _handle_common_features(self, session_id: str,
+                                 pose_dir: str, frames_csv: str) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        frame_set = _parse_int_csv(frames_csv)
+        if not frame_set:
+            self._send_text(400, "frames= required (comma-separated integers)\n"); return
+        meta_name = _features_meta_for_pose_dir(pose_dir)
+        meta_path = FRAMES_DIR / session_id / meta_name
+        if not meta_path.exists():
+            self._send_text(
+                404,
+                f"{meta_name} not found — run "
+                f"`tools/feature_ray_reconstruct.py --session {session_id} "
+                f"--frames-variant {pose_dir}`\n",
+            )
+            return
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            self._send_text(500, f"meta read failed: {e}\n"); return
+        common = _find_common_features(meta, frame_set)
+        # Trim per-feature obs to only the requested frames so the payload
+        # is small even on long-tracked features.
+        out = []
+        for f in common:
+            obs_filtered = {k: f["obs"][k] for k in f["obs"] if k in frame_set}
+            out.append({"world": f["world"], "obs": obs_filtered})
+        self._send_json(200, {
+            "session": session_id,
+            "pose_dir": pose_dir,
+            "meta_file": meta_name,
+            "frames": sorted(frame_set),
+            "count": len(out),
+            "features": out,
+        })
+
+    def _handle_pixel_cloud_autotune(self, session_id: str,
+                                     pose_dir: str, fit_space: str,
+                                     frames_csv: str) -> None:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
+            self.send_response(404); self.end_headers(); return
+        if fit_space not in ("depth", "disparity"):
+            self._send_text(400, f"bad fit_space {fit_space!r}\n"); return
+        frame_set = _parse_int_csv(frames_csv)
+        if not frame_set:
+            self._send_text(400, "frames= required (comma-separated integers)\n"); return
+
+        meta_name = _features_meta_for_pose_dir(pose_dir)
+        meta_path = FRAMES_DIR / session_id / meta_name
+        if not meta_path.exists():
+            self._send_text(
+                404,
+                f"{meta_name} not found — run "
+                f"feature_ray_reconstruct.py --frames-variant {pose_dir}\n",
+            )
+            return
+        model_meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
+        if not model_meta_path.exists():
+            self._send_text(409, "model_raw cache missing — run cache_model_raw.py\n"); return
+
+        try:
+            meta = json.loads(meta_path.read_text())
+            model_meta = json.loads(model_meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            self._send_text(500, f"meta read failed: {e}\n"); return
+
+        common = _find_common_features(meta, frame_set)
+        if not common:
+            self._send_json(200, {
+                "frames": sorted(frame_set),
+                "fit_space": fit_space,
+                "n_common": 0,
+                "per_frame": {},
+                "warning": "no features observed in every selected frame",
+            })
+            return
+
+        per_frame = {}
+        for idx in sorted(frame_set):
+            try:
+                fit = _autotune_one_frame(
+                    session_id, pose_dir, idx,
+                    common_features=common,
+                    model_meta=model_meta,
+                    fit_space=fit_space,
+                )
+            except FileNotFoundError as e:
+                per_frame[str(idx)] = {"error": str(e)}
+                continue
+            except Exception as e:  # noqa: BLE001
+                per_frame[str(idx)] = {"error": f"{type(e).__name__}: {e}"}
+                continue
+            per_frame[str(idx)] = fit
+        self._send_json(200, {
+            "frames": sorted(frame_set),
+            "fit_space": fit_space,
+            "n_common": len(common),
+            "per_frame": per_frame,
         })
 
 
@@ -1261,6 +1787,856 @@ def _frame_to_voxel_indices(
 
     pose = [float(cam[0]), float(cam[1]), float(cam[2])]
     return triples, pose, _frustum_corners(P_inv, V, near=0.1, far=2.0)
+
+
+def _sample_depth_at(*, session_id: str, pose_dir: str, kind: str,
+                     frames: list[int], us: list[float], vs: list[float]) -> list:
+    """For each (frame_i, u_i, v_i) triple, return the depth metres at
+    that norm-view UV from the chosen depth source. Frames are loaded
+    on demand and cached for the duration of this call so a batch of
+    points on the same frame doesn't re-decode the bin repeatedly.
+    Out-of-bounds samples come back as JSON null."""
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+
+    # Per-frame cache: idx → either decoded phone depth (with Bd) OR
+    # the cached model_raw (with cw, ch).
+    phone_cache: dict[int, dict] = {}
+    model_cache: dict[int, np.ndarray] = {}
+    model_meta: dict | None = None
+    if kind == "model":
+        meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
+        if not meta_path.exists():
+            raise FileNotFoundError("model_raw cache missing — run cache_model_raw.py")
+        try:
+            model_meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"model_raw/index.json read failed: {e}") from e
+
+    def get_phone(idx: int) -> dict:
+        if idx in phone_cache:
+            return phone_cache[idx]
+        f = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
+        if not f.exists():
+            raise FileNotFoundError(f"missing {pose_dir}/frame_{idx:06d}.bin")
+        frame = parse_frame(f.read_bytes())
+        dw = int(frame["width"]); dh = int(frame["height"])
+        depth = fusion.decode_depth(
+            frame["depth"], dw, dh,
+            int(frame["format"]), float(frame["rawValueToMeters"]),
+        )
+        Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+        phone_cache[idx] = {"depth": depth, "Bd": Bd, "dw": dw, "dh": dh}
+        return phone_cache[idx]
+
+    def get_model(idx: int) -> tuple[np.ndarray, int, int]:
+        if idx in model_cache:
+            arr = model_cache[idx]
+            return arr, arr.shape[1], arr.shape[0]
+        if model_meta is None:
+            raise RuntimeError("model_meta missing")
+        entry = model_meta.get(str(idx))
+        if entry is None:
+            raise FileNotFoundError(f"model_raw/index.json has no entry for frame {idx}")
+        cw_c = int(entry["w"]); ch_c = int(entry["h"])
+        raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+        if not raw_path.exists():
+            raise FileNotFoundError(f"model_raw cache missing for frame {idx}")
+        arr = (np.frombuffer(raw_path.read_bytes(), dtype=np.float16)
+                 .astype(np.float32, copy=False).reshape(ch_c, cw_c))
+        model_cache[idx] = arr
+        return arr, cw_c, ch_c
+
+    out: list = []
+    for idx, u, v in zip(frames, us, vs):
+        if not (0 <= u <= 1 and 0 <= v <= 1):
+            out.append(None); continue
+        if kind == "model":
+            arr, cw_c, ch_c = get_model(idx)
+            sx = u * cw_c - 0.5
+            sy = v * ch_c - 0.5
+            sample = _bilinear_sample_2d(arr, np.asarray([sx]), np.asarray([sy]))
+            val = float(sample[0])
+            out.append(val if np.isfinite(val) and val > 1e-3 else None)
+        else:  # phone
+            ph = get_phone(idx)
+            depth = ph["depth"]; Bd = ph["Bd"]; dw = ph["dw"]; dh = ph["dh"]
+            # norm-view (u, v) → norm-depth-buffer via Bd, then to pixel
+            # with the same horizontal flip used by every other phone-
+            # depth sampler in this codebase.
+            nv = np.array([u, v, 0.0, 1.0], dtype=np.float64)
+            nd = Bd @ nv
+            w = nd[3] if abs(nd[3]) > 1e-12 else 1.0
+            u_d = nd[0] / w
+            v_d = nd[1] / w
+            bx = (1.0 - u_d) * dw - 0.5
+            by = v_d * dh - 0.5
+            sample = _bilinear_sample_2d(depth, np.asarray([bx]), np.asarray([by]))
+            val = float(sample[0])
+            out.append(val if np.isfinite(val) and val > 1e-3 else None)
+    return out
+
+
+def _snap_feature_match(*, ref_body: bytes, tgt_body: bytes,
+                         ref_uv: tuple[float, float],
+                         init_uv: tuple[float, float],
+                         patch_norm: float, radius_norm: float) -> dict:
+    """Vectorised normalised-cross-correlation patch match. Returns
+    refined (u, v) on the target plus the NCC score and the search
+    bounds actually used (in case clamping kicked in)."""
+    import numpy as np
+
+    ref_frame = parse_frame(ref_body)
+    tgt_frame = parse_frame(tgt_body)
+    if ref_frame["color"] is None or tgt_frame["color"] is None:
+        raise ValueError("ref or target frame has no colour buffer")
+    cw_r = int(ref_frame["color_width"]); ch_r = int(ref_frame["color_height"])
+    cw_t = int(tgt_frame["color_width"]); ch_t = int(tgt_frame["color_height"])
+    rgba_r = np.frombuffer(ref_frame["color"], dtype=np.uint8).reshape(ch_r, cw_r, 4)
+    rgba_t = np.frombuffer(tgt_frame["color"], dtype=np.uint8).reshape(ch_t, cw_t, 4)
+    # rgba is GL-bottom-up (row 0 = scene-bottom). For convenience we
+    # work in CV-style (row 0 = top); just flip vertically once.
+    img_r = np.ascontiguousarray(rgba_r[::-1, :, :3])
+    img_t = np.ascontiguousarray(rgba_t[::-1, :, :3])
+    gray_r = (0.299*img_r[..., 0] + 0.587*img_r[..., 1] + 0.114*img_r[..., 2]).astype(np.float32)
+    gray_t = (0.299*img_t[..., 0] + 0.587*img_t[..., 1] + 0.114*img_t[..., 2]).astype(np.float32)
+
+    # Convert ref UV (norm-view, v=0 bottom) to top-down pixel.
+    cx_r = float(ref_uv[0]) * cw_r
+    cy_r = (1.0 - float(ref_uv[1])) * ch_r
+    cx_t0 = float(init_uv[0]) * cw_t
+    cy_t0 = (1.0 - float(init_uv[1])) * ch_t
+
+    hp_r = max(2, int(round(patch_norm * min(cw_r, ch_r) / 2.0)))
+    hp_t = hp_r   # same square patch on the target
+    sr   = max(2, int(round(radius_norm * min(cw_t, ch_t))))
+
+    cx_r_i = int(round(cx_r)); cy_r_i = int(round(cy_r))
+    if (cx_r_i - hp_r < 0 or cx_r_i + hp_r + 1 > cw_r
+        or cy_r_i - hp_r < 0 or cy_r_i + hp_r + 1 > ch_r):
+        # Reference patch is at the edge — return init, no refinement.
+        return {"u": float(init_uv[0]), "v": float(init_uv[1]),
+                "score": 0.0, "snapped": False,
+                "reason": "ref patch out of bounds"}
+    ref_patch = gray_r[cy_r_i - hp_r:cy_r_i + hp_r + 1,
+                       cx_r_i - hp_r:cx_r_i + hp_r + 1]
+    ref_p = ref_patch - ref_patch.mean()
+    ref_p_norm = float(np.sqrt((ref_p * ref_p).sum()))
+    if ref_p_norm < 1e-6:
+        return {"u": float(init_uv[0]), "v": float(init_uv[1]),
+                "score": 0.0, "snapped": False,
+                "reason": "ref patch is flat"}
+
+    cx_t_i = int(round(cx_t0)); cy_t_i = int(round(cy_t0))
+    x_lo = max(hp_t,             cx_t_i - sr)
+    x_hi = min(cw_t - hp_t - 1,  cx_t_i + sr)
+    y_lo = max(hp_t,             cy_t_i - sr)
+    y_hi = min(ch_t - hp_t - 1,  cy_t_i + sr)
+    if x_lo > x_hi or y_lo > y_hi:
+        return {"u": float(init_uv[0]), "v": float(init_uv[1]),
+                "score": 0.0, "snapped": False,
+                "reason": "search window empty (init too close to edge)"}
+
+    # Vectorise: build the (n_y, n_x, 2hp+1, 2hp+1) tensor of candidate
+    # patches via stride tricks. With typical sizes (~60×60×24×24 ≈ 80k
+    # cells) this is well under 10 ms.
+    from numpy.lib.stride_tricks import sliding_window_view
+    windows = sliding_window_view(gray_t, (2*hp_t + 1, 2*hp_t + 1))
+    # windows shape: (ch_t - 2hp, cw_t - 2hp, 2hp+1, 2hp+1)
+    sub = windows[y_lo - hp_t:y_hi - hp_t + 1,
+                  x_lo - hp_t:x_hi - hp_t + 1]
+    sub = sub.astype(np.float32, copy=False)
+    means = sub.mean(axis=(-1, -2), keepdims=True)
+    sub_c = sub - means
+    num = (sub_c * ref_p[None, None, :, :]).sum(axis=(-1, -2))
+    sub_norm = np.sqrt((sub_c * sub_c).sum(axis=(-1, -2)))
+    ncc = num / (ref_p_norm * sub_norm + 1e-9)
+    best_idx = int(np.nanargmax(ncc))
+    n_y, n_x = ncc.shape
+    by = best_idx // n_x
+    bx = best_idx % n_x
+    best_score = float(ncc[by, bx])
+    best_cx = x_lo + bx
+    best_cy = y_lo + by
+    u_out = best_cx / cw_t
+    v_out = 1.0 - best_cy / ch_t
+    return {"u": float(u_out), "v": float(v_out),
+            "score": best_score, "snapped": True,
+            "patch_px": int(2 * hp_r + 1), "radius_px": int(sr),
+            "ref_size": [cw_r, ch_r], "target_size": [cw_t, ch_t]}
+
+
+def _build_frame_rays_and_raw(session_id: str, pose_dir: str, idx: int,
+                               model_meta: dict, stride: int):
+    """Decode one frame's geometry + the cached model_raw at a stride
+    suitable for voxel-overlap optimisation. Returns
+    (origin_xyz: (3,) float64, dirs: (N, 3) float64, raw: (N,) float64)
+    where each ray is the camera-Z-perpendicular direction (so refined
+    depth d satisfies world_pt = origin + d · ray, matching the spec
+    in fusion.frame_to_world_points). NaN / non-positive raw entries
+    are filtered out so the optimiser doesn't waste evals on them."""
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+
+    f_path = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
+    if not f_path.exists():
+        raise FileNotFoundError(f"missing {pose_dir}/frame_{idx:06d}.bin")
+    raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+    if not raw_path.exists():
+        raise FileNotFoundError(f"model_raw cache missing for frame {idx}")
+    entry = model_meta.get(str(idx))
+    if entry is None:
+        raise FileNotFoundError(f"model_raw/index.json has no entry for frame {idx}")
+    cw_c = int(entry["w"]); ch_c = int(entry["h"])
+    pred_full = (np.frombuffer(raw_path.read_bytes(), dtype=np.float16)
+                   .astype(np.float32, copy=False).reshape(ch_c, cw_c))
+
+    frame = parse_frame(f_path.read_bytes())
+    V  = fusion._mat4_from_column_major(frame["viewMatrix"])
+    P  = fusion._mat4_from_column_major(frame["projectionMatrix"])
+    P_inv = np.linalg.inv(P)
+    cam = V[:3, 3].astype(np.float64)
+
+    # Sample the colour grid at the same stride convention as the live
+    # pixel-cloud endpoint: (cx + 0.5)/cw, (cy + 0.5)/ch.
+    gxs = np.arange(0, cw_c, stride, dtype=np.float64)
+    gys = np.arange(0, ch_c, stride, dtype=np.float64)
+    cx, cy = np.meshgrid(gxs, gys, indexing="xy")
+    raw = pred_full[cy.astype(np.int32), cx.astype(np.int32)]
+    u = (cx + 0.5) / cw_c
+    v = (cy + 0.5) / ch_c
+    x_ndc = 2.0 * u - 1.0
+    y_ndc = 2.0 * v - 1.0
+    clip = np.stack([x_ndc, y_ndc, -np.ones_like(x_ndc),
+                     np.ones_like(x_ndc)], axis=-1)
+    view4 = clip @ P_inv.T
+    safe_w = np.where(np.abs(view4[..., 3:4]) > 1e-12, view4[..., 3:4], 1.0)
+    view3 = view4[..., :3] / safe_w
+    near_z = view3[..., 2:3]
+    near_z_safe = np.where(np.abs(near_z) > 1e-6, near_z, -1e-6)
+    view_dirs = view3 / -near_z_safe
+    rays_world = view_dirs @ V[:3, :3].T   # (gh, gw, 3)
+
+    raw_flat = raw.reshape(-1).astype(np.float64)
+    rays_flat = rays_world.reshape(-1, 3).astype(np.float64)
+    mask = np.isfinite(raw_flat) & (raw_flat > 1e-3)
+    return cam, rays_flat[mask], raw_flat[mask]
+
+
+def _depth_from_affine(raw, a, b, fit_space):
+    """Apply (a, b) in the chosen space to a raw model-depth array.
+    Returns refined depth (same shape) clipped at 0.0 for negatives /
+    nonpositive denominators. Called once per optimiser eval per frame."""
+    import numpy as np
+    if fit_space == "disparity":
+        denom = a + b * raw
+        d = np.where(denom > 1e-3, raw / np.where(denom > 1e-3, denom, 1.0), 0.0)
+    else:
+        d = a * raw + b
+    return np.where(d > 0, d, 0.0)
+
+
+# Voxel-hash bit layout: each component shifted into a 21-bit slot of
+# an int64. Indices are biased by VOXEL_BIAS so negative cells encode
+# without sign-extension surprise. VOXEL_BIAS = 2^20 = 1048576 covers
+# a world span of ±~52 km at 5 cm cells — generous.
+_VOXEL_BIAS = 1 << 20
+_VOXEL_MASK = (1 << 21) - 1
+
+
+def _voxel_hashes(positions, voxel_size: float):
+    """Hash a (N, 3) array of world positions to int64 voxel-cell ids
+    via simple bit packing. Out-of-range cells (very rare) get clipped
+    at the bias boundary."""
+    import numpy as np
+    ix = np.floor(positions[:, 0] / voxel_size).astype(np.int64) + _VOXEL_BIAS
+    iy = np.floor(positions[:, 1] / voxel_size).astype(np.int64) + _VOXEL_BIAS
+    iz = np.floor(positions[:, 2] / voxel_size).astype(np.int64) + _VOXEL_BIAS
+    np.clip(ix, 0, _VOXEL_MASK, out=ix)
+    np.clip(iy, 0, _VOXEL_MASK, out=iy)
+    np.clip(iz, 0, _VOXEL_MASK, out=iz)
+    return (iz << 42) | (iy << 21) | ix
+
+
+def _pairwise_overlap(hash_sets):
+    """Sum of |V_i ∩ V_j| over all pairs (i, j). Each entry of
+    hash_sets is a sorted unique int64 array."""
+    import numpy as np
+    total = 0
+    n = len(hash_sets)
+    for i in range(n):
+        for j in range(i + 1, n):
+            total += int(np.intersect1d(hash_sets[i], hash_sets[j],
+                                         assume_unique=True).size)
+    return total
+
+
+def _autotune_voxel_overlap(*, session_id: str, pose_dir: str,
+                             frames: list[int], fit_space: str,
+                             voxel_sizes: list[float],
+                             init_map: dict, stride: int,
+                             model_meta: dict) -> dict:
+    """Coarse-to-fine voxel-overlap maximisation. Each frame gets its
+    own 2D affine `(a, b)`; with N frames we optimise 2N parameters by
+    Powell. The objective is the pairwise voxel-overlap sum
+    sum_{i<j} |V_i ∩ V_j|, negated for `scipy.optimize.minimize`. We
+    run one Powell pass per voxel size in `voxel_sizes`; the warm-up
+    coarse stage gets close to the basin and the fine stage refines.
+
+    Bounds are conservative ([0.2, 3.0] for `a`, [-1.5, 1.5] for `b`)
+    and Powell respects them via scipy.optimize.minimize since 1.5."""
+    import numpy as np
+    from scipy.optimize import minimize  # type: ignore
+
+    # Pre-decode each frame once; the optimiser only reapplies (a, b).
+    rays_per_frame = []
+    raws_per_frame = []
+    origin_per_frame = []
+    for idx in frames:
+        cam, rays, raw = _build_frame_rays_and_raw(
+            session_id, pose_dir, idx, model_meta, stride,
+        )
+        if raw.size < 50:
+            raise ValueError(f"frame {idx}: only {raw.size} pixels with valid model_raw "
+                             f"after stride={stride}; pick a smaller stride")
+        rays_per_frame.append(rays)
+        raws_per_frame.append(raw)
+        origin_per_frame.append(cam)
+
+    n_frames = len(frames)
+
+    def project(idx_frame, a, b):
+        d = _depth_from_affine(raws_per_frame[idx_frame], a, b, fit_space)
+        return origin_per_frame[idx_frame] + d[:, None] * rays_per_frame[idx_frame]
+
+    eval_count = [0]
+
+    def make_objective(voxel_size):
+        def f(params):
+            eval_count[0] += 1
+            hash_arrays = []
+            for i in range(n_frames):
+                a = float(params[2*i]); b = float(params[2*i + 1])
+                pos = project(i, a, b)
+                hashes = _voxel_hashes(pos, voxel_size)
+                hash_arrays.append(np.unique(hashes))
+            return -_pairwise_overlap(hash_arrays)
+        return f
+
+    # Initial point: per-frame init from caller (or identity).
+    x0 = np.empty(2 * n_frames, dtype=np.float64)
+    for i, idx in enumerate(frames):
+        a0, b0 = init_map.get(idx, (1.0, 0.0))
+        x0[2*i]     = float(a0)
+        x0[2*i + 1] = float(b0)
+
+    bounds = [(0.2, 3.0), (-1.5, 1.5)] * n_frames
+    stages_out = []
+    x = x0
+    for vs in voxel_sizes:
+        eval_count[0] = 0
+        # Per-stage budget: small for the coarse pass (objective is
+        # plateau-laden but the basin is wide), more generous for fine.
+        maxiter = 200 if vs < 0.10 else 120
+        res = minimize(
+            make_objective(vs), x,
+            method="Powell",
+            bounds=bounds,
+            options={"xtol": 1e-3, "ftol": 1e-3, "maxiter": maxiter,
+                     "disp": False},
+        )
+        x = res.x
+        stages_out.append({
+            "voxel_size": float(vs),
+            "overlap": int(-res.fun) if np.isfinite(res.fun) else 0,
+            "n_evals": int(eval_count[0]),
+        })
+
+    per_frame: dict[str, dict] = {}
+    for i, idx in enumerate(frames):
+        per_frame[str(idx)] = {
+            "a": float(x[2*i]),
+            "b": float(x[2*i + 1]),
+            "fit_space": fit_space,
+        }
+    return {
+        "frames": frames,
+        "fit_space": fit_space,
+        "voxel_sizes": voxel_sizes,
+        "stride": stride,
+        "stages": stages_out,
+        "per_frame": per_frame,
+        "n_frames": n_frames,
+    }
+
+
+def _truncated_chamfer_pair(pts_a, pts_b, threshold: float) -> float:
+    """Symmetric truncated mean Chamfer-squared distance between two
+    point clouds. For each a in A: nearest neighbour in B; clamp at
+    `threshold`. Same for B → A. Average each direction (so the score
+    is independent of point counts) and add. Pixels with no real
+    correspondence in the other cloud max out at threshold², which
+    keeps partial-overlap regions from dominating the loss."""
+    import numpy as np
+    from scipy.spatial import cKDTree  # type: ignore
+    tree_a = cKDTree(pts_a)
+    tree_b = cKDTree(pts_b)
+    # Bound the upper search radius via `distance_upper_bound`; misses
+    # come back as `inf`, which we then clip to the threshold. Faster
+    # than letting the tree explore arbitrarily far.
+    da, _ = tree_b.query(pts_a, k=1, distance_upper_bound=threshold * 1.05)
+    db, _ = tree_a.query(pts_b, k=1, distance_upper_bound=threshold * 1.05)
+    da = np.minimum(np.where(np.isfinite(da), da, threshold), threshold)
+    db = np.minimum(np.where(np.isfinite(db), db, threshold), threshold)
+    return float((da * da).mean() + (db * db).mean())
+
+
+def _autotune_chamfer(*, session_id: str, pose_dir: str,
+                      frames: list[int], fit_space: str,
+                      thresholds: list[float], init_map: dict,
+                      stride: int, model_meta: dict) -> dict:
+    """Pairwise truncated-Chamfer minimisation across the selected
+    frames. The objective is much smoother than voxel-overlap (no
+    flat plateaus), so a single Powell pass per threshold typically
+    converges; we run one pass per threshold in `thresholds`,
+    annealing from a wide acceptance window down to a tight one."""
+    import numpy as np
+    from scipy.optimize import minimize  # type: ignore
+
+    rays_per_frame = []
+    raws_per_frame = []
+    origin_per_frame = []
+    for idx in frames:
+        cam, rays, raw = _build_frame_rays_and_raw(
+            session_id, pose_dir, idx, model_meta, stride,
+        )
+        if raw.size < 50:
+            raise ValueError(
+                f"frame {idx}: only {raw.size} valid model_raw pixels at "
+                f"stride={stride}; pick a smaller stride"
+            )
+        rays_per_frame.append(rays)
+        raws_per_frame.append(raw)
+        origin_per_frame.append(cam)
+
+    n_frames = len(frames)
+
+    def project(i, a, b):
+        d = _depth_from_affine(raws_per_frame[i], a, b, fit_space)
+        return origin_per_frame[i] + d[:, None] * rays_per_frame[i]
+
+    eval_count = [0]
+
+    def make_objective(threshold: float):
+        def f(params):
+            eval_count[0] += 1
+            clouds = []
+            for i in range(n_frames):
+                a = float(params[2*i]); b = float(params[2*i + 1])
+                clouds.append(project(i, a, b))
+            total = 0.0
+            for i in range(n_frames):
+                for j in range(i + 1, n_frames):
+                    total += _truncated_chamfer_pair(clouds[i], clouds[j], threshold)
+            return total
+        return f
+
+    x0 = np.empty(2 * n_frames, dtype=np.float64)
+    for i, idx in enumerate(frames):
+        a0, b0 = init_map.get(idx, (1.0, 0.0))
+        x0[2*i]     = float(a0)
+        x0[2*i + 1] = float(b0)
+
+    bounds = [(0.2, 3.0), (-1.5, 1.5)] * n_frames
+    stages_out = []
+    x = x0
+    for thr in thresholds:
+        eval_count[0] = 0
+        # Powell's defaults run away on the smooth Chamfer landscape
+        # (we observed 2000+ evals per stage at small thresholds, taking
+        # ~30s each). Cap both maxiter (line searches) and maxfev
+        # (function calls) hard so a single click returns in a couple
+        # of seconds — there is no benefit chasing 1e-6 precision when
+        # the bare Chamfer objective has known degenerate basins anyway.
+        res = minimize(
+            make_objective(thr), x,
+            method="Powell",
+            bounds=bounds,
+            options={"xtol": 5e-3, "ftol": 5e-4, "maxiter": 40,
+                     "maxfev": 250, "disp": False},
+        )
+        x = res.x
+        stages_out.append({
+            "threshold_m": float(thr),
+            "loss": float(res.fun) if np.isfinite(res.fun) else None,
+            "n_evals": int(eval_count[0]),
+        })
+
+    per_frame: dict[str, dict] = {}
+    for i, idx in enumerate(frames):
+        per_frame[str(idx)] = {
+            "a": float(x[2*i]),
+            "b": float(x[2*i + 1]),
+            "fit_space": fit_space,
+        }
+    return {
+        "frames": frames,
+        "fit_space": fit_space,
+        "thresholds": thresholds,
+        "stride": stride,
+        "stages": stages_out,
+        "per_frame": per_frame,
+        "n_frames": n_frames,
+    }
+
+
+def _features_meta_for_pose_dir(pose_dir: str) -> str:
+    """Map a pose-dir name to the matching features_meta sidecar.
+    `frames` → features_meta.json,
+    `frames_aligned` → features_meta_aligned.json,
+    `frames_feature_ba_aligned` → features_meta_feature_ba_aligned.json.
+    Mirrors depth_refine.py's `suffix = pose_dir.removeprefix('frames')`."""
+    suffix = pose_dir.removeprefix("frames")
+    if not suffix:
+        return "features_meta.json"
+    return f"features_meta{suffix}.json"
+
+
+def _parse_int_csv(s: str) -> set[int]:
+    """Parse a `,`-separated list of integers; ignore empty / non-int parts.
+    Returns a *set* (auto-tune handles each frame once even if listed twice)."""
+    out: set[int] = set()
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return out
+
+
+def _find_common_features(meta: dict, frame_set: set[int]) -> list[dict]:
+    """Walk every voxel.features in `meta` and return those with at least
+    one observation in *every* index from `frame_set`. Returned shape:
+    [{ 'world': [x,y,z], 'obs': {frame_idx: [u, v]} }]. The features_meta
+    schema (per feature_ray_reconstruct.py) places features under a
+    voxel-aggregation tree but each feature carries its own world point
+    + obs list — voxelisation is purely spatial bookkeeping that we can
+    flatten away."""
+    out: list[dict] = []
+    for v in meta.get("voxels", []):
+        for feat in v.get("features", []):
+            obs_by_frame: dict[int, list[float]] = {}
+            for ob in feat.get("obs", []):
+                fi = int(ob["frame"])
+                obs_by_frame[fi] = [float(ob["u"]), float(ob["v"])]
+            if frame_set.issubset(obs_by_frame.keys()):
+                out.append({
+                    "world": [float(c) for c in feat["world"]],
+                    "obs": obs_by_frame,
+                })
+    return out
+
+
+def _bilinear_sample_2d(img, x_arr, y_arr):
+    """Bilinearly sample `img` (H, W) at fractional pixel coords. Out-of-
+    bounds reads return NaN. Lifted from depth_refine._bilinear_sample —
+    inlined here so serve.py doesn't need to import depth_refine (which
+    drags in PIL/torch on `--help`)."""
+    import numpy as np
+    h, w = img.shape
+    inside = (x_arr >= 0) & (x_arr <= w - 1) & (y_arr >= 0) & (y_arr <= h - 1)
+    xc = np.clip(x_arr, 0, w - 1 - 1e-3)
+    yc = np.clip(y_arr, 0, h - 1 - 1e-3)
+    x0 = np.floor(xc).astype(np.int32); y0 = np.floor(yc).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1);     y1 = np.minimum(y0 + 1, h - 1)
+    fx = (xc - x0).astype(np.float32);  fy = (yc - y0).astype(np.float32)
+    s = ((img[y0, x0] * (1 - fx) + img[y0, x1] * fx) * (1 - fy)
+         + (img[y1, x0] * (1 - fx) + img[y1, x1] * fx) * fy)
+    return np.where(inside, s, np.nan)
+
+
+def _autotune_one_frame(session_id: str, pose_dir: str, idx: int,
+                        *, common_features: list, model_meta: dict,
+                        fit_space: str) -> dict:
+    """Solve a per-frame affine `(a, b)` so the cached model_raw depths at
+    common-feature pixels best match the BA-triangulated world points'
+    camera-Z perpendicular distances.
+
+    Two solver branches:
+      * fit_space='depth':     a · M_f + b ≈ target_depth_f      (linear LS)
+      * fit_space='disparity': a · (1/M_f) + b ≈ 1/target_depth_f
+                               then  d = M / (a + b·M)             (linear LS in 1/d)
+
+    target_depth_f = -(V_w2c · [P_world, 1])[z] = perpendicular distance
+    from the camera plane to the BA point in frame `idx`. NaN-sampled
+    pixels (feature pixel outside the cached prediction) are dropped.
+    Frames with too few common features (<3) get a friendly skip
+    rather than a noisy fit."""
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+
+    f_path = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
+    if not f_path.exists():
+        raise FileNotFoundError(f"missing {pose_dir}/frame_{idx:06d}.bin")
+    raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+    if not raw_path.exists():
+        raise FileNotFoundError(f"model_raw cache missing for frame {idx}")
+    entry = model_meta.get(str(idx))
+    if entry is None:
+        raise FileNotFoundError(f"model_raw/index.json has no entry for frame {idx}")
+    cw_c = int(entry["w"]); ch_c = int(entry["h"])
+    pred_full = (np.frombuffer(raw_path.read_bytes(), dtype=np.float16)
+                   .astype(np.float32, copy=False).reshape(ch_c, cw_c))
+
+    frame = parse_frame(f_path.read_bytes())
+    V = fusion._mat4_from_column_major(frame["viewMatrix"])      # world_from_view
+    V_w2c = np.linalg.inv(V)
+
+    Ms = []
+    Ts = []
+    for feat in common_features:
+        u, v = feat["obs"].get(idx, (None, None))
+        if u is None:
+            continue
+        # Sample model prediction at (u·cw, v·ch_) — same colour-grid
+        # convention pred_full was written under (cache_model_raw.py
+        # passes rgba directly to PIL, so pred_full[row=0] = scene-
+        # bottom = norm-view UV v=0).
+        sx = float(u) * cw_c - 0.5
+        sy = float(v) * ch_c - 0.5
+        sample = _bilinear_sample_2d(pred_full,
+                                      np.asarray([sx]), np.asarray([sy]))
+        m = float(sample[0])
+        if not np.isfinite(m) or m <= 1e-3:
+            continue
+        Pw = np.asarray(feat["world"], dtype=np.float64)
+        Ph = np.array([Pw[0], Pw[1], Pw[2], 1.0], dtype=np.float64)
+        p_view = V_w2c @ Ph
+        target = -float(p_view[2])    # camera-Z perpendicular distance
+        if not np.isfinite(target) or target < 0.05 or target > 50.0:
+            continue
+        Ms.append(m); Ts.append(target)
+
+    n = len(Ms)
+    if n < 3:
+        return {"a": 1.0, "b": 0.0, "n_features": n,
+                 "skipped": "too few common features for this frame"}
+
+    M = np.asarray(Ms, dtype=np.float64)
+    T = np.asarray(Ts, dtype=np.float64)
+    if fit_space == "disparity":
+        A = np.stack([1.0 / M, np.ones_like(M)], axis=-1)   # (n, 2)
+        y = 1.0 / T
+        sol, *_ = np.linalg.lstsq(A, y, rcond=None)
+        a, b = float(sol[0]), float(sol[1])
+        d_pred = M / np.where(a + b * M > 1e-3, a + b * M, 1.0)
+        residual = float(np.median(np.abs(d_pred - T)))
+    else:
+        A = np.stack([M, np.ones_like(M)], axis=-1)         # (n, 2)
+        sol, *_ = np.linalg.lstsq(A, T, rcond=None)
+        a, b = float(sol[0]), float(sol[1])
+        d_pred = a * M + b
+        residual = float(np.median(np.abs(d_pred - T)))
+    return {"a": a, "b": b, "n_features": n,
+            "residual_m": round(residual, 4),
+            "fit_space": fit_space}
+
+
+def _build_pixel_cloud_payload(
+    body: bytes,
+    depth_kind: str,
+    stride: int,
+    near: float,
+    far: float,
+    model_raw_path: Path | None,
+    model_raw_meta: Path | None,
+    idx: int,
+) -> dict:
+    """Compute one frame's pixel cloud as ray directions + depths + colors,
+    so the client can re-apply slider-driven (a, b) without re-fetching.
+
+    For depth_kind='phone' the source grid is the depth buffer (dw, dh)
+    and 'depth' is the decoded WebXR depth in metres. For depth_kind='model'
+    the source grid is the colour image (cw, ch) and 'depth' is the cached
+    raw Depth-Anything-V2 prediction in (approximate) metres — the client
+    multiplies by a + b·M (or applies the disparity-space correction) to
+    get the refined depth.
+
+    Returns a JSON-serialisable dict with:
+        origin           [x, y, z]    camera position in world
+        forward          [x, y, z]    camera +forward in world
+        frustum_world    8 corners    (4 near + 4 far)
+        depth_kind       echoed back
+        grid             [w, h]       sampling grid before stride
+        stride           effective stride applied
+        count            N            number of points
+        dirs             3N floats    world-space unit ray dirs
+        depths           N  floats    raw depth value (phone meters or model M)
+        colors           3N ints      RGB 0–255
+        near, far        depth window for client-side filter hint
+
+    The default stride is 4 for model (color grid is high-res) and 1 for
+    phone (depth grid is already low-res).
+    """
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+
+    frame = parse_frame(body)
+    dw = int(frame["width"]); dh = int(frame["height"])
+    cw = int(frame["color_width"]); ch_ = int(frame["color_height"])
+    V  = fusion._mat4_from_column_major(frame["viewMatrix"])
+    P  = fusion._mat4_from_column_major(frame["projectionMatrix"])
+    Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+    Bv = np.linalg.inv(Bd)
+    P_inv = np.linalg.inv(P)
+    cam = V[:3, 3].astype(np.float64)
+    forward = (-V[:3, 2]).astype(np.float64)
+
+    if depth_kind == "phone":
+        if stride <= 0:
+            stride = 1
+        depth_arr = fusion.decode_depth(
+            frame["depth"], dw, dh,
+            int(frame["format"]), float(frame["rawValueToMeters"]),
+        )
+        gw, gh = dw, dh
+
+        # Subsampled (gx, gy) grid on the depth buffer.
+        gxs = np.arange(0, gw, stride, dtype=np.float64)
+        gys = np.arange(0, gh, stride, dtype=np.float64)
+        bx, by = np.meshgrid(gxs, gys, indexing="xy")
+        d = depth_arr[by.astype(np.int32), bx.astype(np.int32)]
+
+        # depth-buffer pixel center → norm-view UV via Bd⁻¹ (matches the
+        # Bd convention in fusion.py: u_d horizontally flipped, v_d direct).
+        u_d = 1.0 - (bx + 0.5) / gw
+        v_d = (by + 0.5) / gh
+        nd_h = np.stack([u_d, v_d, np.zeros_like(u_d), np.ones_like(u_d)],
+                        axis=-1)
+        nv_h = nd_h @ Bv.T
+        safe = np.where(np.abs(nv_h[..., 3]) > 1e-12, nv_h[..., 3], 1.0)
+        u = nv_h[..., 0] / safe
+        v = nv_h[..., 1] / safe
+    elif depth_kind == "model":
+        if stride <= 0:
+            stride = 4
+        if model_raw_path is None or not model_raw_path.exists():
+            raise FileNotFoundError(
+                f"model_raw cache missing for frame {idx}: "
+                f"run tools/cache_model_raw.py --session <id>"
+            )
+        # Look up (cw_cached, ch_cached) — the cache might have been built
+        # against an older capture session with a different colour resolution
+        # than the current frame.bin. We trust the cache's dims.
+        if model_raw_meta is None or not model_raw_meta.exists():
+            raise FileNotFoundError(
+                f"model_raw/index.json missing — re-run cache_model_raw.py"
+            )
+        meta = json.loads(model_raw_meta.read_text())
+        entry = meta.get(str(idx))
+        if entry is None:
+            raise FileNotFoundError(
+                f"model_raw cache has no entry for frame {idx}"
+            )
+        cw_c = int(entry["w"]); ch_c = int(entry["h"])
+        depth_arr = np.frombuffer(
+            model_raw_path.read_bytes(), dtype=np.float16,
+        ).astype(np.float32, copy=False).reshape(ch_c, cw_c)
+        gw, gh = cw_c, ch_c
+
+        gxs = np.arange(0, gw, stride, dtype=np.float64)
+        gys = np.arange(0, gh, stride, dtype=np.float64)
+        cx, cy = np.meshgrid(gxs, gys, indexing="xy")
+        d = depth_arr[cy.astype(np.int32), cx.astype(np.int32)]
+
+        # Colour-image pixel → norm-view UV directly (no Bd needed since the
+        # colour image *is* the view image): u = (cx+0.5)/cw, v = (cy+0.5)/ch.
+        u = (cx + 0.5) / gw
+        v = (cy + 0.5) / gh
+    else:
+        raise ValueError(f"bad depth_kind {depth_kind!r}")
+
+    # norm-view UV → view-space ray. We do NOT normalise to a unit ray —
+    # the canonical convention in this codebase (fusion.frame_to_world_points)
+    # treats `depth` as camera-Z (perpendicular) distance, not radial. A
+    # unit-ray formula `cam + d · unit_ray` puts off-axis pixels at the
+    # wrong distance (≈cos(θ) too close at corners, where θ is the angle
+    # from the optical axis). Instead we scale `view3` so view3.z = −1,
+    # giving rays such that  view_pt = view3_scaled · depth  has
+    # view_pt.z = −depth, which is exactly what the W3C depth spec
+    # promises. The cost: dirs are no longer unit vectors but length
+    # 1/|cos θ|, which is fine because the client just multiplies by
+    # depth. Without this fix phone-depth pixels project visibly far
+    # (especially at the edges of the FOV).
+    x_ndc = 2.0 * u - 1.0
+    y_ndc = 2.0 * v - 1.0
+    clip = np.stack([x_ndc, y_ndc, -np.ones_like(x_ndc),
+                     np.ones_like(x_ndc)], axis=-1)
+    view4 = clip @ P_inv.T
+    safe_w = np.where(np.abs(view4[..., 3:4]) > 1e-12, view4[..., 3:4], 1.0)
+    view3 = view4[..., :3] / safe_w
+    near_z = view3[..., 2:3]
+    near_z_safe = np.where(np.abs(near_z) > 1e-6, near_z, -1e-6)
+    view_dirs = view3 / -near_z_safe   # view3.z normalised to -1
+    rays_world = view_dirs @ V[:3, :3].T   # (gh', gw', 3)
+
+    # Sample colour image at norm-view UV (u, v). The rgba memory is in
+    # WebGL convention (origin bottom-left, row 0 = bottom of view), so
+    # row index = v · ch_ — NOT (1 − v) · ch_. Mirrors the canonical
+    # sampling in fusion.frame_to_world_points (color_img[cy, cx]
+    # with cy = Vv · ch_). Getting this wrong vertically flips the
+    # rendered colours about the image centre, which presents as "wall
+    # pixels appear at the floor in 3D".
+    if frame["color"] is not None and cw > 0 and ch_ > 0:
+        rgba = np.frombuffer(frame["color"], dtype=np.uint8).reshape(ch_, cw, 4)
+        sx = np.clip((u * cw).astype(np.int32), 0, cw - 1)
+        sy = np.clip((v * ch_).astype(np.int32), 0, ch_ - 1)
+        rgb = rgba[sy, sx, :3]
+    else:
+        rgb = np.full((d.shape[0], d.shape[1], 3), 128, dtype=np.uint8)
+
+    # Drop pixels with degenerate depth so the JSON stays small. For phone
+    # we drop d≤0 (zeros = unobserved); for model we keep the raw signal
+    # since the client may want to inspect even out-of-range predictions.
+    if depth_kind == "phone":
+        mask = (d > near) & (d < far) & np.isfinite(d)
+    else:
+        mask = np.isfinite(d) & (d > 1e-3)
+    flat_mask = mask.reshape(-1)
+    flat_rays = rays_world.reshape(-1, 3)[flat_mask]
+    flat_depths = d.reshape(-1)[flat_mask].astype(np.float32)
+    flat_rgb = rgb.reshape(-1, 3)[flat_mask]
+
+    # Round positions to 4 decimal places (sub-mm) to keep JSON compact.
+    return {
+        "idx": idx,
+        "depth_kind": depth_kind,
+        "grid": [int(gw), int(gh)],
+        "stride": int(stride),
+        "near": float(near),
+        "far": float(far),
+        "origin": [float(cam[0]), float(cam[1]), float(cam[2])],
+        "forward": [float(forward[0]), float(forward[1]), float(forward[2])],
+        "frustum_world": _frustum_corners(P_inv, V, near=0.1, far=2.0),
+        "count": int(flat_depths.size),
+        "dirs": _round_floats(flat_rays.astype(np.float32).reshape(-1).tolist(), 5),
+        "depths": _round_floats(flat_depths.tolist(), 4),
+        "colors": flat_rgb.reshape(-1).astype(int).tolist(),
+    }
+
+
+def _round_floats(seq: list, ndigits: int) -> list:
+    """Cheaply truncate float precision in a list before JSON-encoding,
+    so the wire payload doesn't carry meaningless trailing digits.
+    Plain `round(x, n)` keeps the float type — no string formatting cost."""
+    return [round(float(x), ndigits) for x in seq]
 
 
 def _frustum_corners(P_inv, V, near: float, far: float) -> list:
