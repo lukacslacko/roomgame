@@ -515,6 +515,30 @@ function colorForFrame(idx) {
   return c;
 }
 
+// Pick the on-disk frames_*/ directory whose depth payload was the
+// input to the currently-selected voxel variant. We can't always tell
+// which one the rust voxeliser actually used (filename collisions
+// between the legacy depth-ICP path and the new BA path), so prefer
+// the BA-aligned sibling when present and fall back along the chain.
+function pickDepthDir(variant, dirsAvail) {
+  const want = (variant || "").toLowerCase();
+  const has = (d) => dirsAvail.has(d);
+  // Refined variants → look for a frames_refined*/ source.
+  if (want.includes("refined") || want === "refined_aligned") {
+    if (has("frames_refined_feature_ba")) return "frames_refined_feature_ba";
+    if (has("frames_refined_aligned"))    return "frames_refined_aligned";
+    if (has("frames_refined_mv"))         return "frames_refined_mv";
+    if (has("frames_refined"))            return "frames_refined";
+    // No refined depth on disk; fall through to phone depth.
+  }
+  // Everything else (original, aligned, features*) shows raw phone
+  // depth. The pose-corrected siblings (frames_aligned, frames_feature_ba)
+  // carry byte-identical depth, so we prefer the simpler `frames/` source.
+  if (has("frames")) return "frames";
+  if (has("frames_feature_ba")) return "frames_feature_ba";
+  return "frames";
+}
+
 async function refreshFrameManifest() {
   const sid = sessionSel.value;
   if (!sid) { frameManifest = null; renderFramePanel(); return; }
@@ -549,15 +573,20 @@ function renderFramePanel() {
     return;
   }
   const sid = sessionSel.value;
-  // Pick the depth-thumbnail source: prefer the model-derived depth in
-  // `frames_refined/` (i.e. what depth_refine.py wrote out — that's the
-  // depth the user actually wants to inspect for debugging), fall back
-  // to the phone's lowres ARCore depth in `frames/` if the session hasn't
-  // been through the refiner yet.
   const sessInfo = availableSessions.find((s) => s.id === sid);
-  const depthDir = (sessInfo && (sessInfo.n_frames_refined ?? 0) > 0)
-                   ? "frames_refined" : "frames";
-  const depthLabel = depthDir === "frames_refined" ? "model depth" : "phone depth";
+  // Pick the depth-thumbnail source so it matches the depth that
+  // actually went into the voxel variant the user is looking at —
+  // otherwise refined-aligned voxels in 3D look nothing like the
+  // (blurry, lowres, phone-WebXR) depth thumbnail next to each frame.
+  // Mapping: `refined*` variants want model depth from a
+  // `frames_refined*` dir (preferring the BA-aligned `_feature_ba`
+  // sibling when present), everything else wants the raw phone depth
+  // payload that lives in `frames/` (and is byte-identical in the
+  // pose-only siblings like `frames_feature_ba/`).
+  const dirsAvail = new Set(sessInfo?.frame_dirs ?? []);
+  const depthDir = pickDepthDir(variantSel.value || "", dirsAvail);
+  const depthLabel = depthDir.startsWith("frames_refined")
+    ? "model depth" : "phone depth";
   // Render in batches to keep the DOM responsive on long sessions.
   const frag = document.createDocumentFragment();
   for (const f of frames) {
@@ -817,6 +846,10 @@ variantSel.addEventListener("change", () => {
     featuresMetaVariant = null;
   }
   if (isFeaturesVariant(variantSel.value)) prefetchFeaturesMeta();
+  // Depth-thumbnail source depends on the active variant — re-render
+  // the panel so model-vs-phone depth shows up correctly when the user
+  // flips between e.g. `aligned` and `refined_aligned`.
+  if (frameManifest) renderFramePanel();
 });
 
 // =====================================================================

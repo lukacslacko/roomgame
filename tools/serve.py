@@ -291,9 +291,12 @@ SESSION_ID_RE      = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 SESSION_VARIANT_RE = re.compile(r"^[A-Za-z0-9_\-]{1,32}$")
 SESSION_VOXELS_FILE_RE = re.compile(r"^voxels_([A-Za-z0-9_\-]{1,32})\.json$")
 
-# Frame-debug endpoints serve from these specific subdirs only.
-FRAME_VARIANT_DIRS = ("frames", "frames_refined", "frames_aligned",
-                      "frames_refined_aligned", "frames_refined_mv")
+# Frame-debug endpoints serve from any directory matching this pattern
+# under captured_frames/<session>/. Replacing the previous hard-coded
+# allowlist with a regex lets new pipeline outputs (frames_feature_ba/,
+# frames_refined_feature_ba/, …) appear in the viewer without a server
+# code change. The strict pattern still blocks path traversal.
+FRAME_VARIANT_RE = re.compile(r"^frames(?:_[A-Za-z0-9_\-]{1,32})?$")
 # Cap on how many of the captured colour pixels we project for the
 # frame-voxels endpoint (subsample stride = ceil(sqrt(npix / cap))).
 FRAME_VOXELS_PIXEL_CAP = 80_000
@@ -779,17 +782,22 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                             if p.is_file() and p.name.startswith("frame_") and p.suffix == ".bin"
                         )
                     variants = []
+                    frame_dirs = []
                     for p in child.iterdir():
-                        if not p.is_file(): continue
-                        m = SESSION_VOXELS_FILE_RE.match(p.name)
-                        if m:
-                            variants.append(m.group(1))
+                        if p.is_file():
+                            m = SESSION_VOXELS_FILE_RE.match(p.name)
+                            if m:
+                                variants.append(m.group(1))
+                        elif p.is_dir() and FRAME_VARIANT_RE.fullmatch(p.name):
+                            frame_dirs.append(p.name)
                     variants.sort()
+                    frame_dirs.sort()
                     result.append({
                         "id": child.name,
                         "n_frames": n_frames,
                         "n_frames_refined": n_frames_refined,
                         "variants": variants,
+                        "frame_dirs": frame_dirs,
                     })
         except OSError as e:
             self._send_text(500, f"sessions enumeration failed: {e}\n")
@@ -908,7 +916,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(404); self.end_headers()
 
     def _handle_frame_manifest(self, session_id: str, variant_dir: str) -> None:
-        if not SESSION_ID_RE.match(session_id) or variant_dir not in FRAME_VARIANT_DIRS:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
         d = FRAMES_DIR / session_id / variant_dir
         if not d.is_dir():
@@ -950,7 +958,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_frame_thumb(self, session_id: str, variant_dir: str,
                              idx: int, kind: str) -> None:
-        if not SESSION_ID_RE.match(session_id) or variant_dir not in FRAME_VARIANT_DIRS:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
         if kind not in ("color", "depth"):
             self.send_response(404); self.end_headers(); return
@@ -1041,7 +1049,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
     def _handle_frame_voxels(self, session_id: str, variant_dir: str, idx: int,
                               voxel_size: float, world_min: list,
                               shape: list) -> None:
-        if not SESSION_ID_RE.match(session_id) or variant_dir not in FRAME_VARIANT_DIRS:
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
         if voxel_size <= 0 or voxel_size > 10 or len(world_min) != 3 or len(shape) != 3:
             self._send_text(400, "bad grid params\n"); return
