@@ -45,6 +45,11 @@
       font-family: inherit;
     }
     .toolbar label { opacity: 0.7; font-size: 0.82rem; }
+    .toolbar label.vox-mesh-toggle {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      opacity: 0.85; cursor: pointer; user-select: none;
+    }
+    .toolbar label.vox-mesh-toggle input { margin: 0; }
 
     /* Frame-debug panel: scrollable thumbnail list on the left.
        Width sized for two ~200 px-wide portrait thumbs side-by-side plus
@@ -124,6 +129,55 @@
       opacity: 0.5; font-size: 0.7rem; margin-top: 0.4rem;
       text-transform: uppercase; letter-spacing: 0.04em;
     }
+
+    /* Pixel-cloud toolbar (second row, only shown when mode is on). */
+    .pc-toolbar {
+      display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;
+      padding: 0.45rem 1rem; background: #161620; border-bottom: 1px solid #222;
+      font-size: 0.85rem;
+    }
+    .pc-toolbar[hidden] { display: none; }
+    .pc-toolbar label  { opacity: 0.7; font-size: 0.82rem; }
+    .pc-toolbar select {
+      background: #1f1f24; color: #d8e1ff; border: 1px solid #353541;
+      border-radius: 0.3rem; padding: 0.2rem 0.4rem; font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .pc-toolbar input[type="range"] { width: 160px; }
+    .pc-toolbar .pc-val {
+      min-width: 3.4rem; text-align: right;
+      font-variant-numeric: tabular-nums; color: #6ec4ff;
+    }
+    .pc-toolbar .pc-status {
+      opacity: 0.65; font-size: 0.78rem; margin-left: auto;
+    }
+    .pc-toolbar button {
+      background: #1f1f24; color: #d8e1ff; border: 1px solid #353541;
+      border-radius: 0.3rem; padding: 0.2rem 0.55rem; font-size: 0.78rem; cursor: pointer;
+    }
+    .pc-toolbar button#pcAutotuneBtn,
+    .pc-toolbar button#pcAutotuneVoxelBtn,
+    .pc-toolbar button#pcAutotuneChamferBtn {
+      background: #2563eb; color: white; border: 0; padding: 0.25rem 0.7rem;
+      font-weight: 500;
+    }
+    .pc-toolbar button#pcAutotuneVoxelBtn { background: #6d28d9; }
+    .pc-toolbar button#pcAutotuneChamferBtn { background: #0f766e; }
+    .pc-toolbar button#pcAutotuneBtn:disabled,
+    .pc-toolbar button#pcAutotuneVoxelBtn:disabled,
+    .pc-toolbar button#pcAutotuneChamferBtn:disabled {
+      background: #333; color: #888; cursor: not-allowed;
+    }
+    .pc-toolbar label.pc-feat-toggle {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      cursor: pointer; user-select: none;
+    }
+    .pc-toolbar label.pc-feat-toggle input { margin: 0; }
+    .pc-group {
+      display: flex; align-items: center; gap: 0.35rem;
+      padding: 0.05rem 0.45rem; border-left: 1px solid #2a2a36;
+    }
+    .pc-group:first-child { border-left: 0; }
   </style>
 </head>
 <body class="viewer">
@@ -135,7 +189,12 @@
     <button id="reloadBtn">Reload</button>
     <button id="recenterBtn">Recenter</button>
     <button id="lightingBtn" title="Toggle lit / flat shading. Flat = no shadows, no SSAO, raw captured colours">Flat</button>
+    <label class="vox-mesh-toggle" title="Show / hide the main voxel reconstruction (helpful when comparing pixel-cloud overlays against the baked voxels)">
+      <input id="voxMeshToggle" type="checkbox" checked> voxels
+    </label>
     <button id="panelToggleBtn" title="Show / hide the per-frame debug panel">Frames ▸</button>
+    <button id="pixelCloudBtn" title="Toggle pixel-cloud mode: project each depth pixel of the selected frame(s) to a colored point in 3D">Pixel cloud ▸</button>
+    <a href="triplet.html" style="text-decoration:none;"><button title="Open the 3-frame feature explorer for inspecting depth-map correspondence">Triplet editor →</button></a>
     <span class="spacer"></span>
     <span class="keys">
       <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>
@@ -148,6 +207,52 @@
     <span class="stat">voxels <b id="stVoxels">—</b></span>
     <span class="stat">size <b id="stSize">—</b></span>
     <span class="stat" id="stMsg">loading…</span>
+  </div>
+  <div id="pcToolbar" class="pc-toolbar" hidden>
+    <span class="pc-group">
+      <label for="pcDepthKindSel">depth</label>
+      <select id="pcDepthKindSel">
+        <option value="phone">phone (WebXR)</option>
+        <option value="model">model (Depth-Anything-V2)</option>
+      </select>
+    </span>
+    <span class="pc-group">
+      <label for="pcPoseDirSel">pose</label>
+      <select id="pcPoseDirSel"></select>
+    </span>
+    <span class="pc-group">
+      <label for="pcStrideSel">stride</label>
+      <select id="pcStrideSel">
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="4" selected>4</option>
+        <option value="8">8</option>
+        <option value="16">16</option>
+      </select>
+    </span>
+    <span class="pc-group" id="pcAffineGroup">
+      <label for="pcASlider">a</label>
+      <input id="pcASlider" type="range" min="0" max="3" step="0.005" value="1.0">
+      <span class="pc-val" id="pcAVal">1.000</span>
+      <label for="pcBSlider">b</label>
+      <input id="pcBSlider" type="range" min="-2" max="2" step="0.005" value="0.0">
+      <span class="pc-val" id="pcBVal">+0.000</span>
+      <label for="pcFitSpaceSel">space</label>
+      <select id="pcFitSpaceSel">
+        <option value="depth">depth</option>
+        <option value="disparity" selected>disparity (1/d)</option>
+      </select>
+      <button id="pcResetBtn" title="Reset all selected frames to a=1, b=0">reset</button>
+    </span>
+    <span class="pc-group">
+      <button id="pcAutotuneBtn" title="Fit (a, b) per selected frame so the cached model_raw at each common BA-feature pixel matches the BA-triangulated world point's camera-Z. Persists per-frame.">auto-tune (features)</button>
+      <button id="pcAutotuneVoxelBtn" title="Feature-free: maximise pairwise voxel-overlap count between selected frames (≥2). Coarse-to-fine voxel sizes (30 → 15 → 5 cm) with Powell. Slow first run, ~1–3 s with 2 frames.">auto-tune (voxel)</button>
+      <button id="pcAutotuneChamferBtn" title="Feature-free smooth surrogate: minimise pairwise truncated-Chamfer distance (NN-distance squared, clipped at the threshold) between selected frames. Coarse-to-fine thresholds (30 → 5 cm) with Powell. Best when warm-started from auto-tune (features) — cold-starts can fall into a 'collapse to camera' basin.">auto-tune (chamfer)</button>
+      <label class="pc-feat-toggle" title="Show common BA features as cyan markers in 3D and as overlays on the per-frame thumbnails">
+        <input id="pcFeaturesToggle" type="checkbox" checked> features
+      </label>
+    </span>
+    <span class="pc-status" id="pcStatus">—</span>
   </div>
   <div class="main-row">
     <aside id="framePanel" hidden>

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomgame · Triplet feature explorer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    html, body.viewer { height: 100vh; max-height: 100vh; overflow: hidden; }
+    body.viewer { display: flex; flex-direction: column; }
+    .toolbar {
+      display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;
+      padding: 0.55rem 1rem; background: #111; border-bottom: 1px solid #222;
+      font-size: 0.9rem;
+    }
+    .toolbar button {
+      background: #2563eb; color: white; border: 0; border-radius: 0.4rem;
+      padding: 0.35rem 0.75rem; font-size: 0.85rem; cursor: pointer;
+    }
+    .toolbar button.secondary {
+      background: #1f1f24; color: #d8e1ff; border: 1px solid #353541;
+    }
+    .toolbar button:disabled { background: #333; color: #888; cursor: not-allowed; }
+    .toolbar select, .toolbar input[type="number"] {
+      background: #1f1f24; color: #d8e1ff; border: 1px solid #353541;
+      border-radius: 0.3rem; padding: 0.25rem 0.4rem; font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .toolbar input[type="number"] { width: 5rem; }
+    .toolbar label { opacity: 0.7; font-size: 0.82rem; }
+    .toolbar .spacer { flex: 1; }
+    .toolbar .stat { opacity: 0.75; font-variant-numeric: tabular-nums; }
+    .toolbar .stat b { color: #6ec4ff; font-weight: 500; }
+    .keys { opacity: 0.7; font-size: 0.78rem; }
+    .keys kbd {
+      background: #1f1f24; border: 1px solid #353541; border-bottom-color: #15151b;
+      border-radius: 0.25rem; padding: 0.05rem 0.4rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.75rem; color: #d8e1ff;
+    }
+
+    .main-row { display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; }
+    /* Thumb list — narrow column for picking which 3 frames go into the slots. */
+    #thumbsPanel {
+      width: 200px; flex: 0 0 200px;
+      overflow-y: auto; overflow-x: hidden;
+      background: #0c0c10; border-right: 1px solid #222;
+      font-size: 0.8rem;
+      padding: 0.3rem;
+    }
+    #thumbsPanel .thumb-item {
+      position: relative;
+      margin-bottom: 0.3rem;
+      cursor: pointer;
+      border: 2px solid transparent;
+      border-radius: 0.25rem;
+    }
+    #thumbsPanel .thumb-item img {
+      width: 100%; height: auto; display: block;
+      border-radius: 0.2rem;
+      background: #111;
+    }
+    #thumbsPanel .thumb-item.assigned { border-color: var(--slot-color, #6ec4ff); }
+    #thumbsPanel .thumb-item:hover { background: #14141c; }
+    #thumbsPanel .thumb-item .slot-badge {
+      position: absolute; left: 4px; top: 4px;
+      background: var(--slot-color, #6ec4ff); color: #000;
+      width: 1.6em; height: 1.6em; line-height: 1.6em;
+      font-weight: 700; font-size: 0.95rem;
+      border-radius: 0.3rem; text-align: center;
+      pointer-events: none;
+      box-shadow: 0 0 4px rgba(0,0,0,0.6);
+    }
+    #thumbsPanel .thumb-item .idx-tag {
+      position: absolute; right: 4px; bottom: 4px;
+      background: rgba(0,0,0,0.7); color: #d8e1ff;
+      padding: 0 0.3rem; border-radius: 0.2rem;
+      font-size: 0.7rem; font-variant-numeric: tabular-nums;
+      pointer-events: none;
+    }
+
+    /* Three large frame panels arranged horizontally, filling vertical space. */
+    #frames-area {
+      flex: 1 1 0; min-width: 0;
+      display: flex; flex-direction: column; min-height: 0;
+    }
+    .frames-strip {
+      flex: 1 1 0; min-height: 0;
+      display: flex; flex-direction: row; gap: 6px;
+      padding: 6px;
+      background: #07070b;
+    }
+    .frame-slot {
+      flex: 1 1 0; min-width: 0;
+      position: relative;
+      background: #14141c;
+      border: 2px solid #222;
+      border-radius: 0.4rem;
+      overflow: hidden;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .frame-slot.next-click {
+      border-color: var(--slot-color, #6ec4ff);
+      box-shadow: 0 0 16px rgba(110, 196, 255, 0.35);
+    }
+    .frame-slot[data-slot="1"] { --slot-color: #f87171; }
+    .frame-slot[data-slot="2"] { --slot-color: #fbbf24; }
+    .frame-slot[data-slot="3"] { --slot-color: #34d399; }
+    .frame-slot .slot-img-wrap {
+      position: relative;
+      max-width: 100%; max-height: 100%;
+      display: block;
+    }
+    .frame-slot img {
+      max-width: 100%; max-height: 100%;
+      display: block;
+      object-fit: contain;
+      cursor: crosshair;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .frame-slot .slot-empty {
+      color: #555; font-size: 1rem;
+    }
+    .frame-slot .slot-tag {
+      position: absolute; left: 8px; top: 8px;
+      background: var(--slot-color, #6ec4ff); color: #000;
+      padding: 0.15rem 0.5rem;
+      font-weight: 700; border-radius: 0.3rem;
+      font-size: 0.85rem;
+      pointer-events: none;
+      z-index: 5;
+    }
+    .frame-slot .slot-meta {
+      position: absolute; right: 8px; top: 8px;
+      background: rgba(0,0,0,0.6); color: #d8e1ff;
+      padding: 0.15rem 0.45rem;
+      border-radius: 0.3rem;
+      font-size: 0.78rem; font-variant-numeric: tabular-nums;
+      pointer-events: none;
+      z-index: 5;
+    }
+    .frame-slot svg.fmarkers {
+      position: absolute; left: 0; top: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 4;
+    }
+    .frame-slot svg.fmarkers circle.ring  { fill: none; stroke-width: 2.5; filter: drop-shadow(0 0 1.5px rgba(0,0,0,0.95)); }
+    .frame-slot svg.fmarkers circle.dot   { stroke: #111; stroke-width: 1; }
+    .frame-slot svg.fmarkers text         { font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+                                             fill: #fff; stroke: #000; stroke-width: 0.5px;
+                                             paint-order: stroke; }
+    /* Bottom: scatter plots showing depth at clicked points. */
+    .plot-area {
+      flex: 0 0 220px;
+      display: flex; flex-direction: row; gap: 6px;
+      padding: 6px;
+      background: #0a0a0e;
+      border-top: 1px solid #222;
+    }
+    .plot-card {
+      flex: 1 1 0; min-width: 0;
+      background: #14141c;
+      border: 1px solid #2a2a36;
+      border-radius: 0.4rem;
+      padding: 0.4rem 0.5rem;
+      display: flex; flex-direction: column;
+    }
+    .plot-card h3 {
+      margin: 0 0 0.3rem 0;
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: #d8e1ff; opacity: 0.85;
+    }
+    .plot-card svg { flex: 1 1 0; min-height: 0; width: 100%; }
+    .plot-card .plot-empty { color: #555; font-size: 0.85rem; padding: 0.6rem; }
+    .plot-card .axis text { font: 10px ui-monospace, monospace; fill: #98a4c8; }
+    .plot-card .axis line, .plot-card .axis path { stroke: #2a2a36; fill: none; }
+    .plot-card .gridline { stroke: #1c1c24; stroke-dasharray: 2 3; }
+    .plot-card .yx { stroke: #555; stroke-dasharray: 4 3; }
+    .plot-card .point { stroke: #000; stroke-width: 0.5; }
+  </style>
+</head>
+<body class="viewer">
+  <div class="toolbar">
+    <label for="sessionSel">session</label>
+    <select id="sessionSel"><option>(loading…)</option></select>
+    <label for="poseDirSel">pose</label>
+    <select id="poseDirSel"></select>
+    <label for="depthKindSel">depth values</label>
+    <select id="depthKindSel">
+      <option value="phone">phone (WebXR)</option>
+      <option value="model">model (Depth-Anything-V2)</option>
+    </select>
+    <button id="reloadBtn" class="secondary">Reload</button>
+    <button id="clearFeaturesBtn" class="secondary" title="Forget all features">Clear features</button>
+    <button id="skipBtn" class="secondary" title="Skip the next click slot (so the current feature ends without a corresponding point on this frame). Hotkey: Space">Skip ⏭</button>
+    <span class="spacer"></span>
+    <span class="keys">
+      next click: <kbd id="nextSlotIndicator">frame 1</kbd>
+      <kbd>Space</kbd>=skip · <kbd>Esc</kbd>=cancel feature
+    </span>
+    <span class="spacer"></span>
+    <span class="stat">features <b id="stFeatures">0</b></span>
+    <span class="stat" id="stMsg">pick three frames →</span>
+  </div>
+  <div class="main-row">
+    <aside id="thumbsPanel"></aside>
+    <div id="frames-area">
+      <div class="frames-strip">
+        <div class="frame-slot" data-slot="1">
+          <span class="slot-tag">frame 1</span>
+          <span class="slot-meta" id="meta1">—</span>
+          <span class="slot-empty">click a thumbnail to assign</span>
+        </div>
+        <div class="frame-slot" data-slot="2">
+          <span class="slot-tag">frame 2</span>
+          <span class="slot-meta" id="meta2">—</span>
+          <span class="slot-empty">click a thumbnail to assign</span>
+        </div>
+        <div class="frame-slot" data-slot="3">
+          <span class="slot-tag">frame 3</span>
+          <span class="slot-meta" id="meta3">—</span>
+          <span class="slot-empty">click a thumbnail to assign</span>
+        </div>
+      </div>
+      <div class="plot-area">
+        <div class="plot-card">
+          <h3>frame 2 depth (m) vs frame 1 depth (m)</h3>
+          <svg id="plot12" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="plot-card">
+          <h3>frame 3 depth (m) vs frame 1 depth (m)</h3>
+          <svg id="plot13" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="plot-card">
+          <h3>frame 3 depth (m) vs frame 2 depth (m)</h3>
+          <svg id="plot23" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="./triplet.js"></script>
+</body>
+</html>
