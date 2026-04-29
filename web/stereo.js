@@ -1,15 +1,18 @@
-// Pair feature explorer.
+// Stereo feature explorer.
 // User picks 2 frames; clicks land exactly where placed (no snap).
 // Clicking frame 1 starts a feature; clicking frame 2 commits it.
 // Two-mark features are LS-triangulated (midpoint of closest approach
-// between the two world rays). For each frame, we plot model (or
-// phone) depth at the click against the camera-Z distance from that
-// camera to the triangulated point — y=x is "perfect agreement".
-// Scroll to zoom, drag to pan; "0" resets the view.
+// between the two world rays). For each frame, we plot phone / model /
+// blend depth at the click against the camera-Z distance from that
+// camera to the triangulated point — y=x (rendered as a 45° diagonal,
+// since the plot region is a centred square with equal axis scaling)
+// is "perfect agreement". Scroll to zoom, drag to pan; "0" resets.
 
 const sessionSel    = document.getElementById("sessionSel");
 const poseDirSel    = document.getElementById("poseDirSel");
 const depthKindSel  = document.getElementById("depthKindSel");
+const sigmaSlider   = document.getElementById("sigmaSlider");
+const sigmaValue    = document.getElementById("sigmaValue");
 const reloadBtn     = document.getElementById("reloadBtn");
 const clearFeaturesBtn = document.getElementById("clearFeaturesBtn");
 const skipBtn       = document.getElementById("skipBtn");
@@ -616,6 +619,7 @@ async function refreshAllPlots() {
   });
   const url = `/captures/${encodeURIComponent(sid)}/triplet-distances`
     + `?pose_dir=${encodeURIComponent(poseDirSel.value || "frames")}`
+    + `&sigma=${getSigma()}`
     + `&features=${encodeURIComponent(JSON.stringify(featuresPayload))}`;
   let r;
   try { r = await fetch(url); }
@@ -647,8 +651,12 @@ async function refreshAllPlots() {
 }
 
 function redrawPlots() {
-  const kind = depthKindSel.value;   // "phone" | "model"
-  const fieldName = (kind === "phone") ? "phone_depth" : "model_depth";
+  // Depth source on the X axis: "phone" → phone_depth, "model" →
+  // model_depth (DA-V2 raw), "blend" → blend_depth (in metres).
+  const kind = depthKindSel.value;
+  const fieldName = (kind === "phone") ? "phone_depth"
+                  : (kind === "model") ? "model_depth"
+                  : "blend_depth";
   for (const slot of SLOTS) {
     kindTagEls[slot].textContent = kind;
     const pts = [];
@@ -686,7 +694,8 @@ function drawSlotPlot(slot, points) {
     svg.appendChild(t);
     return;
   }
-  // Auto-range with 5% padding; clamp to (0, ~) so negative depths visible.
+  // Auto-range with 5% padding; share the same range across both axes
+  // so y=x reads as "x-source agrees with triangulated truth".
   const xs = points.map((p) => p.x);
   const ys = points.map((p) => p.y);
   const allMin = Math.min(...xs, ...ys);
@@ -694,40 +703,48 @@ function drawSlotPlot(slot, points) {
   const span = Math.max(0.1, allMax - allMin);
   const min = Math.max(0, allMin - 0.05 * span);
   const max = allMax + 0.05 * span;
-  const sx = (x) => padL + (x - min) / (max - min) * (W - padL - padR);
-  const sy = (y) => H - padB - (y - min) / (max - min) * (H - padT - padB);
+
+  // Equal data-to-pixel scaling: pick the smaller of the available
+  // width/height in pixels and use it for both axes. The plot region
+  // is then a centred square inside the panel — the diagonal looks
+  // 45° regardless of the panel's aspect.
+  const usableW = W - padL - padR;
+  const usableH = H - padT - padB;
+  const side    = Math.max(20, Math.min(usableW, usableH));
+  const scale   = side / (max - min);
+  const x0 = padL + Math.max(0, (usableW - side) / 2);
+  const y1 = H - padB - Math.max(0, (usableH - side) / 2);
+  const xR = x0 + side, yT = y1 - side;
+  const sx = (x) => x0 + (x - min) * scale;
+  const sy = (y) => y1 - (y - min) * scale;
 
   const NS = "http://www.w3.org/2000/svg";
   const axis = document.createElementNS(NS, "g");
   axis.setAttribute("class", "axis");
-  // Y axis
-  axis.appendChild(makeLine(NS, padL, padT, padL, H - padB));
-  // X axis
-  axis.appendChild(makeLine(NS, padL, H - padB, W - padR, H - padB));
-  // y=x diagonal — perfect agreement reference.
-  const xy0 = sx(min), xy1 = sx(max);
-  const yy0 = sy(min), yy1 = sy(max);
-  axis.appendChild(makeLine(NS, xy0, yy0, xy1, yy1, "yx"));
-  // Tick labels at 4 even points
+  axis.appendChild(makeLine(NS, x0, yT, x0, y1));            // y axis
+  axis.appendChild(makeLine(NS, x0, y1, xR, y1));            // x axis
+  // y=x diagonal at exactly 45° (equal axis scaling).
+  axis.appendChild(makeLine(NS, sx(min), sy(min), sx(max), sy(max), "yx"));
+  // Tick labels at 4 even points.
   for (let k = 0; k <= 3; k++) {
     const t = min + (max - min) * (k / 3);
     const xt = sx(t);
     const yt = sy(t);
     const lblX = document.createElementNS(NS, "text");
     lblX.setAttribute("x", xt);
-    lblX.setAttribute("y", H - padB + 12);
+    lblX.setAttribute("y", y1 + 12);
     lblX.setAttribute("text-anchor", "middle");
     lblX.textContent = t.toFixed(2);
     axis.appendChild(lblX);
     const lblY = document.createElementNS(NS, "text");
-    lblY.setAttribute("x", padL - 4);
+    lblY.setAttribute("x", x0 - 4);
     lblY.setAttribute("y", yt + 3);
     lblY.setAttribute("text-anchor", "end");
     lblY.textContent = t.toFixed(2);
     axis.appendChild(lblY);
     if (k > 0 && k < 3) {
-      axis.appendChild(makeLine(NS, padL, yt, W - padR, yt, "gridline"));
-      axis.appendChild(makeLine(NS, xt, padT, xt, H - padB, "gridline"));
+      axis.appendChild(makeLine(NS, x0, yt, xR, yt, "gridline"));
+      axis.appendChild(makeLine(NS, xt, yT, xt, y1, "gridline"));
     }
   }
   svg.appendChild(axis);
@@ -860,6 +877,22 @@ poseDirSel.addEventListener("change", () => {
 depthKindSel.addEventListener("change", () => {
   redrawPlots();
 });
+
+// σ slider drives the blend depth values returned by /triplet-distances.
+// While dragging, only update the readout; on commit re-fetch so the
+// plots refresh — but only when "blend" is the selected depth source
+// (the other two are sigma-independent).
+sigmaSlider.addEventListener("input", () => {
+  sigmaValue.textContent = `${(getSigma() * 100).toFixed(1)}%`;
+});
+sigmaSlider.addEventListener("change", () => {
+  if (depthKindSel.value === "blend") refreshAllPlots();
+});
+
+function getSigma() {
+  return parseFloat(sigmaSlider.value);
+}
+
 window.addEventListener("resize", () => redrawPlots());
 
 // Boot.

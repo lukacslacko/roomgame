@@ -304,6 +304,12 @@ FRAME_VOXELS_PIXEL_CAP = 80_000
 _THUMB_CACHE: dict[tuple, bytes] = {}
 _THUMB_CACHE_MAX = 2000  # ~50KB each → ~100MB ceiling
 
+# Cached blend grids for the stereo page. Keyed by
+# (session, idx, sigma_quantised, out_w, out_h). Each entry is a float32
+# array (≈ 1000×400×4B = 1.6 MB), so 16 entries top out around 25 MB.
+_BLEND_GRID_CACHE: dict[tuple, "numpy.ndarray"] = {}
+_BLEND_GRID_CACHE_MAX = 16
+
 
 def _features_meta_filename(variant: str) -> str:
     """Map the voxelview variant string to the corresponding features_meta
@@ -872,7 +878,10 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_frame_manifest(m.group(1), variant_dir)
             return
 
-        # /captures/<id>/frame-thumb/<idx>.<png|jpg>?variant=<vd>&kind=color|depth&long_edge=<n>
+        # /captures/<id>/frame-thumb/<idx>.png?variant=<vd>
+        #     &kind=color|depth|phone|model|diff|blend
+        #     &long_edge=<n>
+        #     &sigma=<frac>          (only for kind=blend)
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/frame-thumb/(\d+)\.png", path,
         )
@@ -885,8 +894,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 long_edge = 600
             long_edge = max(64, min(2400, long_edge))
+            try:
+                sigma_frac = float((qs.get("sigma") or ["0.03"])[0])
+            except ValueError:
+                sigma_frac = 0.03
+            sigma_frac = max(0.001, min(0.20, sigma_frac))
             self._handle_frame_thumb(m.group(1), variant_dir, int(m.group(2)),
-                                       kind, long_edge=long_edge)
+                                       kind, long_edge=long_edge,
+                                       sigma_frac=sigma_frac)
             return
 
         # /captures/<id>/frame-voxels/<idx>.json?variant=<vd>
@@ -906,9 +921,11 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             )
             return
 
-        # /captures/<id>/depth-scatter/<idx>.json?variant=<vd>&max_samples=<n>
-        # — paired (phone, model) depth samples on the colour-image grid
-        # plus Pearson + Spearman computed over ALL valid pairs.
+        # /captures/<id>/depth-scatter/<idx>.json?variant=<vd>
+        #     &max_samples=<n>&sigma=<frac>
+        # — paired depth samples on the colour-image grid: both
+        # (phone, model_raw) and (phone, blend) plus Pearson + Spearman
+        # for each. Sigma is the Gaussian blur fraction used by the blend.
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/depth-scatter/(\d+)\.json",
             path,
@@ -921,8 +938,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 max_samples = 5000
             max_samples = max(100, min(50000, max_samples))
+            try:
+                sigma_frac = float((qs.get("sigma") or ["0.03"])[0])
+            except ValueError:
+                sigma_frac = 0.03
+            sigma_frac = max(0.001, min(0.20, sigma_frac))
             self._handle_depth_scatter(m.group(1), variant_dir, int(m.group(2)),
-                                        max_samples=max_samples)
+                                        max_samples=max_samples,
+                                        sigma_frac=sigma_frac)
             return
 
         # /captures/<id>/frame-feature-voxels/<idx>.json[?variant=features|features_aligned|...]
@@ -1052,8 +1075,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             qs = parse_qs(purl.query)
             pose_dir = (qs.get("pose_dir") or ["frames"])[0]
             features_json = (qs.get("features") or ["[]"])[0]
+            try:
+                sigma_frac = float((qs.get("sigma") or ["0.03"])[0])
+            except ValueError:
+                sigma_frac = 0.03
+            sigma_frac = max(0.001, min(0.20, sigma_frac))
             self._handle_triplet_distances(
                 m.group(1), pose_dir, features_json,
+                sigma_frac=sigma_frac,
             )
             return
 
@@ -1189,14 +1218,21 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, {"session": session_id, "variant": variant_dir, "frames": frames})
 
     def _handle_frame_thumb(self, session_id: str, variant_dir: str,
-                             idx: int, kind: str, *, long_edge: int = 600) -> None:
+                             idx: int, kind: str, *, long_edge: int = 600,
+                             sigma_frac: float = 0.03) -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
-        if kind not in ("color", "depth", "phone", "model", "diff"):
+        if kind not in ("color", "depth", "phone", "model", "diff", "blend"):
             self.send_response(404); self.end_headers(); return
         # Cache by long_edge as well so the triplet (full-res) and the
         # voxelview panel (600 px) thumbs don't evict each other.
-        cache_key = (session_id, variant_dir, idx, kind, long_edge)
+        # For kind=blend, sigma is also part of the key but quantised so
+        # a stream of slider ticks doesn't bloat the cache.
+        if kind == "blend":
+            sigma_q = round(float(sigma_frac), 3)
+            cache_key = (session_id, variant_dir, idx, kind, long_edge, sigma_q)
+        else:
+            cache_key = (session_id, variant_dir, idx, kind, long_edge)
         png = _THUMB_CACHE.get(cache_key)
         if png is None:
             f = FRAMES_DIR / session_id / variant_dir / f"frame_{idx:06d}.bin"
@@ -1210,7 +1246,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                     png = _render_depth_thumb(body, size=long_edge)
                 elif kind == "phone":
                     png = _render_phone_color_thumb(body, size=long_edge)
-                else:  # "model" or "diff" — both need the cached prediction
+                else:  # model / diff / blend — all need the cached prediction
                     arr = _load_model_raw_array(session_id, idx)
                     if arr is None:
                         self._send_text(409,
@@ -1219,8 +1255,12 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                         return
                     if kind == "model":
                         png = _render_model_color_thumb(body, arr, size=long_edge)
-                    else:
+                    elif kind == "diff":
                         png = _render_diff_color_thumb(body, arr, size=long_edge)
+                    else:
+                        png = _render_blend_color_thumb(
+                            body, arr, size=long_edge, sigma_frac=sigma_frac,
+                        )
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"thumb render failed: {e}\n"); return
             if png is None:
@@ -1238,16 +1278,18 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(png)
 
     def _handle_depth_scatter(self, session_id: str, variant_dir: str,
-                                idx: int, *, max_samples: int) -> None:
-        """Phone-vs-model paired-depth samples + correlation coefficients
-        for one frame. Sampling lattice is built on the colour-image grid
-        at a stride chosen so the full grid produces ≈ 200_000 candidate
-        pixels; valid pairs (both depth sources finite & positive) are
-        retained, then subsampled to `max_samples` for the wire.
+                                idx: int, *, max_samples: int,
+                                sigma_frac: float) -> None:
+        """Per-pixel paired depth samples for one frame, on the colour-image
+        grid: both (phone, model_raw) and (phone, blend_metres) pairs plus
+        Pearson + Spearman computed over ALL valid pixels (the wire
+        sampling is just a per-axis subset for plotting).
 
-        Pearson and Spearman are computed over ALL valid pairs (not just
-        the wire-sampled subset) so the reported coefficients don't drift
-        with `max_samples`."""
+        The blend uses the same hole-aware Gaussian detail-injection as the
+        kind=blend thumbnail, so on-screen the scatter and the picture line
+        up. `sigma_frac` is the Gaussian sigma as a fraction of the
+        sampling grid's diagonal."""
+        import math
         import numpy as np
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
@@ -1275,31 +1317,43 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             phone, model = _sample_phone_model_on_color_grid(
                 body, out_w=out_w, out_h=out_h, model_raw_arr=arr,
             )
+            sigma_px = max(1.0, float(sigma_frac) * math.hypot(out_w, out_h))
+            blend, model_metres, fit_a, fit_b, _ = _compute_blend_metres(
+                phone, model, sigma_px,
+            )
         except Exception as e:  # noqa: BLE001
             self._send_text(500, f"scatter sample failed: {e}\n")
             return
 
-        valid = np.isfinite(phone) & np.isfinite(model)
-        n_valid = int(valid.sum())
-        p = phone[valid].astype(np.float64)
-        m = model[valid].astype(np.float64)
+        valid_pm = np.isfinite(phone) & np.isfinite(model)
+        valid_pb = np.isfinite(phone) & np.isfinite(blend)
+        n_pm = int(valid_pm.sum()); n_pb = int(valid_pb.sum())
+        p_for_m = phone[valid_pm].astype(np.float64)
+        m_arr   = model[valid_pm].astype(np.float64)
+        p_for_b = phone[valid_pb].astype(np.float64)
+        b_arr   = blend[valid_pb].astype(np.float64)
 
-        pearson = None; spearman = None
-        if n_valid >= 3 and float(p.std()) > 1e-9 and float(m.std()) > 1e-9:
-            pearson = float(np.corrcoef(p, m)[0, 1])
-            rp = _ranks_with_ties(p)
-            rm = _ranks_with_ties(m)
-            spearman = float(np.corrcoef(rp, rm)[0, 1])
+        def corr_pair(x, y):
+            if x.size < 3 or float(x.std()) < 1e-9 or float(y.std()) < 1e-9:
+                return None, None
+            r = float(np.corrcoef(x, y)[0, 1])
+            rho = float(np.corrcoef(_ranks_with_ties(x), _ranks_with_ties(y))[0, 1])
+            return r, rho
 
-        if n_valid > max_samples:
-            rng = np.random.default_rng(0xC0FFEE)
-            sel = rng.choice(n_valid, size=max_samples, replace=False)
-            wire_p = p[sel]; wire_m = m[sel]
-        else:
-            wire_p = p; wire_m = m
-        # Ship as round-trip-trimmed floats to keep the JSON small.
-        pairs = [[round(float(a), 4), round(float(b), 4)]
-                 for a, b in zip(wire_p, wire_m)]
+        pearson_m, spearman_m = corr_pair(p_for_m, m_arr)
+        pearson_b, spearman_b = corr_pair(p_for_b, b_arr)
+
+        rng = np.random.default_rng(0xC0FFEE)
+        def subsample_pairs(x, y):
+            n = x.size
+            if n > max_samples:
+                sel = rng.choice(n, size=max_samples, replace=False)
+                x = x[sel]; y = y[sel]
+            return [[round(float(a), 4), round(float(b), 4)]
+                    for a, b in zip(x, y)]
+
+        pairs_model = subsample_pairs(p_for_m, m_arr)
+        pairs_blend = subsample_pairs(p_for_b, b_arr)
 
         self._send_json(200, {
             "session": session_id,
@@ -1308,15 +1362,19 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             "color_size": [cw, ch],
             "grid_size": [int(out_w), int(out_h)],
             "stride": int(stride),
-            "n_valid": n_valid,
-            "n_returned": len(pairs),
-            "pearson": pearson,
-            "spearman": spearman,
-            "phone_min": float(p.min()) if p.size else None,
-            "phone_max": float(p.max()) if p.size else None,
-            "model_min": float(m.min()) if m.size else None,
-            "model_max": float(m.max()) if m.size else None,
-            "pairs": pairs,
+            "sigma": float(sigma_frac),
+            "fit": {"a": float(fit_a), "b": float(fit_b)},
+            "n_valid_model": n_pm, "n_valid_blend": n_pb,
+            "pearson_model":  pearson_m,  "spearman_model":  spearman_m,
+            "pearson_blend":  pearson_b,  "spearman_blend":  spearman_b,
+            "phone_min": float(p_for_m.min()) if p_for_m.size else None,
+            "phone_max": float(p_for_m.max()) if p_for_m.size else None,
+            "model_min": float(m_arr.min()) if m_arr.size else None,
+            "model_max": float(m_arr.max()) if m_arr.size else None,
+            "blend_min": float(b_arr.min()) if b_arr.size else None,
+            "blend_max": float(b_arr.max()) if b_arr.size else None,
+            "pairs_model": pairs_model,
+            "pairs_blend": pairs_blend,
         })
 
     def _handle_frame_feature_voxels(self, session_id: str, idx: int,
@@ -1539,7 +1597,8 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         })
 
     def _handle_triplet_distances(self, session_id: str,
-                                   pose_dir: str, features_json: str) -> None:
+                                   pose_dir: str, features_json: str,
+                                   *, sigma_frac: float = 0.03) -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
             self.send_response(404); self.end_headers(); return
         try:
@@ -1554,6 +1613,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 session_id=session_id,
                 pose_dir=pose_dir,
                 features_in=features_in,
+                sigma_frac=sigma_frac,
             )
         except FileNotFoundError as e:
             self._send_text(409, f"{e}\n"); return
@@ -2055,6 +2115,83 @@ def _render_diff_color_thumb(body: bytes, model_raw_arr, *, size: int = 600):
     return buf.getvalue()
 
 
+def _compute_blend_metres(phone, model, sigma_px: float):
+    """Fuse phone-depth (metres, sparse) and model_raw (DA-V2 native units,
+    dense) into a single depth map in metres, taking low-frequency content
+    from phone and high-frequency detail from model. Approach:
+
+      1. OLS-fit `model_metres = a · model_raw + b` on the overlap of valid
+         pixels — same affine the autotune endpoints use.
+      2. Hole-aware Gaussian low-pass:  blur(x_with_NaN_zeroed) / blur(mask)
+         is a standard trick that gives a sane local mean even when phone
+         has missing pixels. Sigma is in pixels of the supplied grid.
+      3. blend = low_phone + (model_metres − low_model_metres)
+
+    Pixels where phone has no valid neighbours within the blur kernel
+    fall back to plain `model_metres` so the result has no NaN holes
+    introduced beyond what model_raw itself can't cover. Returns
+    (blend_metres, model_metres, fit_a, fit_b, n_overlap)."""
+    import numpy as np
+    from scipy.ndimage import gaussian_filter
+
+    overlap = np.isfinite(phone) & np.isfinite(model)
+    n_overlap = int(overlap.sum())
+    if n_overlap < 100:
+        # Without a usable overlap we can't fit the affine; pass through
+        # phone as the blend so the page still has something to render.
+        return phone.astype(np.float32), phone.astype(np.float32), 1.0, 0.0, n_overlap
+
+    M = model[overlap].astype(np.float64)
+    P = phone[overlap].astype(np.float64)
+    A = np.stack([M, np.ones_like(M)], axis=-1)
+    coeffs, *_ = np.linalg.lstsq(A, P, rcond=None)
+    a = float(coeffs[0]); b = float(coeffs[1])
+    model_metres = (a * model + b).astype(np.float32)
+
+    def blur_holes(x):
+        valid = np.isfinite(x).astype(np.float32)
+        x0 = np.where(np.isfinite(x), x, 0.0).astype(np.float32)
+        num = gaussian_filter(x0, sigma=sigma_px, mode="reflect")
+        den = gaussian_filter(valid, sigma=sigma_px, mode="reflect")
+        # Threshold the mask blur so we don't divide by a sliver of valid
+        # pixels at a far edge — that produces wild extrapolations.
+        return np.where(den > 0.05, num / np.maximum(den, 1e-6), np.nan)
+
+    low_phone = blur_holes(phone)
+    low_model = blur_holes(model_metres)
+    detail = model_metres - low_model
+    blend = low_phone + detail
+    blend = np.where(np.isfinite(blend), blend, model_metres)
+    return blend.astype(np.float32), model_metres, a, b, n_overlap
+
+
+def _render_blend_color_thumb(body: bytes, model_raw_arr, *, size: int = 600,
+                               sigma_frac: float = 0.03):
+    """Detail-injected blend rendered with the same turbo colormap as the
+    other depth thumbs. `sigma_frac` is the Gaussian sigma expressed as a
+    fraction of the thumbnail's diagonal (so the blur scales sensibly
+    across thumb resolutions instead of being baked-in pixels)."""
+    import io
+    import math
+    from PIL import Image
+    frame = parse_frame(body)
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    dw = int(frame["width"]);       dh = int(frame["height"])
+    if cw == 0 or ch == 0:
+        cw, ch = dw, dh
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    phone, model = _sample_phone_model_on_color_grid(
+        body, out_w=out_w, out_h=out_h, model_raw_arr=model_raw_arr,
+    )
+    diag = math.hypot(out_w, out_h)
+    sigma_px = max(1.0, float(sigma_frac) * diag)
+    blend, *_ = _compute_blend_metres(phone, model, sigma_px)
+    rgb = _depth_to_turbo_rgb(blend)
+    img = Image.fromarray(rgb)
+    buf = io.BytesIO(); img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
 def _load_model_raw_array(session_id: str, idx: int):
     """Read the cached float16 model_raw prediction for one frame, plus
     its (cw, ch) from index.json. Returns (arr, cw, ch) or None if the
@@ -2418,10 +2555,15 @@ def _triangulate_rays(rays):
 
 
 def _triplet_distances_payload(*, session_id: str, pose_dir: str,
-                                features_in: list) -> dict:
+                                features_in: list,
+                                sigma_frac: float = 0.03) -> dict:
     """Compute, per feature, an LS-triangulated world point from the
-    user's clicked marks, plus per-mark (model_depth, phone_depth,
-    cam_distance_to_world_pt). Frames are decoded once and cached."""
+    user's clicked marks, plus per-mark (phone_depth, model_depth,
+    blend_depth, cam_distance_to_world_pt). Frames are decoded once and
+    cached for the duration of the call. The blend grid for each (frame,
+    σ) pair lives in a module-level cache so successive marks on the
+    same frame don't recompute it."""
+    import math
     import numpy as np
     sys.path.insert(0, str(PROJECT_ROOT / "tools"))
     import fusion  # noqa: E402
@@ -2436,13 +2578,22 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
             model_meta = None
     model_arr_cache: dict[int, np.ndarray] = {}
 
+    # Blend grid resolution: long-edge ~1000 px keeps Gaussian-filter
+    # cost low enough to be unnoticeable per request even for the cold
+    # path; the colour-image-aspect grid means UV→pixel sampling is
+    # exact (a wider/shorter grid would fold in extra resampling
+    # error at the bilinear sample step).
+    BLEND_LONG_EDGE = 1000
+    sigma_q = round(float(sigma_frac), 3)
+
     def get_frame(idx: int) -> dict:
         if idx in frame_cache:
             return frame_cache[idx]
         f = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
         if not f.exists():
             raise FileNotFoundError(f"missing {pose_dir}/frame_{idx:06d}.bin")
-        frame = parse_frame(f.read_bytes())
+        body = f.read_bytes()
+        frame = parse_frame(body)
         dw = int(frame["width"]); dh = int(frame["height"])
         depth = fusion.decode_depth(
             frame["depth"], dw, dh,
@@ -2452,7 +2603,7 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
         V  = fusion._mat4_from_column_major(frame["viewMatrix"])
         V_w2c = np.linalg.inv(V)
         frame_cache[idx] = {
-            "frame": frame, "dw": dw, "dh": dh,
+            "frame": frame, "body": body, "dw": dw, "dh": dh,
             "phone_depth": depth, "Bd": Bd, "V_w2c": V_w2c,
         }
         return frame_cache[idx]
@@ -2474,6 +2625,32 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
                  .astype(np.float32, copy=False).reshape(ch_c, cw_c))
         model_arr_cache[idx] = arr
         return arr, cw_c, ch_c
+
+    def get_blend_grid(idx: int):
+        """Return (blend_array, out_w, out_h) or (None, 0, 0) if the
+        model_raw cache is missing for this frame."""
+        arr, _, _ = get_model(idx)
+        if arr is None:
+            return None, 0, 0
+        fr = get_frame(idx)
+        cw = int(fr["frame"]["color_width"])
+        ch_ = int(fr["frame"]["color_height"])
+        if cw == 0 or ch_ == 0:
+            cw = fr["dw"]; ch_ = fr["dh"]
+        out_w, out_h = _thumb_target_size(cw, ch_, BLEND_LONG_EDGE)
+        key = (session_id, idx, sigma_q, out_w, out_h)
+        cached = _BLEND_GRID_CACHE.get(key)
+        if cached is not None:
+            return cached, out_w, out_h
+        phone, model = _sample_phone_model_on_color_grid(
+            fr["body"], out_w=out_w, out_h=out_h, model_raw_arr=arr,
+        )
+        sigma_px = max(1.0, float(sigma_frac) * math.hypot(out_w, out_h))
+        blend, *_ = _compute_blend_metres(phone, model, sigma_px)
+        if len(_BLEND_GRID_CACHE) >= _BLEND_GRID_CACHE_MAX:
+            _BLEND_GRID_CACHE.pop(next(iter(_BLEND_GRID_CACHE)))
+        _BLEND_GRID_CACHE[key] = blend
+        return blend, out_w, out_h
 
     out_features = []
     for f in features_in:
@@ -2518,6 +2695,20 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
                 ms = _bilinear_sample_2d(arr, np.asarray([sx]), np.asarray([sy]))
                 m_val = float(ms[0])
                 model_d = m_val if (np.isfinite(m_val) and m_val > 1e-3) else None
+            # blend depth at (u, v). The blend grid was built in NATURAL
+            # display orientation (yo=0 is the top row, norm-view v=1),
+            # so to sample at norm-view (u, v) we flip v back to a row
+            # index: yo = (1 − v) · out_h.
+            blend_grid, b_w, b_h = get_blend_grid(idx)
+            if blend_grid is None:
+                blend_d = None
+            else:
+                bx = u * b_w - 0.5
+                by = (1.0 - v) * b_h - 0.5
+                bs = _bilinear_sample_2d(blend_grid,
+                                          np.asarray([bx]), np.asarray([by]))
+                b_val = float(bs[0])
+                blend_d = b_val if (np.isfinite(b_val) and b_val > 1e-3) else None
             # cam-Z distance from this frame's camera to triangulated P.
             cam_d = None
             if world is not None:
@@ -2530,6 +2721,7 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
                 "frame": idx, "u": u, "v": v,
                 "phone_depth": phone_d,
                 "model_depth": model_d,
+                "blend_depth": blend_d,
                 "cam_distance": cam_d,
             })
         out_features.append({
