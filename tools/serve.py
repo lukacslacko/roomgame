@@ -872,7 +872,10 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_frame_manifest(m.group(1), variant_dir)
             return
 
-        # /captures/<id>/frame-thumb/<idx>.<png|jpg>?variant=<vd>&kind=color|depth&long_edge=<n>
+        # /captures/<id>/frame-thumb/<idx>.png?variant=<vd>
+        #     &kind=color|depth|phone|model|diff|blend
+        #     &long_edge=<n>
+        #     &sigma=<frac>          (only for kind=blend)
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/frame-thumb/(\d+)\.png", path,
         )
@@ -885,8 +888,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 long_edge = 600
             long_edge = max(64, min(2400, long_edge))
+            try:
+                sigma_frac = float((qs.get("sigma") or ["0.03"])[0])
+            except ValueError:
+                sigma_frac = 0.03
+            sigma_frac = max(0.001, min(0.20, sigma_frac))
             self._handle_frame_thumb(m.group(1), variant_dir, int(m.group(2)),
-                                       kind, long_edge=long_edge)
+                                       kind, long_edge=long_edge,
+                                       sigma_frac=sigma_frac)
             return
 
         # /captures/<id>/frame-voxels/<idx>.json?variant=<vd>
@@ -1189,14 +1198,21 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, {"session": session_id, "variant": variant_dir, "frames": frames})
 
     def _handle_frame_thumb(self, session_id: str, variant_dir: str,
-                             idx: int, kind: str, *, long_edge: int = 600) -> None:
+                             idx: int, kind: str, *, long_edge: int = 600,
+                             sigma_frac: float = 0.03) -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
-        if kind not in ("color", "depth", "phone", "model", "diff"):
+        if kind not in ("color", "depth", "phone", "model", "diff", "blend"):
             self.send_response(404); self.end_headers(); return
         # Cache by long_edge as well so the triplet (full-res) and the
         # voxelview panel (600 px) thumbs don't evict each other.
-        cache_key = (session_id, variant_dir, idx, kind, long_edge)
+        # For kind=blend, sigma is also part of the key but quantised so
+        # a stream of slider ticks doesn't bloat the cache.
+        if kind == "blend":
+            sigma_q = round(float(sigma_frac), 3)
+            cache_key = (session_id, variant_dir, idx, kind, long_edge, sigma_q)
+        else:
+            cache_key = (session_id, variant_dir, idx, kind, long_edge)
         png = _THUMB_CACHE.get(cache_key)
         if png is None:
             f = FRAMES_DIR / session_id / variant_dir / f"frame_{idx:06d}.bin"
@@ -1210,7 +1226,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                     png = _render_depth_thumb(body, size=long_edge)
                 elif kind == "phone":
                     png = _render_phone_color_thumb(body, size=long_edge)
-                else:  # "model" or "diff" — both need the cached prediction
+                else:  # model / diff / blend — all need the cached prediction
                     arr = _load_model_raw_array(session_id, idx)
                     if arr is None:
                         self._send_text(409,
@@ -1219,8 +1235,12 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                         return
                     if kind == "model":
                         png = _render_model_color_thumb(body, arr, size=long_edge)
-                    else:
+                    elif kind == "diff":
                         png = _render_diff_color_thumb(body, arr, size=long_edge)
+                    else:
+                        png = _render_blend_color_thumb(
+                            body, arr, size=long_edge, sigma_frac=sigma_frac,
+                        )
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"thumb render failed: {e}\n"); return
             if png is None:
@@ -2050,6 +2070,83 @@ def _render_diff_color_thumb(body: bytes, model_raw_arr, *, size: int = 600):
         # the invalid pixels black.
         rgb_full = _apply_diverging(np.where(valid, norm, 0.0))
         rgb[valid] = rgb_full[valid]
+    img = Image.fromarray(rgb)
+    buf = io.BytesIO(); img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
+def _compute_blend_metres(phone, model, sigma_px: float):
+    """Fuse phone-depth (metres, sparse) and model_raw (DA-V2 native units,
+    dense) into a single depth map in metres, taking low-frequency content
+    from phone and high-frequency detail from model. Approach:
+
+      1. OLS-fit `model_metres = a · model_raw + b` on the overlap of valid
+         pixels — same affine the autotune endpoints use.
+      2. Hole-aware Gaussian low-pass:  blur(x_with_NaN_zeroed) / blur(mask)
+         is a standard trick that gives a sane local mean even when phone
+         has missing pixels. Sigma is in pixels of the supplied grid.
+      3. blend = low_phone + (model_metres − low_model_metres)
+
+    Pixels where phone has no valid neighbours within the blur kernel
+    fall back to plain `model_metres` so the result has no NaN holes
+    introduced beyond what model_raw itself can't cover. Returns
+    (blend_metres, model_metres, fit_a, fit_b, n_overlap)."""
+    import numpy as np
+    from scipy.ndimage import gaussian_filter
+
+    overlap = np.isfinite(phone) & np.isfinite(model)
+    n_overlap = int(overlap.sum())
+    if n_overlap < 100:
+        # Without a usable overlap we can't fit the affine; pass through
+        # phone as the blend so the page still has something to render.
+        return phone.astype(np.float32), phone.astype(np.float32), 1.0, 0.0, n_overlap
+
+    M = model[overlap].astype(np.float64)
+    P = phone[overlap].astype(np.float64)
+    A = np.stack([M, np.ones_like(M)], axis=-1)
+    coeffs, *_ = np.linalg.lstsq(A, P, rcond=None)
+    a = float(coeffs[0]); b = float(coeffs[1])
+    model_metres = (a * model + b).astype(np.float32)
+
+    def blur_holes(x):
+        valid = np.isfinite(x).astype(np.float32)
+        x0 = np.where(np.isfinite(x), x, 0.0).astype(np.float32)
+        num = gaussian_filter(x0, sigma=sigma_px, mode="reflect")
+        den = gaussian_filter(valid, sigma=sigma_px, mode="reflect")
+        # Threshold the mask blur so we don't divide by a sliver of valid
+        # pixels at a far edge — that produces wild extrapolations.
+        return np.where(den > 0.05, num / np.maximum(den, 1e-6), np.nan)
+
+    low_phone = blur_holes(phone)
+    low_model = blur_holes(model_metres)
+    detail = model_metres - low_model
+    blend = low_phone + detail
+    blend = np.where(np.isfinite(blend), blend, model_metres)
+    return blend.astype(np.float32), model_metres, a, b, n_overlap
+
+
+def _render_blend_color_thumb(body: bytes, model_raw_arr, *, size: int = 600,
+                               sigma_frac: float = 0.03):
+    """Detail-injected blend rendered with the same turbo colormap as the
+    other depth thumbs. `sigma_frac` is the Gaussian sigma expressed as a
+    fraction of the thumbnail's diagonal (so the blur scales sensibly
+    across thumb resolutions instead of being baked-in pixels)."""
+    import io
+    import math
+    from PIL import Image
+    frame = parse_frame(body)
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    dw = int(frame["width"]);       dh = int(frame["height"])
+    if cw == 0 or ch == 0:
+        cw, ch = dw, dh
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    phone, model = _sample_phone_model_on_color_grid(
+        body, out_w=out_w, out_h=out_h, model_raw_arr=model_raw_arr,
+    )
+    diag = math.hypot(out_w, out_h)
+    sigma_px = max(1.0, float(sigma_frac) * diag)
+    blend, *_ = _compute_blend_metres(phone, model, sigma_px)
+    rgb = _depth_to_turbo_rgb(blend)
     img = Image.fromarray(rgb)
     buf = io.BytesIO(); img.save(buf, format="PNG", optimize=False)
     return buf.getvalue()

@@ -194,10 +194,17 @@
       <label><input type="radio" name="overlay" value="phone">phone</label>
       <label><input type="radio" name="overlay" value="model">model</label>
       <label><input type="radio" name="overlay" value="diff">diff</label>
+      <label><input type="radio" name="overlay" value="blend">blend</label>
     </fieldset>
     <label for="overlayOpacity">opacity</label>
     <input id="overlayOpacity" type="range" min="0" max="1" step="0.05" value="0.6"
            style="width: 100px; vertical-align: middle;">
+
+    <label for="sigmaSlider">σ</label>
+    <input id="sigmaSlider" type="range" min="0.005" max="0.15" step="0.005" value="0.03"
+           style="width: 120px; vertical-align: middle;"
+           title="Gaussian blur sigma as a fraction of the thumbnail diagonal — bigger σ takes more low-frequency content from the phone">
+    <span id="sigmaValue" class="stat" style="min-width: 4em;">3.0%</span>
 
     <span class="spacer"></span>
     <span class="stat" id="stStatus">pick a frame →</span>
@@ -219,6 +226,12 @@
       </div>
       <div class="panel image-panel" id="panelModel">
         <span class="panel-tag">model depth</span>
+        <div class="panel-img-wrap">
+          <span class="panel-empty">—</span>
+        </div>
+      </div>
+      <div class="panel image-panel" id="panelBlend">
+        <span class="panel-tag">blend</span>
         <div class="panel-img-wrap">
           <span class="panel-empty">—</span>
         </div>

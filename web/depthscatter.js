@@ -9,11 +9,14 @@ const poseDirSel    = document.getElementById("poseDirSel");
 const reloadBtn     = document.getElementById("reloadBtn");
 const overlayRadios = document.querySelectorAll("input[name='overlay']");
 const overlayOpacity = document.getElementById("overlayOpacity");
+const sigmaSlider   = document.getElementById("sigmaSlider");
+const sigmaValue    = document.getElementById("sigmaValue");
 const stStatus      = document.getElementById("stStatus");
 const thumbsPanel   = document.getElementById("thumbsPanel");
 const panelRgb      = document.getElementById("panelRgb");
 const panelPhone    = document.getElementById("panelPhone");
 const panelModel    = document.getElementById("panelModel");
+const panelBlend    = document.getElementById("panelBlend");
 const scatterMeta   = document.getElementById("scatterMeta");
 const scatterSvg    = document.getElementById("scatterSvg");
 
@@ -183,10 +186,30 @@ function loadFrame() {
 
   setDepthImg(panelPhone, `${base}?${qs}&kind=phone`);
   setDepthImg(panelModel, `${base}?${qs}&kind=model`);
+  setDepthImg(panelBlend, `${base}?${qs}&kind=blend&sigma=${getSigma()}`);
 
   fetchScatter(sid, idx, myToken);
 
   stStatus.textContent = `frame #${idx} · loading…`;
+}
+
+function getSigma() {
+  return parseFloat(sigmaSlider.value);
+}
+
+// Re-fetch only the σ-dependent images. Used when the slider moves so
+// we don't re-render RGB / phone / model / scatter on every tick.
+function refreshBlendOnly() {
+  const sid = sessionSel.value;
+  if (sid == null || selectedFrame == null) return;
+  const idx = selectedFrame;
+  const longEdge = 800;
+  const base = `/captures/${encodeURIComponent(sid)}/frame-thumb/${idx}.png`;
+  const qs = `variant=frames&long_edge=${longEdge}`;
+  setDepthImg(panelBlend, `${base}?${qs}&kind=blend&sigma=${getSigma()}`);
+  if (getOverlayMode() === "blend") {
+    applyOverlay("blend", idx, longEdge);
+  }
 }
 
 function setRgbImg(src) {
@@ -255,7 +278,9 @@ function applyOverlay(mode, idx, longEdge) {
   const sid = sessionSel.value;
   if (sid == null) return;
   const base = `/captures/${encodeURIComponent(sid)}/frame-thumb/${idx}.png`;
-  const src = `${base}?variant=frames&long_edge=${longEdge}&kind=${mode}`;
+  // Blend depends on sigma; everything else is sigma-free.
+  const extra = (mode === "blend") ? `&sigma=${getSigma()}` : "";
+  const src = `${base}?variant=frames&long_edge=${longEdge}&kind=${mode}${extra}`;
   setOverlayImg(src);
 }
 
@@ -467,6 +492,7 @@ sessionSel.addEventListener("change", () => {
   resetPanel(panelRgb,   "(no frame selected)");
   resetPanel(panelPhone, "—");
   resetPanel(panelModel, "—");
+  resetPanel(panelBlend, "—");
   setOverlayImg(null);
   drawScatter([]); setScatterMeta("(no data)");
   stStatus.textContent = "pick a frame →";
@@ -486,6 +512,16 @@ for (const r of overlayRadios) {
 overlayOpacity.addEventListener("input", () => {
   const overlay = panelRgb.querySelector("img.overlay-img");
   if (overlay) overlay.style.opacity = String(parseFloat(overlayOpacity.value));
+});
+
+// σ slider: while dragging, just update the readout; on commit (mouse-up
+// or arrow-key release) refetch the blend image. The server quantises
+// σ to 1e-3 so cache hits are common when the user wiggles the slider.
+sigmaSlider.addEventListener("input", () => {
+  sigmaValue.textContent = `${(getSigma() * 100).toFixed(1)}%`;
+});
+sigmaSlider.addEventListener("change", () => {
+  refreshBlendOnly();
 });
 
 window.addEventListener("resize", () => renderScatterFromState());
