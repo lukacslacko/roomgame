@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Roomgame · Triplet feature explorer</title>
+  <title>Roomgame · Pair feature explorer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <link rel="stylesheet" href="styles.css">
   <style>
@@ -40,7 +40,7 @@
     }
 
     .main-row { display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; }
-    /* Thumb list — narrow column for picking which 3 frames go into the slots. */
+    /* Thumb list — narrow column for picking which 2 frames go into the slots. */
     #thumbsPanel {
       width: 200px; flex: 0 0 200px;
       overflow-y: auto; overflow-x: hidden;
@@ -104,20 +104,33 @@
       box-shadow: 0 0 16px rgba(110, 196, 255, 0.35);
     }
     .frame-slot[data-slot="1"] { --slot-color: #f87171; }
-    .frame-slot[data-slot="2"] { --slot-color: #fbbf24; }
-    .frame-slot[data-slot="3"] { --slot-color: #34d399; }
+    .frame-slot[data-slot="2"] { --slot-color: #34d399; }
     .frame-slot .slot-img-wrap {
-      position: relative;
-      max-width: 100%; max-height: 100%;
-      display: block;
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      transform-origin: 0 0;
+      will-change: transform;
     }
     .frame-slot img {
-      max-width: 100%; max-height: 100%;
+      width: 100%; height: 100%;
       display: block;
       object-fit: contain;
       cursor: crosshair;
       user-select: none;
       -webkit-user-drag: none;
+      pointer-events: none;     /* let the slot grab pointer events */
+    }
+    .frame-slot.panning { cursor: grabbing; }
+    .frame-slot.panning .slot-img-wrap { cursor: grabbing; }
+    .frame-slot .zoom-tag {
+      position: absolute; right: 8px; bottom: 8px;
+      background: rgba(0,0,0,0.65); color: #d8e1ff;
+      padding: 0.1rem 0.45rem;
+      border-radius: 0.3rem;
+      font-size: 0.7rem; font-variant-numeric: tabular-nums;
+      pointer-events: none;
+      z-index: 6;
     }
     .frame-slot .slot-empty {
       color: #555; font-size: 1rem;
@@ -180,6 +193,10 @@
     .plot-card .gridline { stroke: #1c1c24; stroke-dasharray: 2 3; }
     .plot-card .yx { stroke: #555; stroke-dasharray: 4 3; }
     .plot-card .point { stroke: #000; stroke-width: 0.5; }
+    .plot-card h3 .kind-tag {
+      color: #6ec4ff;
+      font-weight: 500;
+    }
   </style>
 </head>
 <body class="viewer">
@@ -199,11 +216,11 @@
     <span class="spacer"></span>
     <span class="keys">
       next click: <kbd id="nextSlotIndicator">frame 1</kbd>
-      <kbd>Space</kbd>=skip · <kbd>Esc</kbd>=cancel feature
+      <kbd>Space</kbd>=skip · <kbd>Esc</kbd>=cancel · <kbd>scroll</kbd>=zoom · drag=pan · <kbd>0</kbd>=reset zoom
     </span>
     <span class="spacer"></span>
     <span class="stat">features <b id="stFeatures">0</b></span>
-    <span class="stat" id="stMsg">pick three frames →</span>
+    <span class="stat" id="stMsg">pick two frames →</span>
   </div>
   <div class="main-row">
     <aside id="thumbsPanel"></aside>
@@ -219,24 +236,15 @@
           <span class="slot-meta" id="meta2">—</span>
           <span class="slot-empty">click a thumbnail to assign</span>
         </div>
-        <div class="frame-slot" data-slot="3">
-          <span class="slot-tag">frame 3</span>
-          <span class="slot-meta" id="meta3">—</span>
-          <span class="slot-empty">click a thumbnail to assign</span>
-        </div>
       </div>
       <div class="plot-area">
         <div class="plot-card">
-          <h3>frame 2 depth (m) vs frame 1 depth (m)</h3>
-          <svg id="plot12" preserveAspectRatio="none"></svg>
+          <h3>frame 1 — <span class="kind-tag" id="kindTagX1">model</span> depth (m) vs triangulated distance (m)</h3>
+          <svg id="plot1" preserveAspectRatio="none"></svg>
         </div>
         <div class="plot-card">
-          <h3>frame 3 depth (m) vs frame 1 depth (m)</h3>
-          <svg id="plot13" preserveAspectRatio="none"></svg>
-        </div>
-        <div class="plot-card">
-          <h3>frame 3 depth (m) vs frame 2 depth (m)</h3>
-          <svg id="plot23" preserveAspectRatio="none"></svg>
+          <h3>frame 2 — <span class="kind-tag" id="kindTagX2">model</span> depth (m) vs triangulated distance (m)</h3>
+          <svg id="plot2" preserveAspectRatio="none"></svg>
         </div>
       </div>
     </div>
