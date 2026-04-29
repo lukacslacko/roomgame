@@ -1148,10 +1148,12 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         # Query params:
         #   pose_dir   = frames | frames_aligned | frames_feature_ba_*    (which
         #                frame.bin to read for V/P/Bd matrices)
-        #   depth_kind = phone | model
-        #   stride     = pixel skip on the source grid (default 4 for model,
-        #                1 for phone)
+        #   depth_kind = phone | model | blend
+        #   stride     = pixel skip on the source grid (default 4 for model
+        #                and blend, 1 for phone)
         #   near, far  = depth window for client-side filtering hint
+        #   sigma      = blend Gaussian (fraction of the colour-image diagonal,
+        #                only used for depth_kind=blend; default 0.03 = 3%)
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/pixel-cloud/(\d+)\.json", path,
         )
@@ -1168,9 +1170,15 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 far  = float((qs.get("far")  or ["8.0"])[0])
             except ValueError:
                 near, far = 0.05, 8.0
+            try:
+                sigma_frac = float((qs.get("sigma") or ["0.03"])[0])
+            except ValueError:
+                sigma_frac = 0.03
+            sigma_frac = max(0.001, min(0.20, sigma_frac))
             self._handle_pixel_cloud(
                 m.group(1), int(m.group(2)),
                 pose_dir, depth_kind, stride, near, far,
+                sigma_frac=sigma_frac,
             )
             return
 
@@ -1478,17 +1486,19 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_pixel_cloud(self, session_id: str, idx: int,
                             pose_dir: str, depth_kind: str,
-                            stride: int, near: float, far: float) -> None:
+                            stride: int, near: float, far: float,
+                            *, sigma_frac: float = 0.03) -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
             self.send_response(404); self.end_headers(); return
-        if depth_kind not in ("phone", "model"):
+        if depth_kind not in ("phone", "model", "blend"):
             self._send_text(400, f"bad depth_kind {depth_kind!r}\n"); return
         f = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
         if not f.exists():
             self._send_text(404, f"missing {pose_dir}/frame_{idx:06d}.bin\n"); return
-        # Model-raw cache (only needed for depth_kind=model).
+        # Model-raw cache (needed for depth_kind=model and blend).
         model_raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
         model_raw_meta = FRAMES_DIR / session_id / "model_raw" / "index.json"
+        needs_model = depth_kind in ("model", "blend")
         try:
             payload = _build_pixel_cloud_payload(
                 body=f.read_bytes(),
@@ -1496,9 +1506,10 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 stride=stride,
                 near=near,
                 far=far,
-                model_raw_path=model_raw_path if depth_kind == "model" else None,
-                model_raw_meta=model_raw_meta if depth_kind == "model" else None,
+                model_raw_path=model_raw_path if needs_model else None,
+                model_raw_meta=model_raw_meta if needs_model else None,
                 idx=idx,
+                sigma_frac=sigma_frac,
             )
         except FileNotFoundError as e:
             self._send_text(409, f"{e}\n"); return
@@ -3227,6 +3238,7 @@ def _build_pixel_cloud_payload(
     model_raw_path: Path | None,
     model_raw_meta: Path | None,
     idx: int,
+    sigma_frac: float = 0.03,
 ) -> dict:
     """Compute one frame's pixel cloud as ray directions + depths + colors,
     so the client can re-apply slider-driven (a, b) without re-fetching.
@@ -3236,7 +3248,9 @@ def _build_pixel_cloud_payload(
     the source grid is the colour image (cw, ch) and 'depth' is the cached
     raw Depth-Anything-V2 prediction in (approximate) metres — the client
     multiplies by a + b·M (or applies the disparity-space correction) to
-    get the refined depth.
+    get the refined depth. For depth_kind='blend' the source grid is again
+    the colour image and 'depth' is the on-the-fly Gaussian detail-injection
+    blend in metres — clients should treat it like phone (a=1, b=0).
 
     Returns a JSON-serialisable dict with:
         origin           [x, y, z]    camera position in world
@@ -3294,7 +3308,7 @@ def _build_pixel_cloud_payload(
         safe = np.where(np.abs(nv_h[..., 3]) > 1e-12, nv_h[..., 3], 1.0)
         u = nv_h[..., 0] / safe
         v = nv_h[..., 1] / safe
-    elif depth_kind == "model":
+    elif depth_kind in ("model", "blend"):
         if stride <= 0:
             stride = 4
         if model_raw_path is None or not model_raw_path.exists():
@@ -3316,9 +3330,27 @@ def _build_pixel_cloud_payload(
                 f"model_raw cache has no entry for frame {idx}"
             )
         cw_c = int(entry["w"]); ch_c = int(entry["h"])
-        depth_arr = np.frombuffer(
+        model_arr = np.frombuffer(
             model_raw_path.read_bytes(), dtype=np.float16,
         ).astype(np.float32, copy=False).reshape(ch_c, cw_c)
+
+        if depth_kind == "model":
+            depth_arr = model_arr
+        else:
+            # Build the blend on the colour-image grid (in NATURAL display
+            # orientation) and flip rows so the resulting array follows
+            # the same GL-style convention as model_arr — row 0 = scene
+            # bottom = norm-view v=0, matching the (cy+0.5)/gh sampling
+            # below. Sigma is a fraction of the grid diagonal.
+            import math
+            phone_grid, model_grid = _sample_phone_model_on_color_grid(
+                body, out_w=cw_c, out_h=ch_c, model_raw_arr=model_arr,
+            )
+            sigma_px = max(1.0, float(sigma_frac) * math.hypot(cw_c, ch_c))
+            blend_natural, *_ = _compute_blend_metres(
+                phone_grid, model_grid, sigma_px,
+            )
+            depth_arr = np.ascontiguousarray(blend_natural[::-1, :])
         gw, gh = cw_c, ch_c
 
         gxs = np.arange(0, gw, stride, dtype=np.float64)
@@ -3375,7 +3407,9 @@ def _build_pixel_cloud_payload(
     # Drop pixels with degenerate depth so the JSON stays small. For phone
     # we drop d≤0 (zeros = unobserved); for model we keep the raw signal
     # since the client may want to inspect even out-of-range predictions.
-    if depth_kind == "phone":
+    # Blend is already in metres so the same (near, far) window as phone
+    # applies — no need to drag invalid faraway points into the cloud.
+    if depth_kind in ("phone", "blend"):
         mask = (d > near) & (d < far) & np.isfinite(d)
     else:
         mask = np.isfinite(d) & (d > 1e-3)

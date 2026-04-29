@@ -1267,7 +1267,8 @@ function updatePcStatus() {
     ? ` · raw d ${dMin.toFixed(2)}–${dMax.toFixed(2)} m`
     : "";
   let cacheTag = "";
-  if (p.depth_kind === "model" && !pcModelStatus?.ready) {
+  if ((p.depth_kind === "model" || p.depth_kind === "blend")
+      && !pcModelStatus?.ready) {
     cacheTag = " · model cache missing — run cache_model_raw.py";
   }
   pcStatus.textContent =
@@ -1287,6 +1288,7 @@ async function refreshPcModelStatus() {
   }
   // Update the model option in the depth-kind dropdown to reflect cache state.
   const modelOpt = [...pcDepthKindSel.options].find((o) => o.value === "model");
+  const blendOpt = [...pcDepthKindSel.options].find((o) => o.value === "blend");
   if (modelOpt) {
     modelOpt.disabled = !pcModelStatus?.ready;
     const n = Object.keys(pcModelStatus?.frames || {}).length;
@@ -1294,7 +1296,14 @@ async function refreshPcModelStatus() {
       ? `model (Depth-Anything-V2, ${n} cached)`
       : "model (no cache — run cache_model_raw.py)";
   }
-  if (!pcModelStatus?.ready && pcDepthKindSel.value === "model") {
+  if (blendOpt) {
+    blendOpt.disabled = !pcModelStatus?.ready;
+    blendOpt.textContent = pcModelStatus?.ready
+      ? "blend (phone low + model high, σ=3%)"
+      : "blend (no cache — run cache_model_raw.py)";
+  }
+  if (!pcModelStatus?.ready
+      && (pcDepthKindSel.value === "model" || pcDepthKindSel.value === "blend")) {
     pcDepthKindSel.value = "phone";
     syncPcAffineEnabled();
   }
@@ -1331,10 +1340,14 @@ function populatePosePicker() {
 async function fetchPixelCloud(idx) {
   const sid = sessionSel.value;
   const p = pcParams();
+  // Blend uses the server-side hole-aware Gaussian detail-injection at a
+  // fixed 3% sigma — no slider here. (Sigma can still be tuned on the
+  // depth-scatter and stereo pages.)
+  const sigmaQ = (p.depth_kind === "blend") ? "&sigma=0.03" : "";
   const url = `/captures/${encodeURIComponent(sid)}/pixel-cloud/${idx}.json`
     + `?depth_kind=${encodeURIComponent(p.depth_kind)}`
     + `&pose_dir=${encodeURIComponent(p.pose_dir)}`
-    + `&stride=${p.stride}`;
+    + `&stride=${p.stride}${sigmaQ}`;
   let r;
   try { r = await fetch(url); }
   catch (e) { console.warn("pixel-cloud fetch failed", e); return null; }
@@ -1347,9 +1360,11 @@ async function fetchPixelCloud(idx) {
 }
 
 function applyAffineToPositions(payload, positionsBuf, a, b, fitSpace) {
-  // Phone depth is already metric — sliders should be a no-op even if
-  // the user happens to have nudged them while in phone mode.
-  if (payload.depth_kind === "phone") { a = 1.0; b = 0.0; fitSpace = "depth"; }
+  // Phone and blend depths are already metric — sliders are a no-op for
+  // both even if the user has nudged them in another mode.
+  if (payload.depth_kind === "phone" || payload.depth_kind === "blend") {
+    a = 1.0; b = 0.0; fitSpace = "depth";
+  }
   const n = payload.count;
   const ox = payload.origin[0], oy = payload.origin[1], oz = payload.origin[2];
   const dirs = payload.dirs;
