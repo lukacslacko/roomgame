@@ -76,15 +76,16 @@
       pointer-events: none;
     }
 
-    /* Main strip: panels arranged left-to-right. Image panels sit at
-       the captured frames' portrait aspect (set from the manifest as
-       --frame-ar; see depthscatter.js); the scatter panel takes the
-       remaining horizontal space so on typical laptop displays it
-       ends up roughly square. */
+    /* Two-row 4-column grid: row 1 has the four image panels (RGB,
+       phone, model, blend), row 2 has the two scatters under the model
+       and blend columns (RGB and phone columns leave row 2 empty). The
+       scatter row's height clamps so the images don't get squashed on
+       small screens but the scatters stay roughly square on big ones. */
     #content-area {
       flex: 1 1 0; min-width: 0;
-      display: flex;
-      flex-direction: row;
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
+      grid-template-rows: minmax(0, 1fr) clamp(180px, 32vh, 360px);
       gap: 6px;
       padding: 6px;
       background: #07070b;
@@ -99,20 +100,21 @@
       overflow: hidden;
       display: flex; align-items: center; justify-content: center;
       min-width: 0; min-height: 0;
-      height: 100%;
     }
-    /* Image panels at the captured frame's aspect (default to typical
-       phone portrait until the manifest tells us otherwise). flex: 0 1
-       lets them shrink when the viewport is narrow, but normally the
-       browser sizes them to height × ar. */
+    /* Image panels live in row 1; widths come from the grid track,
+       heights from the row track. The inner <img> uses object-fit:
+       contain so the captured portrait is letterboxed within the
+       cell rather than stretched. */
     .panel.image-panel {
-      flex: 0 1 auto;
-      aspect-ratio: var(--frame-ar, 9 / 19.5);
+      grid-row: 1;
     }
     .panel.scatter {
-      flex: 1 1 0;
-      min-width: 200px;
+      grid-row: 2;
     }
+    /* The two scatters appear under columns 3 (model) and 4 (blend);
+       columns 1 and 2 stay empty in row 2. */
+    #panelScatterModel { grid-column: 3; }
+    #panelScatterBlend { grid-column: 4; }
     .panel .panel-tag {
       position: absolute; left: 8px; top: 8px;
       background: rgba(0,0,0,0.65); color: #d8e1ff;
@@ -236,10 +238,15 @@
           <span class="panel-empty">—</span>
         </div>
       </div>
-      <div class="panel scatter" id="panelScatter">
+      <div class="panel scatter" id="panelScatterModel">
         <span class="panel-tag">phone vs model</span>
-        <div class="scatter-meta" id="scatterMeta">—</div>
-        <svg class="scatter-svg" id="scatterSvg" preserveAspectRatio="none"></svg>
+        <div class="scatter-meta" id="scatterMetaModel">—</div>
+        <svg class="scatter-svg" id="scatterSvgModel" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="panel scatter" id="panelScatterBlend">
+        <span class="panel-tag">phone vs blend</span>
+        <div class="scatter-meta" id="scatterMetaBlend">—</div>
+        <svg class="scatter-svg" id="scatterSvgBlend" preserveAspectRatio="none"></svg>
       </div>
     </div>
   </div>

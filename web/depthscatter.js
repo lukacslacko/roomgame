@@ -1,8 +1,9 @@
 // Depth-scatter viewer.
-// Pick a session + frame; see the RGB photo, the phone-depth thumb, the
-// model-depth thumb, and a scatter of (phone, model) at every pixel of
-// the (subsampled) colour-image grid. The RGB panel can have an overlay
-// (phone, model, or signed diff) blended on top with adjustable opacity.
+// Pick a session + frame; row 1 shows RGB / phone / model / blend
+// thumbnails; row 2 shows two scatters under the model and blend
+// columns (phone-vs-model and phone-vs-blend), each with Pearson +
+// Spearman printed. RGB has an optional overlay; σ slider drives the
+// blend (and the phone-vs-blend scatter).
 
 const sessionSel    = document.getElementById("sessionSel");
 const poseDirSel    = document.getElementById("poseDirSel");
@@ -17,8 +18,10 @@ const panelRgb      = document.getElementById("panelRgb");
 const panelPhone    = document.getElementById("panelPhone");
 const panelModel    = document.getElementById("panelModel");
 const panelBlend    = document.getElementById("panelBlend");
-const scatterMeta   = document.getElementById("scatterMeta");
-const scatterSvg    = document.getElementById("scatterSvg");
+const scatterMetaModel = document.getElementById("scatterMetaModel");
+const scatterSvgModel  = document.getElementById("scatterSvgModel");
+const scatterMetaBlend = document.getElementById("scatterMetaBlend");
+const scatterSvgBlend  = document.getElementById("scatterSvgBlend");
 
 // ---------------------------------------------------------------------
 // State
@@ -31,7 +34,8 @@ let selectedFrame = null;
 // re-draw without re-fetching. null until the first response arrives.
 let lastScatter = null;
 // Bumps on every fetch so a slow response from a previously-selected
-// frame can't clobber the panel after the user has moved on.
+// frame can't clobber the panel after the user has moved on. Anything
+// that triggers a refetch (frame click, σ change) increments this.
 let fetchToken = 0;
 
 // ---------------------------------------------------------------------
@@ -291,7 +295,8 @@ function applyOverlay(mode, idx, longEdge) {
 async function fetchScatter(sid, idx, token) {
   let r;
   try {
-    r = await fetch(`/captures/${encodeURIComponent(sid)}/depth-scatter/${idx}.json?max_samples=5000`);
+    r = await fetch(`/captures/${encodeURIComponent(sid)}/depth-scatter/${idx}.json`
+                    + `?max_samples=5000&sigma=${getSigma()}`);
   } catch (e) {
     if (token === fetchToken) {
       stStatus.textContent = `frame #${idx} · scatter request failed`;
@@ -303,8 +308,10 @@ async function fetchScatter(sid, idx, token) {
   if (!r.ok) {
     const txt = await r.text();
     stStatus.textContent = `frame #${idx} · scatter HTTP ${r.status}`;
-    setScatterMeta(`(server: ${txt.trim()})`);
-    drawScatter([]);
+    setScatterMeta(scatterMetaModel, `(server: ${txt.trim()})`);
+    setScatterMeta(scatterMetaBlend, `(server: ${txt.trim()})`);
+    drawScatter(scatterSvgModel, [], "phone depth (m)", "model raw");
+    drawScatter(scatterSvgBlend, [], "phone depth (m)", "blend (m)");
     lastScatter = null;
     return;
   }
@@ -313,21 +320,34 @@ async function fetchScatter(sid, idx, token) {
   lastScatter = j;
   renderScatterFromState();
   stStatus.textContent =
-      `frame #${idx} · ${j.n_valid.toLocaleString()} valid pairs · `
-    + `Pearson ${fmtCorr(j.pearson)} · Spearman ${fmtCorr(j.spearman)}`;
+      `frame #${idx} · model r=${fmtCorr(j.pearson_model)} ρ=${fmtCorr(j.spearman_model)} · `
+    + `blend r=${fmtCorr(j.pearson_blend)} ρ=${fmtCorr(j.spearman_blend)}`;
 }
 
 function renderScatterFromState() {
   const j = lastScatter;
-  if (!j) { drawScatter([]); setScatterMeta("(no data)"); return; }
-  setScatterMeta(
-    `<span><b>${j.n_valid.toLocaleString()}</b> valid pairs (${j.n_returned.toLocaleString()} plotted)</span>`
-    + ` <span>Pearson <b>${fmtCorr(j.pearson)}</b></span>`
-    + ` <span>Spearman <b>${fmtCorr(j.spearman)}</b></span>`
+  if (!j) {
+    setScatterMeta(scatterMetaModel, "(no data)");
+    setScatterMeta(scatterMetaBlend, "(no data)");
+    drawScatter(scatterSvgModel, [], "phone depth (m)", "model raw");
+    drawScatter(scatterSvgBlend, [], "phone depth (m)", "blend (m)");
+    return;
+  }
+  setScatterMeta(scatterMetaModel,
+      `<span><b>${j.n_valid_model.toLocaleString()}</b> pairs</span>`
+    + ` <span>Pearson <b>${fmtCorr(j.pearson_model)}</b></span>`
+    + ` <span>Spearman <b>${fmtCorr(j.spearman_model)}</b></span>`
     + ` <span>phone <b>${fmtRange(j.phone_min, j.phone_max)}</b> m</span>`
     + ` <span>model <b>${fmtRange(j.model_min, j.model_max)}</b></span>`
   );
-  drawScatter(j.pairs || []);
+  setScatterMeta(scatterMetaBlend,
+      `<span><b>${j.n_valid_blend.toLocaleString()}</b> pairs · σ=${(j.sigma * 100).toFixed(1)}%</span>`
+    + ` <span>Pearson <b>${fmtCorr(j.pearson_blend)}</b></span>`
+    + ` <span>Spearman <b>${fmtCorr(j.spearman_blend)}</b></span>`
+    + ` <span>blend <b>${fmtRange(j.blend_min, j.blend_max)}</b> m</span>`
+  );
+  drawScatter(scatterSvgModel, j.pairs_model || [], "phone depth (m)", "model raw");
+  drawScatter(scatterSvgBlend, j.pairs_blend || [], "phone depth (m)", "blend (m)");
 }
 
 function fmtCorr(x) {
@@ -338,12 +358,11 @@ function fmtRange(a, b) {
   if (a == null || b == null) return "—";
   return `${a.toFixed(2)}…${b.toFixed(2)}`;
 }
-function setScatterMeta(html) {
-  scatterMeta.innerHTML = html;
+function setScatterMeta(el, html) {
+  el.innerHTML = html;
 }
 
-function drawScatter(pairs) {
-  const svg = scatterSvg;
+function drawScatter(svg, pairs, xLabel, yLabel) {
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   const rect = svg.getBoundingClientRect();
   const W = Math.max(160, rect.width);
@@ -436,14 +455,14 @@ function drawScatter(pairs) {
   xlbl.setAttribute("x", xR);
   xlbl.setAttribute("y", y1 - 4);
   xlbl.setAttribute("text-anchor", "end");
-  xlbl.textContent = "phone depth (m)";
+  xlbl.textContent = xLabel;
   svg.appendChild(xlbl);
   const ylbl = document.createElementNS(NS, "text");
   ylbl.setAttribute("class", "axis-label");
   ylbl.setAttribute("x", x0 + 4);
   ylbl.setAttribute("y", yT + 10);
   ylbl.setAttribute("text-anchor", "start");
-  ylbl.textContent = "model raw";
+  ylbl.textContent = yLabel;
   svg.appendChild(ylbl);
 
   // Points — additive translucent fill so dense regions read as bright
@@ -494,7 +513,7 @@ sessionSel.addEventListener("change", () => {
   resetPanel(panelModel, "—");
   resetPanel(panelBlend, "—");
   setOverlayImg(null);
-  drawScatter([]); setScatterMeta("(no data)");
+  renderScatterFromState();
   stStatus.textContent = "pick a frame →";
 });
 poseDirSel.addEventListener("change", () => {
@@ -515,13 +534,18 @@ overlayOpacity.addEventListener("input", () => {
 });
 
 // σ slider: while dragging, just update the readout; on commit (mouse-up
-// or arrow-key release) refetch the blend image. The server quantises
-// σ to 1e-3 so cache hits are common when the user wiggles the slider.
+// or arrow-key release) refetch the blend image AND the phone-vs-blend
+// scatter. The server quantises σ to 1e-3 so cache hits are common when
+// the user wiggles the slider.
 sigmaSlider.addEventListener("input", () => {
   sigmaValue.textContent = `${(getSigma() * 100).toFixed(1)}%`;
 });
 sigmaSlider.addEventListener("change", () => {
   refreshBlendOnly();
+  if (selectedFrame != null && sessionSel.value) {
+    fetchToken++;
+    fetchScatter(sessionSel.value, selectedFrame, fetchToken);
+  }
 });
 
 window.addEventListener("resize", () => renderScatterFromState());

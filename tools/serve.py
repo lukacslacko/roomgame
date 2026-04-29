@@ -915,9 +915,11 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             )
             return
 
-        # /captures/<id>/depth-scatter/<idx>.json?variant=<vd>&max_samples=<n>
-        # — paired (phone, model) depth samples on the colour-image grid
-        # plus Pearson + Spearman computed over ALL valid pairs.
+        # /captures/<id>/depth-scatter/<idx>.json?variant=<vd>
+        #     &max_samples=<n>&sigma=<frac>
+        # — paired depth samples on the colour-image grid: both
+        # (phone, model_raw) and (phone, blend) plus Pearson + Spearman
+        # for each. Sigma is the Gaussian blur fraction used by the blend.
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/depth-scatter/(\d+)\.json",
             path,
@@ -930,8 +932,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 max_samples = 5000
             max_samples = max(100, min(50000, max_samples))
+            try:
+                sigma_frac = float((qs.get("sigma") or ["0.03"])[0])
+            except ValueError:
+                sigma_frac = 0.03
+            sigma_frac = max(0.001, min(0.20, sigma_frac))
             self._handle_depth_scatter(m.group(1), variant_dir, int(m.group(2)),
-                                        max_samples=max_samples)
+                                        max_samples=max_samples,
+                                        sigma_frac=sigma_frac)
             return
 
         # /captures/<id>/frame-feature-voxels/<idx>.json[?variant=features|features_aligned|...]
@@ -1258,16 +1266,18 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(png)
 
     def _handle_depth_scatter(self, session_id: str, variant_dir: str,
-                                idx: int, *, max_samples: int) -> None:
-        """Phone-vs-model paired-depth samples + correlation coefficients
-        for one frame. Sampling lattice is built on the colour-image grid
-        at a stride chosen so the full grid produces ≈ 200_000 candidate
-        pixels; valid pairs (both depth sources finite & positive) are
-        retained, then subsampled to `max_samples` for the wire.
+                                idx: int, *, max_samples: int,
+                                sigma_frac: float) -> None:
+        """Per-pixel paired depth samples for one frame, on the colour-image
+        grid: both (phone, model_raw) and (phone, blend_metres) pairs plus
+        Pearson + Spearman computed over ALL valid pixels (the wire
+        sampling is just a per-axis subset for plotting).
 
-        Pearson and Spearman are computed over ALL valid pairs (not just
-        the wire-sampled subset) so the reported coefficients don't drift
-        with `max_samples`."""
+        The blend uses the same hole-aware Gaussian detail-injection as the
+        kind=blend thumbnail, so on-screen the scatter and the picture line
+        up. `sigma_frac` is the Gaussian sigma as a fraction of the
+        sampling grid's diagonal."""
+        import math
         import numpy as np
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
@@ -1295,31 +1305,43 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             phone, model = _sample_phone_model_on_color_grid(
                 body, out_w=out_w, out_h=out_h, model_raw_arr=arr,
             )
+            sigma_px = max(1.0, float(sigma_frac) * math.hypot(out_w, out_h))
+            blend, model_metres, fit_a, fit_b, _ = _compute_blend_metres(
+                phone, model, sigma_px,
+            )
         except Exception as e:  # noqa: BLE001
             self._send_text(500, f"scatter sample failed: {e}\n")
             return
 
-        valid = np.isfinite(phone) & np.isfinite(model)
-        n_valid = int(valid.sum())
-        p = phone[valid].astype(np.float64)
-        m = model[valid].astype(np.float64)
+        valid_pm = np.isfinite(phone) & np.isfinite(model)
+        valid_pb = np.isfinite(phone) & np.isfinite(blend)
+        n_pm = int(valid_pm.sum()); n_pb = int(valid_pb.sum())
+        p_for_m = phone[valid_pm].astype(np.float64)
+        m_arr   = model[valid_pm].astype(np.float64)
+        p_for_b = phone[valid_pb].astype(np.float64)
+        b_arr   = blend[valid_pb].astype(np.float64)
 
-        pearson = None; spearman = None
-        if n_valid >= 3 and float(p.std()) > 1e-9 and float(m.std()) > 1e-9:
-            pearson = float(np.corrcoef(p, m)[0, 1])
-            rp = _ranks_with_ties(p)
-            rm = _ranks_with_ties(m)
-            spearman = float(np.corrcoef(rp, rm)[0, 1])
+        def corr_pair(x, y):
+            if x.size < 3 or float(x.std()) < 1e-9 or float(y.std()) < 1e-9:
+                return None, None
+            r = float(np.corrcoef(x, y)[0, 1])
+            rho = float(np.corrcoef(_ranks_with_ties(x), _ranks_with_ties(y))[0, 1])
+            return r, rho
 
-        if n_valid > max_samples:
-            rng = np.random.default_rng(0xC0FFEE)
-            sel = rng.choice(n_valid, size=max_samples, replace=False)
-            wire_p = p[sel]; wire_m = m[sel]
-        else:
-            wire_p = p; wire_m = m
-        # Ship as round-trip-trimmed floats to keep the JSON small.
-        pairs = [[round(float(a), 4), round(float(b), 4)]
-                 for a, b in zip(wire_p, wire_m)]
+        pearson_m, spearman_m = corr_pair(p_for_m, m_arr)
+        pearson_b, spearman_b = corr_pair(p_for_b, b_arr)
+
+        rng = np.random.default_rng(0xC0FFEE)
+        def subsample_pairs(x, y):
+            n = x.size
+            if n > max_samples:
+                sel = rng.choice(n, size=max_samples, replace=False)
+                x = x[sel]; y = y[sel]
+            return [[round(float(a), 4), round(float(b), 4)]
+                    for a, b in zip(x, y)]
+
+        pairs_model = subsample_pairs(p_for_m, m_arr)
+        pairs_blend = subsample_pairs(p_for_b, b_arr)
 
         self._send_json(200, {
             "session": session_id,
@@ -1328,15 +1350,19 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             "color_size": [cw, ch],
             "grid_size": [int(out_w), int(out_h)],
             "stride": int(stride),
-            "n_valid": n_valid,
-            "n_returned": len(pairs),
-            "pearson": pearson,
-            "spearman": spearman,
-            "phone_min": float(p.min()) if p.size else None,
-            "phone_max": float(p.max()) if p.size else None,
-            "model_min": float(m.min()) if m.size else None,
-            "model_max": float(m.max()) if m.size else None,
-            "pairs": pairs,
+            "sigma": float(sigma_frac),
+            "fit": {"a": float(fit_a), "b": float(fit_b)},
+            "n_valid_model": n_pm, "n_valid_blend": n_pb,
+            "pearson_model":  pearson_m,  "spearman_model":  spearman_m,
+            "pearson_blend":  pearson_b,  "spearman_blend":  spearman_b,
+            "phone_min": float(p_for_m.min()) if p_for_m.size else None,
+            "phone_max": float(p_for_m.max()) if p_for_m.size else None,
+            "model_min": float(m_arr.min()) if m_arr.size else None,
+            "model_max": float(m_arr.max()) if m_arr.size else None,
+            "blend_min": float(b_arr.min()) if b_arr.size else None,
+            "blend_max": float(b_arr.max()) if b_arr.size else None,
+            "pairs_model": pairs_model,
+            "pairs_blend": pairs_blend,
         })
 
     def _handle_frame_feature_voxels(self, session_id: str, idx: int,
