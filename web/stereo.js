@@ -1,11 +1,12 @@
-// Pair feature explorer.
+// Stereo feature explorer.
 // User picks 2 frames; clicks land exactly where placed (no snap).
 // Clicking frame 1 starts a feature; clicking frame 2 commits it.
 // Two-mark features are LS-triangulated (midpoint of closest approach
-// between the two world rays). For each frame, we plot model (or
-// phone) depth at the click against the camera-Z distance from that
-// camera to the triangulated point — y=x is "perfect agreement".
-// Scroll to zoom, drag to pan; "0" resets the view.
+// between the two world rays). For each frame, we plot phone / model /
+// blend depth at the click against the camera-Z distance from that
+// camera to the triangulated point — y=x (rendered as a 45° diagonal,
+// since the plot region is a centred square with equal axis scaling)
+// is "perfect agreement". Scroll to zoom, drag to pan; "0" resets.
 
 const sessionSel    = document.getElementById("sessionSel");
 const poseDirSel    = document.getElementById("poseDirSel");
