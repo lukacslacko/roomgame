@@ -258,7 +258,6 @@ fn compute_blend_metres(
     // orientation (yo=0 = top of view = norm-view v=1). NaN where the
     // sample would land outside the source grid or on a zero/negative
     // depth pixel (phone holes).
-    let bv = frame.bd.inverse();
     let mut phone_grid = vec![f32::NAN; n];
     let mut model_grid = vec![f32::NAN; n];
     for yo in 0..ch_c {
@@ -266,9 +265,16 @@ fn compute_blend_metres(
         for xo in 0..cw_c {
             let u_v = (xo as f64 + 0.5) / cw_c as f64;
 
-            // Phone via Bd⁻¹ → depth-buffer pixel.
+            // Phone via Bd (norm-view → norm-depth-buffer) → pixel.
+            // Matches `nd = nv @ Bd.T` in tools/serve.py
+            // _sample_phone_model_on_color_grid (and the same convention
+            // in project_voxel_to_frame above). The pre-fix code applied
+            // Bd⁻¹ here, which inverted the per-pixel phone-depth
+            // assignment and produced an OLS fit whose `a` was off by a
+            // large factor — invisible at 5 cm voxels but obviously wrong
+            // at 2 cm.
             let nv = DVec4::new(u_v, v_v, 0.0, 1.0);
-            let nd = bv * nv;
+            let nd = frame.bd * nv;
             if nd.w.abs() > 1e-12 {
                 let u_d = nd.x / nd.w;
                 let v_d = nd.y / nd.w;
