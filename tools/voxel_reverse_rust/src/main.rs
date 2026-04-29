@@ -38,6 +38,29 @@ enum DepthSource {
     Blend,
 }
 
+/// Which family of monocular-depth cache the blend pulls from. The on-disk
+/// directory layout matches `tools/cache_model_raw.py`:
+///   V2 → `<session>/model_raw/`
+///   V3 → `<session>/model_raw_v3/`
+/// The cache contract (`index.json` + per-frame `frame_NNNNNN.f16` at
+/// colour-image resolution) is identical across versions, so the only
+/// thing that changes here is which directory we read from and what
+/// suffix we apply to the output JSON files.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ModelVersion {
+    V2,
+    V3,
+}
+
+impl ModelVersion {
+    fn cache_subdir(self) -> &'static str {
+        match self {
+            ModelVersion::V2 => "model_raw",
+            ModelVersion::V3 => "model_raw_v3",
+        }
+    }
+}
+
 struct Frame {
     v_inv: DMat4,
     p: DMat4,
@@ -575,15 +598,17 @@ struct BlendContext {
 }
 
 impl BlendContext {
-    fn from_session(session_dir: &Path, sigma_frac: f64) -> Result<Self, String> {
-        let model_dir = session_dir.join("model_raw");
+    fn from_session(session_dir: &Path, sigma_frac: f64,
+                     model_version: ModelVersion) -> Result<Self, String> {
+        let sub = model_version.cache_subdir();
+        let model_dir = session_dir.join(sub);
         let index_path = model_dir.join("index.json");
         let bytes = fs::read(&index_path)
-            .map_err(|e| format!("model_raw/index.json read failed: {e}"))?;
+            .map_err(|e| format!("{sub}/index.json read failed: {e}"))?;
         let v: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("model_raw/index.json parse failed: {e}"))?;
+            .map_err(|e| format!("{sub}/index.json parse failed: {e}"))?;
         let obj = v.as_object()
-            .ok_or_else(|| "model_raw/index.json must be an object".to_string())?;
+            .ok_or_else(|| format!("{sub}/index.json must be an object"))?;
         let mut model_dims = std::collections::HashMap::new();
         for (k, entry) in obj.iter() {
             let idx: usize = match k.parse() {
@@ -628,6 +653,10 @@ struct Args {
     /// Gaussian sigma (fraction of the colour-image diagonal) for the
     /// blend low-pass — only used when `depth_source == Blend`.
     blend_sigma: f64,
+    /// Which model_raw cache directory to read from. Only meaningful
+    /// when `depth_source == Blend`. V2 is the default for backward
+    /// compatibility.
+    model_version: ModelVersion,
 }
 
 impl Args {
@@ -648,6 +677,7 @@ impl Args {
             max_frames: None,
             depth_source: DepthSource::Phone,
             blend_sigma: 0.03,
+            model_version: ModelVersion::V2,
         };
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -676,6 +706,17 @@ impl Args {
                     i += 2;
                 }
                 "--blend-sigma" => { a.blend_sigma = args[i+1].parse().unwrap();      i += 2; }
+                "--model-version" => {
+                    a.model_version = match args[i+1].as_str() {
+                        "v2" => ModelVersion::V2,
+                        "v3" => ModelVersion::V3,
+                        other => {
+                            eprintln!("--model-version must be 'v2' or 'v3', got {other:?}");
+                            std::process::exit(2);
+                        }
+                    };
+                    i += 2;
+                }
                 "--world-min"   => {
                     a.world_min = [
                         args[i+1].parse().unwrap(),
@@ -699,7 +740,8 @@ impl Args {
         [--voxel-size M] [--world-min X Y Z] [--world-max X Y Z] \\
         [--near M] [--far M] [--tol M] \\
         [--threshold R] [--min-color-count N] [--max-frames N] \\
-        [--depth-source phone|blend] [--blend-sigma 0.03]");
+        [--depth-source phone|blend] [--blend-sigma 0.03] \\
+        [--model-version v2|v3]                  # which model_raw cache to read");
                     std::process::exit(0);
                 }
                 other => {
@@ -919,9 +961,14 @@ fn main() {
     let args = Args::parse();
     println!("rayon threads: {}", rayon::current_num_threads());
 
-    let blend_suffix = match args.depth_source {
-        DepthSource::Phone => "",
-        DepthSource::Blend => "_blended",
+    // Output filename suffix per (depth_source, model_version).
+    //   Phone           → ""
+    //   Blend + V2      → "_blended"      (unchanged: keeps existing filenames)
+    //   Blend + V3      → "_blended_v3"   (parallel to the V2 outputs)
+    let blend_suffix: &str = match (args.depth_source, args.model_version) {
+        (DepthSource::Phone, _)                => "",
+        (DepthSource::Blend, ModelVersion::V2) => "_blended",
+        (DepthSource::Blend, ModelVersion::V3) => "_blended_v3",
     };
 
     if let Some(session_id) = &args.session {
@@ -945,7 +992,8 @@ fn main() {
         let blend_ctx = match args.depth_source {
             DepthSource::Phone => None,
             DepthSource::Blend => Some(
-                BlendContext::from_session(&session_dir, args.blend_sigma)
+                BlendContext::from_session(&session_dir, args.blend_sigma,
+                                            args.model_version)
                     .unwrap_or_else(|e| {
                         eprintln!("blend mode: {e}");
                         std::process::exit(1);
