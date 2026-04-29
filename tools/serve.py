@@ -906,6 +906,25 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             )
             return
 
+        # /captures/<id>/depth-scatter/<idx>.json?variant=<vd>&max_samples=<n>
+        # — paired (phone, model) depth samples on the colour-image grid
+        # plus Pearson + Spearman computed over ALL valid pairs.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/depth-scatter/(\d+)\.json",
+            path,
+        )
+        if m:
+            qs = parse_qs(purl.query)
+            variant_dir = (qs.get("variant") or ["frames"])[0]
+            try:
+                max_samples = int((qs.get("max_samples") or ["5000"])[0])
+            except ValueError:
+                max_samples = 5000
+            max_samples = max(100, min(50000, max_samples))
+            self._handle_depth_scatter(m.group(1), variant_dir, int(m.group(2)),
+                                        max_samples=max_samples)
+            return
+
         # /captures/<id>/frame-feature-voxels/<idx>.json[?variant=features|features_aligned|...]
         # — voxels for features observed in this frame (uses the right
         # features_meta<suffix>.json based on which variant the viewer is on).
@@ -1173,7 +1192,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                              idx: int, kind: str, *, long_edge: int = 600) -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
-        if kind not in ("color", "depth"):
+        if kind not in ("color", "depth", "phone", "model", "diff"):
             self.send_response(404); self.end_headers(); return
         # Cache by long_edge as well so the triplet (full-res) and the
         # voxelview panel (600 px) thumbs don't evict each other.
@@ -1187,8 +1206,21 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 body = f.read_bytes()
                 if kind == "color":
                     png = _render_color_thumb(body, size=long_edge)
-                else:
+                elif kind == "depth":
                     png = _render_depth_thumb(body, size=long_edge)
+                elif kind == "phone":
+                    png = _render_phone_color_thumb(body, size=long_edge)
+                else:  # "model" or "diff" — both need the cached prediction
+                    arr = _load_model_raw_array(session_id, idx)
+                    if arr is None:
+                        self._send_text(409,
+                            "model_raw cache missing — run "
+                            f"tools/cache_model_raw.py --session {session_id}\n")
+                        return
+                    if kind == "model":
+                        png = _render_model_color_thumb(body, arr, size=long_edge)
+                    else:
+                        png = _render_diff_color_thumb(body, arr, size=long_edge)
             except Exception as e:  # noqa: BLE001
                 self._send_text(500, f"thumb render failed: {e}\n"); return
             if png is None:
@@ -1204,6 +1236,88 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
         self.wfile.write(png)
+
+    def _handle_depth_scatter(self, session_id: str, variant_dir: str,
+                                idx: int, *, max_samples: int) -> None:
+        """Phone-vs-model paired-depth samples + correlation coefficients
+        for one frame. Sampling lattice is built on the colour-image grid
+        at a stride chosen so the full grid produces ≈ 200_000 candidate
+        pixels; valid pairs (both depth sources finite & positive) are
+        retained, then subsampled to `max_samples` for the wire.
+
+        Pearson and Spearman are computed over ALL valid pairs (not just
+        the wire-sampled subset) so the reported coefficients don't drift
+        with `max_samples`."""
+        import numpy as np
+        if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
+            self.send_response(404); self.end_headers(); return
+        f = FRAMES_DIR / session_id / variant_dir / f"frame_{idx:06d}.bin"
+        if not f.exists():
+            self._send_text(404, f"frame missing: {variant_dir}/frame_{idx:06d}.bin\n")
+            return
+        arr = _load_model_raw_array(session_id, idx)
+        if arr is None:
+            self._send_text(409,
+                "model_raw cache missing — run "
+                f"tools/cache_model_raw.py --session {session_id}\n")
+            return
+        try:
+            body = f.read_bytes()
+            frame = parse_frame(body)
+            cw = int(frame["color_width"]); ch = int(frame["color_height"])
+            if cw == 0 or ch == 0:
+                # No colour buffer → fall back to the depth-buffer dims so the
+                # grid sampling still has something sensible to chew on.
+                cw = int(frame["width"]); ch = int(frame["height"])
+            target = 200_000
+            stride = max(1, int(round(((cw * ch) / target) ** 0.5)))
+            out_w = max(1, cw // stride); out_h = max(1, ch // stride)
+            phone, model = _sample_phone_model_on_color_grid(
+                body, out_w=out_w, out_h=out_h, model_raw_arr=arr,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._send_text(500, f"scatter sample failed: {e}\n")
+            return
+
+        valid = np.isfinite(phone) & np.isfinite(model)
+        n_valid = int(valid.sum())
+        p = phone[valid].astype(np.float64)
+        m = model[valid].astype(np.float64)
+
+        pearson = None; spearman = None
+        if n_valid >= 3 and float(p.std()) > 1e-9 and float(m.std()) > 1e-9:
+            pearson = float(np.corrcoef(p, m)[0, 1])
+            rp = _ranks_with_ties(p)
+            rm = _ranks_with_ties(m)
+            spearman = float(np.corrcoef(rp, rm)[0, 1])
+
+        if n_valid > max_samples:
+            rng = np.random.default_rng(0xC0FFEE)
+            sel = rng.choice(n_valid, size=max_samples, replace=False)
+            wire_p = p[sel]; wire_m = m[sel]
+        else:
+            wire_p = p; wire_m = m
+        # Ship as round-trip-trimmed floats to keep the JSON small.
+        pairs = [[round(float(a), 4), round(float(b), 4)]
+                 for a, b in zip(wire_p, wire_m)]
+
+        self._send_json(200, {
+            "session": session_id,
+            "variant": variant_dir,
+            "idx": idx,
+            "color_size": [cw, ch],
+            "grid_size": [int(out_w), int(out_h)],
+            "stride": int(stride),
+            "n_valid": n_valid,
+            "n_returned": len(pairs),
+            "pearson": pearson,
+            "spearman": spearman,
+            "phone_min": float(p.min()) if p.size else None,
+            "phone_max": float(p.max()) if p.size else None,
+            "model_min": float(m.min()) if m.size else None,
+            "model_max": float(m.max()) if m.size else None,
+            "pairs": pairs,
+        })
 
     def _handle_frame_feature_voxels(self, session_id: str, idx: int,
                                       variant: str = "features") -> None:
@@ -1740,6 +1854,247 @@ def _render_depth_thumb(body: bytes, size: int = 600) -> bytes | None:
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=False)
     return buf.getvalue()
+
+
+# 11-point sample of matplotlib's 'turbo' colormap in 0–255 RGB, evenly
+# spaced from t=0 (deep blue) to t=1 (deep red). Using a LUT + linear
+# interpolation is plenty for thumbnail visualisation and lets us stay
+# inside numpy without pulling in matplotlib.
+_TURBO_LUT_RGB = [
+    [ 48,  18,  59],
+    [ 70,  74, 213],
+    [ 50, 137, 252],
+    [ 26, 195, 232],
+    [ 47, 234, 162],
+    [124, 250,  90],
+    [201, 230,  43],
+    [248, 178,  29],
+    [243, 113,  19],
+    [203,  41,  15],
+    [122,   4,   3],
+]
+
+
+def _apply_turbo(x):
+    """Map values in [0, 1] (any shape, ndarray) to uint8 RGB along a new
+    trailing axis using a piecewise-linear approximation of matplotlib's
+    'turbo' colormap."""
+    import numpy as np
+    lut = np.asarray(_TURBO_LUT_RGB, dtype=np.float32)
+    n = lut.shape[0] - 1
+    f = np.clip(x, 0.0, 1.0) * n
+    i0 = np.floor(f).astype(np.int32)
+    i1 = np.minimum(i0 + 1, n)
+    t = (f - i0)[..., None]
+    rgb = (1 - t) * lut[i0] + t * lut[i1]
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _apply_diverging(x):
+    """Map values in [-1, 1] to uint8 RGB. Red for positive, blue for
+    negative, near-white at zero. Saturates at the extremes."""
+    import numpy as np
+    t = np.clip(x, -1.0, 1.0)
+    s = np.abs(t)
+    fade = 1.0 - 0.85 * s   # white → coloured as |t| grows
+    r = np.where(t >= 0, 1.0, fade)
+    b = np.where(t <  0, 1.0, fade)
+    g = fade
+    rgb = np.stack([r, g, b], axis=-1) * 255.0
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _sample_phone_model_on_color_grid(body: bytes, *, out_w: int, out_h: int,
+                                       model_raw_arr=None):
+    """Sample WebXR phone depth and (optionally) cached model_raw at every
+    pixel of a (out_h, out_w) thumbnail grid in NATURAL display orientation
+    (yo=0 → top of displayed image). Returns (phone, model) arrays of shape
+    (out_h, out_w) — float32, NaN for invalid samples. Pixels are paired:
+    phone[i,j] and model[i,j] correspond to the same view ray.
+
+    Phone depth is in metres; model_raw is the Depth-Anything-V2 prediction
+    in its native units (≈ metres, but unrescaled). Pass model_raw_arr=None
+    to skip the model branch entirely (model returned all-NaN)."""
+    import numpy as np
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import fusion  # noqa: E402
+    frame = parse_frame(body)
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    dw = int(frame["width"]);       dh = int(frame["height"])
+    if cw == 0 or ch == 0:
+        cw, ch = dw, dh
+    depth = fusion.decode_depth(
+        frame["depth"], dw, dh,
+        int(frame["format"]), float(frame["rawValueToMeters"]),
+    )
+    Bd = fusion._mat4_from_column_major(frame["normDepthBufferFromNormView"])
+
+    yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing="ij")
+    # Natural display: yo=0 is the top row, but norm-view v=0 is the
+    # bottom of the view. Invert v so the sampled pixel at the visual
+    # top of the thumb maps to the top of the scene.
+    u_v = (xx + 0.5) / out_w
+    v_v = 1.0 - (yy + 0.5) / out_h
+
+    # Phone: norm-view (u_v, v_v) → norm-depth-buffer via Bd → pixel.
+    nv = np.stack([u_v, v_v, np.zeros_like(u_v), np.ones_like(u_v)], axis=-1)
+    nd = nv @ Bd.T
+    safe = np.where(np.abs(nd[..., 3]) > 1e-12, nd[..., 3], 1.0)
+    u_d = nd[..., 0] / safe
+    v_d = nd[..., 1] / safe
+    bx = (1.0 - u_d) * dw - 0.5
+    by = v_d * dh - 0.5
+    phone = _bilinear_sample_2d(depth, bx, by).astype(np.float32)
+    phone = np.where((phone > 0) & np.isfinite(phone), phone, np.float32("nan"))
+
+    if model_raw_arr is not None:
+        ch_c, cw_c = model_raw_arr.shape
+        # model_raw was written by cache_model_raw.py from rgba *without*
+        # a vertical flip, so model_raw row 0 = scene-bottom = norm-view
+        # v=0. Sample at (u_v · cw_c, v_v · ch_c).
+        sx = u_v * cw_c - 0.5
+        sy = v_v * ch_c - 0.5
+        model = _bilinear_sample_2d(model_raw_arr, sx, sy).astype(np.float32)
+        model = np.where(np.isfinite(model) & (model > 1e-3),
+                         model, np.float32("nan"))
+    else:
+        model = np.full_like(phone, np.float32("nan"))
+    return phone, model
+
+
+def _depth_to_turbo_rgb(depth):
+    """uint8 RGB the same height/width as `depth`. NaN/zero → black.
+    Range comes from the 2nd–98th percentile of the valid pixels so the
+    colormap isn't squashed by a handful of outliers."""
+    import numpy as np
+    valid = np.isfinite(depth) & (depth > 0)
+    if not valid.any():
+        return np.zeros((*depth.shape, 3), dtype=np.uint8)
+    d_min = float(np.percentile(depth[valid], 2))
+    d_max = float(np.percentile(depth[valid], 98))
+    d_max = max(d_max, d_min + 1e-3)
+    norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
+    rgb = _apply_turbo(norm)
+    rgb[~valid] = 0
+    return rgb
+
+
+def _render_phone_color_thumb(body: bytes, *, size: int = 600):
+    """Phone depth as turbo-colormapped PNG, in natural display orientation.
+    The sampling grid matches `_render_color_thumb` so depth and colour
+    line up pixel-for-pixel in the same thumbnail."""
+    import io
+    from PIL import Image
+    frame = parse_frame(body)
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    dw = int(frame["width"]);       dh = int(frame["height"])
+    if cw == 0 or ch == 0:
+        cw, ch = dw, dh
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    phone, _ = _sample_phone_model_on_color_grid(
+        body, out_w=out_w, out_h=out_h, model_raw_arr=None,
+    )
+    rgb = _depth_to_turbo_rgb(phone)
+    img = Image.fromarray(rgb)
+    buf = io.BytesIO(); img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
+def _render_model_color_thumb(body: bytes, model_raw_arr, *, size: int = 600):
+    """Model_raw rendered with the same orientation + colormap as the
+    phone thumb so the user can flick between them and visually compare."""
+    import io
+    from PIL import Image
+    frame = parse_frame(body)
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    dw = int(frame["width"]);       dh = int(frame["height"])
+    if cw == 0 or ch == 0:
+        cw, ch = dw, dh
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    _, model = _sample_phone_model_on_color_grid(
+        body, out_w=out_w, out_h=out_h, model_raw_arr=model_raw_arr,
+    )
+    rgb = _depth_to_turbo_rgb(model)
+    img = Image.fromarray(rgb)
+    buf = io.BytesIO(); img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
+def _render_diff_color_thumb(body: bytes, model_raw_arr, *, size: int = 600):
+    """Per-pixel signed (model − phone) on the colour grid, rendered with a
+    diverging Red-White-Blue colormap. Range is symmetrical around 0 with
+    extents at the 95th percentile of |diff| so a few crazy values don't
+    flatten everything else. Pixels missing either source render black —
+    that gap pattern itself is informative (e.g., model has corners that
+    phone-depth doesn't cover)."""
+    import io
+    import numpy as np
+    from PIL import Image
+    frame = parse_frame(body)
+    cw = int(frame["color_width"]); ch = int(frame["color_height"])
+    dw = int(frame["width"]);       dh = int(frame["height"])
+    if cw == 0 or ch == 0:
+        cw, ch = dw, dh
+    out_w, out_h = _thumb_target_size(cw, ch, size)
+    phone, model = _sample_phone_model_on_color_grid(
+        body, out_w=out_w, out_h=out_h, model_raw_arr=model_raw_arr,
+    )
+    diff = model - phone
+    valid = np.isfinite(diff)
+    rgb = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    if valid.any():
+        scale = float(np.percentile(np.abs(diff[valid]), 95))
+        scale = max(scale, 1e-3)
+        norm = np.clip(diff / scale, -1.0, 1.0)
+        # _apply_diverging vectorises over the full grid; we mask to keep
+        # the invalid pixels black.
+        rgb_full = _apply_diverging(np.where(valid, norm, 0.0))
+        rgb[valid] = rgb_full[valid]
+    img = Image.fromarray(rgb)
+    buf = io.BytesIO(); img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
+def _load_model_raw_array(session_id: str, idx: int):
+    """Read the cached float16 model_raw prediction for one frame, plus
+    its (cw, ch) from index.json. Returns (arr, cw, ch) or None if the
+    cache is missing for this frame."""
+    import numpy as np
+    meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
+    raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+    if not meta_path.exists() or not raw_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    entry = meta.get(str(idx))
+    if entry is None:
+        return None
+    cw_c = int(entry["w"]); ch_c = int(entry["h"])
+    arr = (np.frombuffer(raw_path.read_bytes(), dtype=np.float16)
+              .astype(np.float32, copy=False).reshape(ch_c, cw_c))
+    return arr
+
+
+def _ranks_with_ties(x):
+    """1-based fractional ranks (ties get the average rank of the run)."""
+    import numpy as np
+    n = x.size
+    order = np.argsort(x, kind="quicksort")
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = np.arange(1, n + 1)
+    sx = x[order]
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sx[j + 1] == sx[i]:
+            j += 1
+        if j > i:
+            avg = (i + j + 2) / 2.0
+            ranks[order[i:j+1]] = avg
+        i = j + 1
+    return ranks
 
 
 def _frame_to_voxel_indices(
