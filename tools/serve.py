@@ -304,6 +304,12 @@ FRAME_VOXELS_PIXEL_CAP = 80_000
 _THUMB_CACHE: dict[tuple, bytes] = {}
 _THUMB_CACHE_MAX = 2000  # ~50KB each → ~100MB ceiling
 
+# Cached blend grids for the stereo page. Keyed by
+# (session, idx, sigma_quantised, out_w, out_h). Each entry is a float32
+# array (≈ 1000×400×4B = 1.6 MB), so 16 entries top out around 25 MB.
+_BLEND_GRID_CACHE: dict[tuple, "numpy.ndarray"] = {}
+_BLEND_GRID_CACHE_MAX = 16
+
 
 def _features_meta_filename(variant: str) -> str:
     """Map the voxelview variant string to the corresponding features_meta
@@ -1069,8 +1075,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             qs = parse_qs(purl.query)
             pose_dir = (qs.get("pose_dir") or ["frames"])[0]
             features_json = (qs.get("features") or ["[]"])[0]
+            try:
+                sigma_frac = float((qs.get("sigma") or ["0.03"])[0])
+            except ValueError:
+                sigma_frac = 0.03
+            sigma_frac = max(0.001, min(0.20, sigma_frac))
             self._handle_triplet_distances(
                 m.group(1), pose_dir, features_json,
+                sigma_frac=sigma_frac,
             )
             return
 
@@ -1585,7 +1597,8 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         })
 
     def _handle_triplet_distances(self, session_id: str,
-                                   pose_dir: str, features_json: str) -> None:
+                                   pose_dir: str, features_json: str,
+                                   *, sigma_frac: float = 0.03) -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
             self.send_response(404); self.end_headers(); return
         try:
@@ -1600,6 +1613,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 session_id=session_id,
                 pose_dir=pose_dir,
                 features_in=features_in,
+                sigma_frac=sigma_frac,
             )
         except FileNotFoundError as e:
             self._send_text(409, f"{e}\n"); return
@@ -2541,10 +2555,15 @@ def _triangulate_rays(rays):
 
 
 def _triplet_distances_payload(*, session_id: str, pose_dir: str,
-                                features_in: list) -> dict:
+                                features_in: list,
+                                sigma_frac: float = 0.03) -> dict:
     """Compute, per feature, an LS-triangulated world point from the
-    user's clicked marks, plus per-mark (model_depth, phone_depth,
-    cam_distance_to_world_pt). Frames are decoded once and cached."""
+    user's clicked marks, plus per-mark (phone_depth, model_depth,
+    blend_depth, cam_distance_to_world_pt). Frames are decoded once and
+    cached for the duration of the call. The blend grid for each (frame,
+    σ) pair lives in a module-level cache so successive marks on the
+    same frame don't recompute it."""
+    import math
     import numpy as np
     sys.path.insert(0, str(PROJECT_ROOT / "tools"))
     import fusion  # noqa: E402
@@ -2559,13 +2578,22 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
             model_meta = None
     model_arr_cache: dict[int, np.ndarray] = {}
 
+    # Blend grid resolution: long-edge ~1000 px keeps Gaussian-filter
+    # cost low enough to be unnoticeable per request even for the cold
+    # path; the colour-image-aspect grid means UV→pixel sampling is
+    # exact (a wider/shorter grid would fold in extra resampling
+    # error at the bilinear sample step).
+    BLEND_LONG_EDGE = 1000
+    sigma_q = round(float(sigma_frac), 3)
+
     def get_frame(idx: int) -> dict:
         if idx in frame_cache:
             return frame_cache[idx]
         f = FRAMES_DIR / session_id / pose_dir / f"frame_{idx:06d}.bin"
         if not f.exists():
             raise FileNotFoundError(f"missing {pose_dir}/frame_{idx:06d}.bin")
-        frame = parse_frame(f.read_bytes())
+        body = f.read_bytes()
+        frame = parse_frame(body)
         dw = int(frame["width"]); dh = int(frame["height"])
         depth = fusion.decode_depth(
             frame["depth"], dw, dh,
@@ -2575,7 +2603,7 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
         V  = fusion._mat4_from_column_major(frame["viewMatrix"])
         V_w2c = np.linalg.inv(V)
         frame_cache[idx] = {
-            "frame": frame, "dw": dw, "dh": dh,
+            "frame": frame, "body": body, "dw": dw, "dh": dh,
             "phone_depth": depth, "Bd": Bd, "V_w2c": V_w2c,
         }
         return frame_cache[idx]
@@ -2597,6 +2625,32 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
                  .astype(np.float32, copy=False).reshape(ch_c, cw_c))
         model_arr_cache[idx] = arr
         return arr, cw_c, ch_c
+
+    def get_blend_grid(idx: int):
+        """Return (blend_array, out_w, out_h) or (None, 0, 0) if the
+        model_raw cache is missing for this frame."""
+        arr, _, _ = get_model(idx)
+        if arr is None:
+            return None, 0, 0
+        fr = get_frame(idx)
+        cw = int(fr["frame"]["color_width"])
+        ch_ = int(fr["frame"]["color_height"])
+        if cw == 0 or ch_ == 0:
+            cw = fr["dw"]; ch_ = fr["dh"]
+        out_w, out_h = _thumb_target_size(cw, ch_, BLEND_LONG_EDGE)
+        key = (session_id, idx, sigma_q, out_w, out_h)
+        cached = _BLEND_GRID_CACHE.get(key)
+        if cached is not None:
+            return cached, out_w, out_h
+        phone, model = _sample_phone_model_on_color_grid(
+            fr["body"], out_w=out_w, out_h=out_h, model_raw_arr=arr,
+        )
+        sigma_px = max(1.0, float(sigma_frac) * math.hypot(out_w, out_h))
+        blend, *_ = _compute_blend_metres(phone, model, sigma_px)
+        if len(_BLEND_GRID_CACHE) >= _BLEND_GRID_CACHE_MAX:
+            _BLEND_GRID_CACHE.pop(next(iter(_BLEND_GRID_CACHE)))
+        _BLEND_GRID_CACHE[key] = blend
+        return blend, out_w, out_h
 
     out_features = []
     for f in features_in:
@@ -2641,6 +2695,20 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
                 ms = _bilinear_sample_2d(arr, np.asarray([sx]), np.asarray([sy]))
                 m_val = float(ms[0])
                 model_d = m_val if (np.isfinite(m_val) and m_val > 1e-3) else None
+            # blend depth at (u, v). The blend grid was built in NATURAL
+            # display orientation (yo=0 is the top row, norm-view v=1),
+            # so to sample at norm-view (u, v) we flip v back to a row
+            # index: yo = (1 − v) · out_h.
+            blend_grid, b_w, b_h = get_blend_grid(idx)
+            if blend_grid is None:
+                blend_d = None
+            else:
+                bx = u * b_w - 0.5
+                by = (1.0 - v) * b_h - 0.5
+                bs = _bilinear_sample_2d(blend_grid,
+                                          np.asarray([bx]), np.asarray([by]))
+                b_val = float(bs[0])
+                blend_d = b_val if (np.isfinite(b_val) and b_val > 1e-3) else None
             # cam-Z distance from this frame's camera to triangulated P.
             cam_d = None
             if world is not None:
@@ -2653,6 +2721,7 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
                 "frame": idx, "u": u, "v": v,
                 "phone_depth": phone_d,
                 "model_depth": model_d,
+                "blend_depth": blend_d,
                 "cam_distance": cam_d,
             })
         out_features.append({

@@ -209,7 +209,13 @@
     <select id="depthKindSel">
       <option value="phone">phone (WebXR)</option>
       <option value="model">model (Depth-Anything-V2)</option>
+      <option value="blend">blend (phone low + model high)</option>
     </select>
+    <label for="sigmaSlider">σ</label>
+    <input id="sigmaSlider" type="range" min="0.005" max="0.15" step="0.005" value="0.03"
+           style="width: 100px; vertical-align: middle;"
+           title="Gaussian blur sigma as a fraction of the blend grid's diagonal — drives the blend depth values">
+    <span id="sigmaValue" class="stat" style="min-width: 4em;">3.0%</span>
     <button id="reloadBtn" class="secondary">Reload</button>
     <button id="clearFeaturesBtn" class="secondary" title="Forget all features">Clear features</button>
     <button id="skipBtn" class="secondary" title="Skip the next click slot (so the current feature ends without a corresponding point on this frame). Hotkey: Space">Skip ⏭</button>
