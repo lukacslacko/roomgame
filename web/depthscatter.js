@@ -99,7 +99,7 @@ function populatePosePicker() {
 
 async function refreshFrameManifest() {
   const sid = sessionSel.value;
-  if (!sid) { frameManifest = null; renderThumbsPanel(); return; }
+  if (!sid) { frameManifest = null; renderThumbsPanel(); applyFrameAspect(); return; }
   try {
     const r = await fetch(`/captures/${encodeURIComponent(sid)}/frame-manifest?variant=frames`);
     frameManifest = r.ok ? await r.json() : null;
@@ -108,6 +108,19 @@ async function refreshFrameManifest() {
     frameManifest = null;
   }
   renderThumbsPanel();
+  applyFrameAspect();
+}
+
+// Set --frame-ar so the image panels size themselves to the captured
+// portrait aspect. All frames in a session share dims so reading the
+// first one is enough; default falls back to typical phone portrait.
+function applyFrameAspect() {
+  const f = frameManifest?.frames?.[0];
+  if (!f?.color) return;
+  const [w, h] = f.color;
+  if (w > 0 && h > 0) {
+    document.documentElement.style.setProperty("--frame-ar", `${w} / ${h}`);
+  }
 }
 
 function renderThumbsPanel() {
@@ -332,25 +345,40 @@ function drawScatter(pairs) {
   // Points outside the window simply don't get drawn.
   const xLo = pct(xs, 0.01), xHi = pct(xs, 0.99);
   const yLo = pct(ys, 0.01), yHi = pct(ys, 0.99);
-  // Use a shared range across both axes so y=x reads naturally as
-  // "phone agrees with model in metres". This is the canonical view
-  // even though phone is metres and model_raw is in DA-V2's native
-  // units — viewers can read the scale off the axes.
+  // Use a shared range across both axes — both `min` and `max` are
+  // identical for x and y. With the same data range AND the same
+  // pixel scale (computed below) the y=x diagonal renders at exactly
+  // 45° regardless of the panel's aspect.
   const allLo = Math.min(xLo, yLo);
   const allHi = Math.max(xHi, yHi);
   const span  = Math.max(0.1, allHi - allLo);
   const min   = Math.max(0, allLo - 0.05 * span);
   const max   = allHi + 0.05 * span;
 
-  const sx = (x) => padL + (x - min) / (max - min) * (W - padL - padR);
-  const sy = (y) => H - padB - (y - min) / (max - min) * (H - padT - padB);
+  // Equal data-to-pixel scaling: pick the smaller of the available
+  // width/height in pixels and use it for both axes. The plot region
+  // is then a centred square inside the panel — the diagonal looks
+  // 45° as required, and labels still fit in the padding gutters.
+  const usableW = W - padL - padR;
+  const usableH = H - padT - padB;
+  const side    = Math.max(20, Math.min(usableW, usableH));
+  const scale   = side / (max - min);
+  // Centre the plot region within the available area.
+  const x0 = padL + Math.max(0, (usableW - side) / 2);
+  const y1 = H - padB - Math.max(0, (usableH - side) / 2);
 
+  const sx = (x) => x0 + (x - min) * scale;
+  const sy = (y) => y1 - (y - min) * scale;
+
+  // Plot square's bounds (drawn in viewBox units, which equal CSS px).
+  const xR = x0 + side;
+  const yT = y1 - side;
   const NS = "http://www.w3.org/2000/svg";
   const axis = document.createElementNS(NS, "g");
   axis.setAttribute("class", "axis");
-  axis.appendChild(makeLine(NS, padL, padT, padL, H - padB));            // y axis
-  axis.appendChild(makeLine(NS, padL, H - padB, W - padR, H - padB));    // x axis
-  // y=x diagonal — useful reference for "phone matches model".
+  axis.appendChild(makeLine(NS, x0, yT, x0, y1));                  // y axis
+  axis.appendChild(makeLine(NS, x0, y1, xR, y1));                  // x axis
+  // y=x diagonal — with equal axis scaling this is exactly 45°.
   axis.appendChild(makeLine(NS, sx(min), sy(min), sx(max), sy(max), "yx"));
   // Tick labels at 4 even points.
   for (let k = 0; k <= 3; k++) {
@@ -359,35 +387,36 @@ function drawScatter(pairs) {
     const yt = sy(t);
     const lblX = document.createElementNS(NS, "text");
     lblX.setAttribute("x", xt);
-    lblX.setAttribute("y", H - padB + 14);
+    lblX.setAttribute("y", y1 + 14);
     lblX.setAttribute("text-anchor", "middle");
     lblX.textContent = t.toFixed(2);
     axis.appendChild(lblX);
     const lblY = document.createElementNS(NS, "text");
-    lblY.setAttribute("x", padL - 4);
+    lblY.setAttribute("x", x0 - 4);
     lblY.setAttribute("y", yt + 3);
     lblY.setAttribute("text-anchor", "end");
     lblY.textContent = t.toFixed(2);
     axis.appendChild(lblY);
     if (k > 0 && k < 3) {
-      axis.appendChild(makeLine(NS, padL, yt, W - padR, yt, "gridline"));
-      axis.appendChild(makeLine(NS, xt, padT, xt, H - padB, "gridline"));
+      axis.appendChild(makeLine(NS, x0, yt, xR, yt, "gridline"));
+      axis.appendChild(makeLine(NS, xt, yT, xt, y1, "gridline"));
     }
   }
   svg.appendChild(axis);
 
-  // Axis labels.
+  // Axis labels — pinned to the corners of the plot square so they
+  // stay readable even when the panel is letterboxed.
   const xlbl = document.createElementNS(NS, "text");
   xlbl.setAttribute("class", "axis-label");
-  xlbl.setAttribute("x", W - padR);
-  xlbl.setAttribute("y", H - padB - 4);
+  xlbl.setAttribute("x", xR);
+  xlbl.setAttribute("y", y1 - 4);
   xlbl.setAttribute("text-anchor", "end");
   xlbl.textContent = "phone depth (m)";
   svg.appendChild(xlbl);
   const ylbl = document.createElementNS(NS, "text");
   ylbl.setAttribute("class", "axis-label");
-  ylbl.setAttribute("x", padL + 4);
-  ylbl.setAttribute("y", padT + 10);
+  ylbl.setAttribute("x", x0 + 4);
+  ylbl.setAttribute("y", yT + 10);
   ylbl.setAttribute("text-anchor", "start");
   ylbl.textContent = "model raw";
   svg.appendChild(ylbl);

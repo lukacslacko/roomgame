@@ -76,16 +76,20 @@
       pointer-events: none;
     }
 
-    /* Main grid: 2×2 panels filling remaining space. */
+    /* Main strip: panels arranged left-to-right. Image panels sit at
+       the captured frames' portrait aspect (set from the manifest as
+       --frame-ar; see depthscatter.js); the scatter panel takes the
+       remaining horizontal space so on typical laptop displays it
+       ends up roughly square. */
     #content-area {
       flex: 1 1 0; min-width: 0;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      grid-template-rows: 1fr 1fr;
+      display: flex;
+      flex-direction: row;
       gap: 6px;
       padding: 6px;
       background: #07070b;
       min-height: 0;
+      overflow: hidden;
     }
     .panel {
       position: relative;
@@ -95,6 +99,19 @@
       overflow: hidden;
       display: flex; align-items: center; justify-content: center;
       min-width: 0; min-height: 0;
+      height: 100%;
+    }
+    /* Image panels at the captured frame's aspect (default to typical
+       phone portrait until the manifest tells us otherwise). flex: 0 1
+       lets them shrink when the viewport is narrow, but normally the
+       browser sizes them to height × ar. */
+    .panel.image-panel {
+      flex: 0 1 auto;
+      aspect-ratio: var(--frame-ar, 9 / 19.5);
+    }
+    .panel.scatter {
+      flex: 1 1 0;
+      min-width: 200px;
     }
     .panel .panel-tag {
       position: absolute; left: 8px; top: 8px;
@@ -188,19 +205,19 @@
   <div class="main-row">
     <aside id="thumbsPanel"></aside>
     <div id="content-area">
-      <div class="panel rgb" id="panelRgb">
+      <div class="panel image-panel rgb" id="panelRgb">
         <span class="panel-tag">RGB</span>
         <div class="panel-img-wrap">
           <span class="panel-empty">(no frame selected)</span>
         </div>
       </div>
-      <div class="panel" id="panelPhone">
+      <div class="panel image-panel" id="panelPhone">
         <span class="panel-tag">phone depth</span>
         <div class="panel-img-wrap">
           <span class="panel-empty">—</span>
         </div>
       </div>
-      <div class="panel" id="panelModel">
+      <div class="panel image-panel" id="panelModel">
         <span class="panel-tag">model depth</span>
         <div class="panel-img-wrap">
           <span class="panel-empty">—</span>
