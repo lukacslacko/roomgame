@@ -899,9 +899,11 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 sigma_frac = 0.03
             sigma_frac = max(0.001, min(0.20, sigma_frac))
+            model_version = _resolve_model_version(qs)
             self._handle_frame_thumb(m.group(1), variant_dir, int(m.group(2)),
                                        kind, long_edge=long_edge,
-                                       sigma_frac=sigma_frac)
+                                       sigma_frac=sigma_frac,
+                                       model_version=model_version)
             return
 
         # /captures/<id>/frame-voxels/<idx>.json?variant=<vd>
@@ -943,9 +945,11 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 sigma_frac = 0.03
             sigma_frac = max(0.001, min(0.20, sigma_frac))
+            model_version = _resolve_model_version(qs)
             self._handle_depth_scatter(m.group(1), variant_dir, int(m.group(2)),
                                         max_samples=max_samples,
-                                        sigma_frac=sigma_frac)
+                                        sigma_frac=sigma_frac,
+                                        model_version=model_version)
             return
 
         # /captures/<id>/frame-feature-voxels/<idx>.json[?variant=features|features_aligned|...]
@@ -970,7 +974,11 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             r"/captures/([A-Za-z0-9_\-]{1,64})/pixel-cloud-status", path,
         )
         if m:
-            self._handle_pixel_cloud_status(m.group(1))
+            qs = parse_qs(purl.query)
+            self._handle_pixel_cloud_status(
+                m.group(1),
+                model_version=_resolve_model_version(qs),
+            )
             return
 
         # /captures/<id>/common-features?frames=1,17,33&pose_dir=frames
@@ -1080,9 +1088,11 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 sigma_frac = 0.03
             sigma_frac = max(0.001, min(0.20, sigma_frac))
+            model_version = _resolve_model_version(qs)
             self._handle_triplet_distances(
                 m.group(1), pose_dir, features_json,
                 sigma_frac=sigma_frac,
+                model_version=model_version,
             )
             return
 
@@ -1175,10 +1185,12 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 sigma_frac = 0.03
             sigma_frac = max(0.001, min(0.20, sigma_frac))
+            model_version = _resolve_model_version(qs)
             self._handle_pixel_cloud(
                 m.group(1), int(m.group(2)),
                 pose_dir, depth_kind, stride, near, far,
                 sigma_frac=sigma_frac,
+                model_version=model_version,
             )
             return
 
@@ -1227,7 +1239,8 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_frame_thumb(self, session_id: str, variant_dir: str,
                              idx: int, kind: str, *, long_edge: int = 600,
-                             sigma_frac: float = 0.03) -> None:
+                             sigma_frac: float = 0.03,
+                             model_version: str = "v2") -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(variant_dir):
             self.send_response(404); self.end_headers(); return
         if kind not in ("color", "depth", "phone", "model", "diff", "blend"):
@@ -1235,10 +1248,15 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         # Cache by long_edge as well so the triplet (full-res) and the
         # voxelview panel (600 px) thumbs don't evict each other.
         # For kind=blend, sigma is also part of the key but quantised so
-        # a stream of slider ticks doesn't bloat the cache.
+        # a stream of slider ticks doesn't bloat the cache. model_version
+        # is part of the key for any kind that reads model_raw.
         if kind == "blend":
             sigma_q = round(float(sigma_frac), 3)
-            cache_key = (session_id, variant_dir, idx, kind, long_edge, sigma_q)
+            cache_key = (session_id, variant_dir, idx, kind, long_edge,
+                         sigma_q, model_version)
+        elif kind in ("model", "diff"):
+            cache_key = (session_id, variant_dir, idx, kind, long_edge,
+                         model_version)
         else:
             cache_key = (session_id, variant_dir, idx, kind, long_edge)
         png = _THUMB_CACHE.get(cache_key)
@@ -1255,11 +1273,14 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 elif kind == "phone":
                     png = _render_phone_color_thumb(body, size=long_edge)
                 else:  # model / diff / blend — all need the cached prediction
-                    arr = _load_model_raw_array(session_id, idx)
+                    arr = _load_model_raw_array(session_id, idx,
+                                                  model_version=model_version)
                     if arr is None:
+                        mv_flag = ("" if model_version == "v2"
+                                    else f" --model-version {model_version}")
                         self._send_text(409,
-                            "model_raw cache missing — run "
-                            f"tools/cache_model_raw.py --session {session_id}\n")
+                            f"model_raw ({model_version}) cache missing — run "
+                            f"tools/cache_model_raw.py --session {session_id}{mv_flag}\n")
                         return
                     if kind == "model":
                         png = _render_model_color_thumb(body, arr, size=long_edge)
@@ -1287,7 +1308,8 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_depth_scatter(self, session_id: str, variant_dir: str,
                                 idx: int, *, max_samples: int,
-                                sigma_frac: float) -> None:
+                                sigma_frac: float,
+                                model_version: str = "v2") -> None:
         """Per-pixel paired depth samples for one frame, on the colour-image
         grid: both (phone, model_raw) and (phone, blend_metres) pairs plus
         Pearson + Spearman computed over ALL valid pixels (the wire
@@ -1305,11 +1327,12 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         if not f.exists():
             self._send_text(404, f"frame missing: {variant_dir}/frame_{idx:06d}.bin\n")
             return
-        arr = _load_model_raw_array(session_id, idx)
+        arr = _load_model_raw_array(session_id, idx, model_version=model_version)
         if arr is None:
+            mv_flag = "" if model_version == "v2" else f" --model-version {model_version}"
             self._send_text(409,
-                "model_raw cache missing — run "
-                f"tools/cache_model_raw.py --session {session_id}\n")
+                f"model_raw ({model_version}) cache missing — run "
+                f"tools/cache_model_raw.py --session {session_id}{mv_flag}\n")
             return
         try:
             body = f.read_bytes()
@@ -1466,28 +1489,45 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
             "indices": indices,
         })
 
-    def _handle_pixel_cloud_status(self, session_id: str) -> None:
-        """Report whether captured_frames/<id>/model_raw/index.json is on
-        disk, plus the list of cached frame indices and the (cw, ch) of
-        each — the client uses this to gate the 'model depth' toggle and
-        to know each frame's color-grid resolution."""
+    def _handle_pixel_cloud_status(self, session_id: str,
+                                    *, model_version: str = "v2") -> None:
+        """Report whether the model_raw cache index.json for the requested
+        version is on disk, plus the list of cached frame indices and the
+        (cw, ch) of each — the client uses this to gate the 'model depth'
+        toggle and to know each frame's color-grid resolution. Also
+        echoes the picked model_version so the client knows whether v3 is
+        available; the response includes an `info` block read from
+        info.json when present (model_id, variant)."""
         if not SESSION_ID_RE.match(session_id):
             self.send_response(404); self.end_headers(); return
-        sess_dir = FRAMES_DIR / session_id
-        idx_path = sess_dir / "model_raw" / "index.json"
+        base = _model_raw_dir(session_id, model_version)
+        idx_path = base / "index.json"
+        info_path = base / "info.json"
         if not idx_path.exists():
-            self._send_json(200, {"ready": False, "frames": {}})
+            self._send_json(200, {
+                "ready": False, "frames": {}, "model_version": model_version,
+            })
             return
         try:
             payload = json.loads(idx_path.read_text())
         except (OSError, json.JSONDecodeError) as e:
             self._send_text(500, f"index.json read failed: {e}\n"); return
-        self._send_json(200, {"ready": True, "frames": payload})
+        info = None
+        if info_path.exists():
+            try:
+                info = json.loads(info_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                info = None
+        self._send_json(200, {
+            "ready": True, "frames": payload,
+            "model_version": model_version, "info": info,
+        })
 
     def _handle_pixel_cloud(self, session_id: str, idx: int,
                             pose_dir: str, depth_kind: str,
                             stride: int, near: float, far: float,
-                            *, sigma_frac: float = 0.03) -> None:
+                            *, sigma_frac: float = 0.03,
+                            model_version: str = "v2") -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
             self.send_response(404); self.end_headers(); return
         if depth_kind not in ("phone", "model", "blend"):
@@ -1496,8 +1536,9 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         if not f.exists():
             self._send_text(404, f"missing {pose_dir}/frame_{idx:06d}.bin\n"); return
         # Model-raw cache (needed for depth_kind=model and blend).
-        model_raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
-        model_raw_meta = FRAMES_DIR / session_id / "model_raw" / "index.json"
+        base = _model_raw_dir(session_id, model_version)
+        model_raw_path = base / f"frame_{idx:06d}.f16"
+        model_raw_meta = base / "index.json"
         needs_model = depth_kind in ("model", "blend")
         try:
             payload = _build_pixel_cloud_payload(
@@ -1609,7 +1650,8 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_triplet_distances(self, session_id: str,
                                    pose_dir: str, features_json: str,
-                                   *, sigma_frac: float = 0.03) -> None:
+                                   *, sigma_frac: float = 0.03,
+                                   model_version: str = "v2") -> None:
         if not SESSION_ID_RE.match(session_id) or not FRAME_VARIANT_RE.fullmatch(pose_dir):
             self.send_response(404); self.end_headers(); return
         try:
@@ -1625,6 +1667,7 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
                 pose_dir=pose_dir,
                 features_in=features_in,
                 sigma_frac=sigma_frac,
+                model_version=model_version,
             )
         except FileNotFoundError as e:
             self._send_text(409, f"{e}\n"); return
@@ -2203,13 +2246,40 @@ def _render_blend_color_thumb(body: bytes, model_raw_arr, *, size: int = 600,
     return buf.getvalue()
 
 
-def _load_model_raw_array(session_id: str, idx: int):
+# ─────────────────────── model_raw dir resolution ────────────────────────
+# Two parallel cache directories live side-by-side:
+#   captured_frames/<id>/model_raw/      Depth-Anything-V2 (default)
+#   captured_frames/<id>/model_raw_v3/   Depth-Anything-V3 (any variant)
+# tools/cache_model_raw.py writes to both depending on --model-version. The
+# user-facing routes (frame-thumb / pixel-cloud / depth-scatter / triplet-
+# distances / pixel-cloud-status) accept a `model_version=v2|v3` query
+# parameter that picks which directory to read from. The auto-tune routes
+# stay V2-only for now.
+
+_MODEL_RAW_DIRS = {"v2": "model_raw", "v3": "model_raw_v3"}
+
+
+def _model_raw_dir(session_id: str, model_version: str = "v2"):
+    sub = _MODEL_RAW_DIRS.get(model_version, _MODEL_RAW_DIRS["v2"])
+    return FRAMES_DIR / session_id / sub
+
+
+def _resolve_model_version(qs: dict) -> str:
+    """Pull `model_version` from a parsed query string. Accepts only
+    'v2' / 'v3'; anything else falls back to v2 silently."""
+    raw = (qs.get("model_version") or ["v2"])[0].lower()
+    return "v3" if raw == "v3" else "v2"
+
+
+def _load_model_raw_array(session_id: str, idx: int, model_version: str = "v2"):
     """Read the cached float16 model_raw prediction for one frame, plus
     its (cw, ch) from index.json. Returns (arr, cw, ch) or None if the
-    cache is missing for this frame."""
+    cache is missing for this frame. `model_version` selects between the
+    V2 and V3 cache directories."""
     import numpy as np
-    meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
-    raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+    base = _model_raw_dir(session_id, model_version)
+    meta_path = base / "index.json"
+    raw_path = base / f"frame_{idx:06d}.f16"
     if not meta_path.exists() or not raw_path.exists():
         return None
     try:
@@ -2567,7 +2637,8 @@ def _triangulate_rays(rays):
 
 def _triplet_distances_payload(*, session_id: str, pose_dir: str,
                                 features_in: list,
-                                sigma_frac: float = 0.03) -> dict:
+                                sigma_frac: float = 0.03,
+                                model_version: str = "v2") -> dict:
     """Compute, per feature, an LS-triangulated world point from the
     user's clicked marks, plus per-mark (phone_depth, model_depth,
     blend_depth, cam_distance_to_world_pt). Frames are decoded once and
@@ -2580,7 +2651,8 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
     import fusion  # noqa: E402
 
     frame_cache: dict[int, dict] = {}
-    model_meta_path = FRAMES_DIR / session_id / "model_raw" / "index.json"
+    model_base = _model_raw_dir(session_id, model_version)
+    model_meta_path = model_base / "index.json"
     model_meta: dict | None = None
     if model_meta_path.exists():
         try:
@@ -2629,7 +2701,7 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
         if entry is None:
             return None, 0, 0
         cw_c = int(entry["w"]); ch_c = int(entry["h"])
-        raw_path = FRAMES_DIR / session_id / "model_raw" / f"frame_{idx:06d}.f16"
+        raw_path = model_base / f"frame_{idx:06d}.f16"
         if not raw_path.exists():
             return None, 0, 0
         arr = (np.frombuffer(raw_path.read_bytes(), dtype=np.float16)
@@ -2649,7 +2721,7 @@ def _triplet_distances_payload(*, session_id: str, pose_dir: str,
         if cw == 0 or ch_ == 0:
             cw = fr["dw"]; ch_ = fr["dh"]
         out_w, out_h = _thumb_target_size(cw, ch_, BLEND_LONG_EDGE)
-        key = (session_id, idx, sigma_q, out_w, out_h)
+        key = (session_id, idx, sigma_q, out_w, out_h, model_version)
         cached = _BLEND_GRID_CACHE.get(key)
         if cached is not None:
             return cached, out_w, out_h

@@ -213,8 +213,15 @@
       <label for="pcDepthKindSel">depth</label>
       <select id="pcDepthKindSel">
         <option value="phone">phone (WebXR)</option>
-        <option value="model">model (Depth-Anything-V2)</option>
+        <option value="model">model</option>
         <option value="blend">blend (phone low + model high, σ=3%)</option>
+      </select>
+    </span>
+    <span class="pc-group" id="pcModelVersionGroup">
+      <label for="pcModelVersionSel">model</label>
+      <select id="pcModelVersionSel">
+        <option value="v2" selected>V2 (Metric Indoor Large)</option>
+        <option value="v3">V3 (Depth-Anything-3)</option>
       </select>
     </span>
     <span class="pc-group">

@@ -27,6 +27,7 @@ const panelClearBtn = document.getElementById("panelClearBtn");
 const pixelCloudBtn = document.getElementById("pixelCloudBtn");
 const pcToolbar = document.getElementById("pcToolbar");
 const pcDepthKindSel = document.getElementById("pcDepthKindSel");
+const pcModelVersionSel = document.getElementById("pcModelVersionSel");
 const pcPoseDirSel = document.getElementById("pcPoseDirSel");
 const pcStrideSel = document.getElementById("pcStrideSel");
 const pcASlider = document.getElementById("pcASlider");
@@ -1219,6 +1220,7 @@ function pcParams() {
     a:          parseFloat(pcASlider.value),
     b:          parseFloat(pcBSlider.value),
     fit_space:  pcFitSpaceSel.value,
+    model_version: (pcModelVersionSel?.value === "v3") ? "v3" : "v2",
   };
 }
 
@@ -1279,30 +1281,57 @@ function updatePcStatus() {
 async function refreshPcModelStatus() {
   const sid = sessionSel.value;
   if (!sid) { pcModelStatus = null; updatePcStatus(); return; }
-  try {
-    const r = await fetch(`/captures/${encodeURIComponent(sid)}/pixel-cloud-status`);
-    pcModelStatus = r.ok ? await r.json() : { ready: false, frames: {} };
-  } catch (e) {
-    console.warn("pixel-cloud-status fetch failed", e);
-    pcModelStatus = { ready: false, frames: {} };
+  // Probe the cache for the currently-selected model_version. Also probe
+  // the *other* version so we can label the picker accurately and let the
+  // user know whether switching is even an option.
+  const mv = (pcModelVersionSel?.value === "v3") ? "v3" : "v2";
+  const otherMv = (mv === "v2") ? "v3" : "v2";
+  async function probe(v) {
+    try {
+      const r = await fetch(
+        `/captures/${encodeURIComponent(sid)}/pixel-cloud-status`
+        + `?model_version=${v}`,
+      );
+      return r.ok ? await r.json() : { ready: false, frames: {} };
+    } catch (e) {
+      console.warn("pixel-cloud-status fetch failed", e);
+      return { ready: false, frames: {} };
+    }
   }
-  // Update the model option in the depth-kind dropdown to reflect cache state.
+  pcModelStatus = await probe(mv);
+  const otherStatus = await probe(otherMv);
+  // Annotate the model_version dropdown options with cache status so the
+  // user can see at a glance whether V3 is even worth selecting.
+  for (const opt of (pcModelVersionSel?.options || [])) {
+    const v = opt.value;
+    const status = (v === mv) ? pcModelStatus : otherStatus;
+    const n = Object.keys(status?.frames || {}).length;
+    const tag = status?.ready ? `${n} cached` : "no cache";
+    const baseLabel = (v === "v2")
+      ? "V2 (Metric Indoor Large)"
+      : "V3 (Depth-Anything-3)";
+    opt.textContent = `${baseLabel} — ${tag}`;
+    opt.disabled = false;
+  }
+  // Update the model/blend options in the depth-kind dropdown.
   const modelOpt = [...pcDepthKindSel.options].find((o) => o.value === "model");
   const blendOpt = [...pcDepthKindSel.options].find((o) => o.value === "blend");
+  const ready = !!pcModelStatus?.ready;
+  const nCached = Object.keys(pcModelStatus?.frames || {}).length;
+  const versionTag = (mv === "v3") ? "V3" : "V2";
   if (modelOpt) {
-    modelOpt.disabled = !pcModelStatus?.ready;
-    const n = Object.keys(pcModelStatus?.frames || {}).length;
-    modelOpt.textContent = pcModelStatus?.ready
-      ? `model (Depth-Anything-V2, ${n} cached)`
-      : "model (no cache — run cache_model_raw.py)";
+    modelOpt.disabled = !ready;
+    modelOpt.textContent = ready
+      ? `model (${versionTag}, ${nCached} cached)`
+      : `model (no ${versionTag} cache — run cache_model_raw.py)`;
   }
   if (blendOpt) {
-    blendOpt.disabled = !pcModelStatus?.ready;
-    blendOpt.textContent = pcModelStatus?.ready
-      ? "blend (phone low + model high, σ=3%)"
-      : "blend (no cache — run cache_model_raw.py)";
+    blendOpt.disabled = !ready;
+    blendOpt.textContent = ready
+      ? `blend (phone low + model ${versionTag} high, σ=3%)`
+      : `blend (no ${versionTag} cache — run cache_model_raw.py)`;
   }
-  if (!pcModelStatus?.ready
+  if (!ready
       && (pcDepthKindSel.value === "model" || pcDepthKindSel.value === "blend")) {
     pcDepthKindSel.value = "phone";
     syncPcAffineEnabled();
@@ -1344,10 +1373,12 @@ async function fetchPixelCloud(idx) {
   // fixed 3% sigma — no slider here. (Sigma can still be tuned on the
   // depth-scatter and stereo pages.)
   const sigmaQ = (p.depth_kind === "blend") ? "&sigma=0.03" : "";
+  const mvQ = (p.depth_kind === "model" || p.depth_kind === "blend")
+    ? `&model_version=${p.model_version}` : "";
   const url = `/captures/${encodeURIComponent(sid)}/pixel-cloud/${idx}.json`
     + `?depth_kind=${encodeURIComponent(p.depth_kind)}`
     + `&pose_dir=${encodeURIComponent(p.pose_dir)}`
-    + `&stride=${p.stride}${sigmaQ}`;
+    + `&stride=${p.stride}${sigmaQ}${mvQ}`;
   let r;
   try { r = await fetch(url); }
   catch (e) { console.warn("pixel-cloud fetch failed", e); return null; }
@@ -1514,6 +1545,14 @@ pixelCloudBtn.addEventListener("click", () => applyPcModeToggle());
 pcDepthKindSel.addEventListener("change", () => {
   syncPcAffineEnabled();
   refetchAllPcOverlays();
+});
+pcModelVersionSel?.addEventListener("change", () => {
+  // Re-probe the cache for the new version, then refetch any overlays
+  // that consume model/blend depth (phone overlays are unaffected).
+  refreshPcModelStatus().then(() => {
+    const k = pcDepthKindSel.value;
+    if (k === "model" || k === "blend") refetchAllPcOverlays();
+  });
 });
 pcPoseDirSel.addEventListener("change", () => {
   // Different pose set → different features_meta sidecar → refresh

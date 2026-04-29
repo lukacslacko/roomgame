@@ -7,6 +7,7 @@
 
 const sessionSel    = document.getElementById("sessionSel");
 const poseDirSel    = document.getElementById("poseDirSel");
+const modelVersionSel = document.getElementById("modelVersionSel");
 const reloadBtn     = document.getElementById("reloadBtn");
 const overlayRadios = document.querySelectorAll("input[name='overlay']");
 const overlayOpacity = document.getElementById("overlayOpacity");
@@ -184,13 +185,14 @@ function loadFrame() {
   const longEdge = 800;
   const base = `/captures/${encodeURIComponent(sid)}/frame-thumb/${idx}.png`;
   const qs = `variant=frames&long_edge=${longEdge}`;
+  const mv = `&model_version=${getModelVersion()}`;
 
   setRgbImg(`${base}?${qs}&kind=color`);
   applyOverlay(getOverlayMode(), idx, longEdge);
 
   setDepthImg(panelPhone, `${base}?${qs}&kind=phone`);
-  setDepthImg(panelModel, `${base}?${qs}&kind=model`);
-  setDepthImg(panelBlend, `${base}?${qs}&kind=blend&sigma=${getSigma()}`);
+  setDepthImg(panelModel, `${base}?${qs}&kind=model${mv}`);
+  setDepthImg(panelBlend, `${base}?${qs}&kind=blend&sigma=${getSigma()}${mv}`);
 
   fetchScatter(sid, idx, myToken);
 
@@ -199,6 +201,10 @@ function loadFrame() {
 
 function getSigma() {
   return parseFloat(sigmaSlider.value);
+}
+
+function getModelVersion() {
+  return (modelVersionSel?.value === "v3") ? "v3" : "v2";
 }
 
 // Re-fetch only the σ-dependent images. Used when the slider moves so
@@ -210,7 +216,8 @@ function refreshBlendOnly() {
   const longEdge = 800;
   const base = `/captures/${encodeURIComponent(sid)}/frame-thumb/${idx}.png`;
   const qs = `variant=frames&long_edge=${longEdge}`;
-  setDepthImg(panelBlend, `${base}?${qs}&kind=blend&sigma=${getSigma()}`);
+  const mv = `&model_version=${getModelVersion()}`;
+  setDepthImg(panelBlend, `${base}?${qs}&kind=blend&sigma=${getSigma()}${mv}`);
   if (getOverlayMode() === "blend") {
     applyOverlay("blend", idx, longEdge);
   }
@@ -282,9 +289,12 @@ function applyOverlay(mode, idx, longEdge) {
   const sid = sessionSel.value;
   if (sid == null) return;
   const base = `/captures/${encodeURIComponent(sid)}/frame-thumb/${idx}.png`;
-  // Blend depends on sigma; everything else is sigma-free.
+  // Blend depends on sigma; everything else is sigma-free. model_version
+  // is only meaningful for kinds that read the model_raw cache.
   const extra = (mode === "blend") ? `&sigma=${getSigma()}` : "";
-  const src = `${base}?variant=frames&long_edge=${longEdge}&kind=${mode}${extra}`;
+  const mv = (mode === "model" || mode === "diff" || mode === "blend")
+    ? `&model_version=${getModelVersion()}` : "";
+  const src = `${base}?variant=frames&long_edge=${longEdge}&kind=${mode}${extra}${mv}`;
   setOverlayImg(src);
 }
 
@@ -296,7 +306,8 @@ async function fetchScatter(sid, idx, token) {
   let r;
   try {
     r = await fetch(`/captures/${encodeURIComponent(sid)}/depth-scatter/${idx}.json`
-                    + `?max_samples=5000&sigma=${getSigma()}`);
+                    + `?max_samples=5000&sigma=${getSigma()}`
+                    + `&model_version=${getModelVersion()}`);
   } catch (e) {
     if (token === fetchToken) {
       stStatus.textContent = `frame #${idx} · scatter request failed`;
@@ -522,6 +533,11 @@ poseDirSel.addEventListener("change", () => {
   // frames/* dir). For now we only use pose_dir to scope the manifest,
   // so just re-fetch.
   refreshFrameManifest();
+});
+modelVersionSel?.addEventListener("change", () => {
+  // Re-render any depth panel that reads from the model_raw cache plus
+  // the scatter (both pairs depend on which model produced model_raw).
+  if (selectedFrame != null) loadFrame();
 });
 for (const r of overlayRadios) {
   r.addEventListener("change", () => {

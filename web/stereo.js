@@ -12,6 +12,7 @@ const sessionSel    = document.getElementById("sessionSel");
 const poseDirSel    = document.getElementById("poseDirSel");
 const depthKindSel  = document.getElementById("depthKindSel");
 const sigmaSlider   = document.getElementById("sigmaSlider");
+const modelVersionSel = document.getElementById("modelVersionSel");
 const sigmaValue    = document.getElementById("sigmaValue");
 const reloadBtn     = document.getElementById("reloadBtn");
 const clearFeaturesBtn = document.getElementById("clearFeaturesBtn");
@@ -620,6 +621,7 @@ async function refreshAllPlots() {
   const url = `/captures/${encodeURIComponent(sid)}/triplet-distances`
     + `?pose_dir=${encodeURIComponent(poseDirSel.value || "frames")}`
     + `&sigma=${getSigma()}`
+    + `&model_version=${getModelVersion()}`
     + `&features=${encodeURIComponent(JSON.stringify(featuresPayload))}`;
   let r;
   try { r = await fetch(url); }
@@ -888,9 +890,18 @@ sigmaSlider.addEventListener("input", () => {
 sigmaSlider.addEventListener("change", () => {
   if (depthKindSel.value === "blend") refreshAllPlots();
 });
+modelVersionSel?.addEventListener("change", () => {
+  // model_version affects model + blend depth values returned by
+  // /triplet-distances; phone is unaffected.
+  if (depthKindSel.value !== "phone") refreshAllPlots();
+});
 
 function getSigma() {
   return parseFloat(sigmaSlider.value);
+}
+
+function getModelVersion() {
+  return (modelVersionSel?.value === "v3") ? "v3" : "v2";
 }
 
 window.addEventListener("resize", () => redrawPlots());
