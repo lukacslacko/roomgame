@@ -208,8 +208,13 @@
     <label for="depthKindSel">depth values</label>
     <select id="depthKindSel">
       <option value="phone">phone (WebXR)</option>
-      <option value="model">model (Depth-Anything-V2)</option>
+      <option value="model">model</option>
       <option value="blend">blend (phone low + model high)</option>
+    </select>
+    <label for="modelVersionSel">model</label>
+    <select id="modelVersionSel">
+      <option value="v2" selected>V2</option>
+      <option value="v3">V3</option>
     </select>
     <label for="sigmaSlider">σ</label>
     <input id="sigmaSlider" type="range" min="0.005" max="0.15" step="0.005" value="0.03"
