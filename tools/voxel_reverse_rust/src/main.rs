@@ -36,6 +36,13 @@ enum DepthSource {
     /// model_raw high-frequency, in metres) at colour-image resolution.
     /// (u, v) maps directly to colour-grid pixels — no Bd indirection.
     Blend,
+    /// Cached model_raw values used directly as metric depth — no blend,
+    /// no OLS fit, no phone-depth interaction. Only meaningful when the
+    /// model_raw cache was produced by a metric model (V3 nested-giant
+    /// outputs metres directly; V3 metric needs the focal/300 scaling
+    /// already applied during caching). For V2 the values are roughly
+    /// metric but the per-frame scale wobbles.
+    Model,
 }
 
 /// Which family of monocular-depth cache the blend pulls from. The on-disk
@@ -232,6 +239,58 @@ fn parse_frame_with_blend(
         bd: phone.bd,
         cam_origin: phone.cam_origin,
         depth: blend,
+        color: phone.color,
+        w: cw_c, h: ch_c,
+        cw: phone.cw, ch: phone.ch,
+        uses_bd: false,
+    }))
+}
+
+/// Build a Frame whose depth source is the cached model_raw used
+/// directly (no blend, no scale fit). Only meaningful for caches
+/// produced by a metric model — e.g. V3 nested-giant outputs metres,
+/// V3 metric is post-scaled by cache_model_raw.py's focal/300 step.
+/// model_raw is at colour-image resolution and stored in GL row order
+/// (row 0 = scene bottom), same as the blend output, so we can plug
+/// it straight into `frame.depth` and reuse the blend-mode projection
+/// branch.
+fn parse_frame_with_model_only(
+    body: &[u8],
+    model_raw_path: &Path,
+    cw_c: usize,
+    ch_c: usize,
+) -> Result<Option<Frame>, String> {
+    let phone = match parse_frame(body)? {
+        Some(f) => f,
+        None    => return Ok(None),
+    };
+    if cw_c != phone.cw || ch_c != phone.ch {
+        return Err(format!(
+            "model_raw dims ({cw_c}×{ch_c}) don't match colour ({}×{})",
+            phone.cw, phone.ch,
+        ));
+    }
+    let bytes = match fs::read(model_raw_path) {
+        Ok(b) => b,
+        Err(e) => return Err(format!("model_raw read failed: {e}")),
+    };
+    if bytes.len() != cw_c * ch_c * 2 {
+        return Err(format!(
+            "model_raw size {} != {} expected",
+            bytes.len(), cw_c * ch_c * 2,
+        ));
+    }
+    let model_metres: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect();
+
+    Ok(Some(Frame {
+        v_inv: phone.v_inv,
+        p: phone.p,
+        bd: phone.bd,
+        cam_origin: phone.cam_origin,
+        depth: model_metres,
         color: phone.color,
         w: cw_c, h: ch_c,
         cw: phone.cw, ch: phone.ch,
@@ -704,8 +763,9 @@ impl Args {
                     a.depth_source = match args[i+1].as_str() {
                         "phone" => DepthSource::Phone,
                         "blend" => DepthSource::Blend,
+                        "model" => DepthSource::Model,
                         other => {
-                            eprintln!("--depth-source must be 'phone' or 'blend', got {other:?}");
+                            eprintln!("--depth-source must be 'phone', 'blend', or 'model', got {other:?}");
                             std::process::exit(2);
                         }
                     };
@@ -746,8 +806,12 @@ impl Args {
         [--voxel-size M] [--world-min X Y Z] [--world-max X Y Z] \\
         [--near M] [--far M] [--tol M] \\
         [--threshold R] [--min-color-count N] [--max-frames N] \\
-        [--depth-source phone|blend] [--blend-sigma 0.03] \\
-        [--model-version v2|v3]                  # which model_raw cache to read");
+        [--depth-source phone|blend|model] [--blend-sigma 0.03] \\
+        [--model-version v2|v3]                  # which model_raw cache to read \\
+        # 'model' uses model_raw values directly as metric depth (no blend);   \\
+        # only meaningful when the cache was produced by a metric model        \\
+        # (V3 nested-giant outputs metres, V3 metric is post-scaled in the     \\
+        # cache step; V2 is roughly metric but per-frame scale wobbles)");
                     std::process::exit(0);
                 }
                 other => {
@@ -803,13 +867,18 @@ fn run_pass(
     }
 
     // Decode frames in parallel.
-    let mode_label = if blend_ctx.is_some() { "phone+model→blend" } else { "phone" };
+    let mode_label = match args.depth_source {
+        DepthSource::Phone => "phone",
+        DepthSource::Blend => "phone+model→blend",
+        DepthSource::Model => "model_raw direct",
+    };
     println!("Decoding {} frames ({mode_label})…", frame_paths.len());
     let t_dec = Instant::now();
     let frames: Vec<Frame> = frame_paths.par_iter()
         .filter_map(|p| {
             // Extract idx from "frame_NNNNNN.bin" so we can look up the
-            // matching model_raw cache file when blending.
+            // matching model_raw cache file when blending or using the
+            // model values directly.
             let stem = p.file_stem().and_then(|s| s.to_str())?;
             let digits = stem.trim_start_matches("frame_");
             let idx: usize = digits.parse().ok()?;
@@ -820,9 +889,16 @@ fn run_pass(
                     return None;
                 }
             };
-            let parsed = match blend_ctx {
-                None => parse_frame(&bytes).map(|f| f),
-                Some(ctx) => {
+            let parsed = match args.depth_source {
+                DepthSource::Phone => parse_frame(&bytes).map(|f| f),
+                DepthSource::Blend | DepthSource::Model => {
+                    let ctx = match blend_ctx {
+                        Some(c) => c,
+                        None => {
+                            eprintln!("  internal error: blend/model mode without ctx");
+                            return None;
+                        }
+                    };
                     let dims = match ctx.model_dims.get(&idx) {
                         Some(d) => *d,
                         None => {
@@ -831,7 +907,11 @@ fn run_pass(
                         }
                     };
                     let raw_path = ctx.model_dir.join(format!("frame_{idx:06}.f16"));
-                    parse_frame_with_blend(&bytes, &raw_path, dims.0, dims.1, ctx.sigma_frac)
+                    if args.depth_source == DepthSource::Blend {
+                        parse_frame_with_blend(&bytes, &raw_path, dims.0, dims.1, ctx.sigma_frac)
+                    } else {
+                        parse_frame_with_model_only(&bytes, &raw_path, dims.0, dims.1)
+                    }
                 }
             };
             match parsed {
@@ -849,7 +929,11 @@ fn run_pass(
              t_dec.elapsed().as_secs_f64());
     if frames.is_empty() { return false; }
     if let Some(f0) = frames.first() {
-        let depth_label = if f0.uses_bd { "phone-depth" } else { "blend-depth" };
+        let depth_label = match args.depth_source {
+            DepthSource::Phone => "phone-depth",
+            DepthSource::Blend => "blend-depth",
+            DepthSource::Model => "model-depth",
+        };
         println!("  {} {}×{}, color {}×{}",
                  depth_label, f0.h, f0.w, f0.ch, f0.cw);
     }
@@ -968,14 +1052,45 @@ fn main() {
     println!("rayon threads: {}", rayon::current_num_threads());
 
     // Output filename suffix per (depth_source, model_version).
-    //   Phone           → ""
-    //   Blend + V2      → "_blended"      (unchanged: keeps existing filenames)
-    //   Blend + V3      → "_blended_v3"   (parallel to the V2 outputs)
+    //   Phone               → ""
+    //   Blend + V2          → "_blended"      (unchanged: keeps existing filenames)
+    //   Blend + V3          → "_blended_v3"
+    //   Model + V2          → "_model_v2"
+    //   Model + V3          → "_model_v3"     (V3 nested-giant is metric)
     let blend_suffix: &str = match (args.depth_source, args.model_version) {
         (DepthSource::Phone, _)                => "",
         (DepthSource::Blend, ModelVersion::V2) => "_blended",
         (DepthSource::Blend, ModelVersion::V3) => "_blended_v3",
+        (DepthSource::Model, ModelVersion::V2) => "_model_v2",
+        (DepthSource::Model, ModelVersion::V3) => "_model_v3",
     };
+
+    // Treat (--session AND --frames-dir AND --out) as ad-hoc mode with
+    // blend support: run a single custom dir → single output, but use
+    // <session>/model_raw{,_v3}/ as the model_raw cache source so the
+    // blend low-pass works. This is what tools/feature_pose_from_scratch.py
+    // expects when voxelizing its frames_pose_scratch/ output without
+    // having to add another hardcoded session-mode variant.
+    if args.session.is_some() && args.frames_dir.is_some() && args.out.is_some() {
+        let session_dir = args.frames_root.join(args.session.as_ref().unwrap());
+        let blend_ctx = match args.depth_source {
+            DepthSource::Phone => None,
+            DepthSource::Blend | DepthSource::Model => Some(
+                BlendContext::from_session(&session_dir, args.blend_sigma,
+                                            args.model_version)
+                    .unwrap_or_else(|e| {
+                        eprintln!("{:?} mode: {e}", args.depth_source);
+                        std::process::exit(1);
+                    })
+            ),
+        };
+        let frames_dir = args.frames_dir.as_ref().unwrap();
+        let out = args.out.as_ref().unwrap();
+        if !run_pass("custom", frames_dir, out, &args, blend_ctx.as_ref()) {
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Some(session_id) = &args.session {
         // Session mode: produce voxels_original.json from frames/, plus
@@ -997,11 +1112,11 @@ fn main() {
         let session_dir = args.frames_root.join(session_id);
         let blend_ctx = match args.depth_source {
             DepthSource::Phone => None,
-            DepthSource::Blend => Some(
+            DepthSource::Blend | DepthSource::Model => Some(
                 BlendContext::from_session(&session_dir, args.blend_sigma,
                                             args.model_version)
                     .unwrap_or_else(|e| {
-                        eprintln!("blend mode: {e}");
+                        eprintln!("{:?} mode: {e}", args.depth_source);
                         std::process::exit(1);
                     })
             ),
@@ -1060,10 +1175,12 @@ fn main() {
         }
     } else {
         // Ad-hoc mode (single dir → single output).
-        // Note: blend mode in ad-hoc mode is unsupported — there's no
-        // session_dir to pull the model_raw cache from. Reject early.
-        if args.depth_source == DepthSource::Blend {
-            eprintln!("--depth-source=blend requires --session (model_raw cache lives in <session>/model_raw/)");
+        // Note: blend / model mode in ad-hoc mode is unsupported —
+        // there's no session_dir to pull the model_raw cache from.
+        // Reject early.
+        if args.depth_source != DepthSource::Phone {
+            eprintln!("--depth-source={:?} requires --session (model_raw cache lives in <session>/model_raw{{,_v3}}/)",
+                       args.depth_source);
             std::process::exit(2);
         }
         let frames_dir = args.frames_dir.clone()
