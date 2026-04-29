@@ -45,25 +45,30 @@ enum DepthSource {
     Model,
 }
 
-/// Which family of monocular-depth cache the blend pulls from. The on-disk
-/// directory layout matches `tools/cache_model_raw.py`:
-///   V2 → `<session>/model_raw/`
-///   V3 → `<session>/model_raw_v3/`
-/// The cache contract (`index.json` + per-frame `frame_NNNNNN.f16` at
-/// colour-image resolution) is identical across versions, so the only
-/// thing that changes here is which directory we read from and what
-/// suffix we apply to the output JSON files.
+/// Which depth cache the blend / model-only pass reads from. The
+/// on-disk layout matches `tools/cache_model_raw.py` for V2 / V3
+/// and `tools/gsplat_depth.py` for Splat:
+///   V2     → `<session>/model_raw/`
+///   V3     → `<session>/model_raw_v3/`
+///   Splat  → `<session>/model_raw_splat/`     (3DGS-rendered depth)
+/// All three caches share the same contract: an `index.json` mapping
+/// idx → (cw, ch) plus per-frame `frame_NNNNNN.f16` of float16 metric
+/// depth at colour-image resolution in GL row order. The only thing
+/// that differs between variants is which directory we read from and
+/// what suffix we apply to the output JSON files.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ModelVersion {
     V2,
     V3,
+    Splat,
 }
 
 impl ModelVersion {
     fn cache_subdir(self) -> &'static str {
         match self {
-            ModelVersion::V2 => "model_raw",
-            ModelVersion::V3 => "model_raw_v3",
+            ModelVersion::V2    => "model_raw",
+            ModelVersion::V3    => "model_raw_v3",
+            ModelVersion::Splat => "model_raw_splat",
         }
     }
 }
@@ -776,8 +781,9 @@ impl Args {
                     a.model_version = match args[i+1].as_str() {
                         "v2" => ModelVersion::V2,
                         "v3" => ModelVersion::V3,
+                        "splat" => ModelVersion::Splat,
                         other => {
-                            eprintln!("--model-version must be 'v2' or 'v3', got {other:?}");
+                            eprintln!("--model-version must be 'v2', 'v3', or 'splat', got {other:?}");
                             std::process::exit(2);
                         }
                     };
@@ -1052,17 +1058,21 @@ fn main() {
     println!("rayon threads: {}", rayon::current_num_threads());
 
     // Output filename suffix per (depth_source, model_version).
-    //   Phone               → ""
-    //   Blend + V2          → "_blended"      (unchanged: keeps existing filenames)
-    //   Blend + V3          → "_blended_v3"
-    //   Model + V2          → "_model_v2"
-    //   Model + V3          → "_model_v3"     (V3 nested-giant is metric)
+    //   Phone                  → ""
+    //   Blend + V2             → "_blended"          (unchanged: keeps existing filenames)
+    //   Blend + V3             → "_blended_v3"
+    //   Blend + Splat          → "_blended_splat"
+    //   Model + V2             → "_model_v2"
+    //   Model + V3             → "_model_v3"         (V3 nested-giant is metric)
+    //   Model + Splat          → "_model_splat"      (3DGS-rendered metric depth)
     let blend_suffix: &str = match (args.depth_source, args.model_version) {
-        (DepthSource::Phone, _)                => "",
-        (DepthSource::Blend, ModelVersion::V2) => "_blended",
-        (DepthSource::Blend, ModelVersion::V3) => "_blended_v3",
-        (DepthSource::Model, ModelVersion::V2) => "_model_v2",
-        (DepthSource::Model, ModelVersion::V3) => "_model_v3",
+        (DepthSource::Phone, _)                   => "",
+        (DepthSource::Blend, ModelVersion::V2)    => "_blended",
+        (DepthSource::Blend, ModelVersion::V3)    => "_blended_v3",
+        (DepthSource::Blend, ModelVersion::Splat) => "_blended_splat",
+        (DepthSource::Model, ModelVersion::V2)    => "_model_v2",
+        (DepthSource::Model, ModelVersion::V3)    => "_model_v3",
+        (DepthSource::Model, ModelVersion::Splat) => "_model_splat",
     };
 
     // Treat (--session AND --frames-dir AND --out) as ad-hoc mode with
