@@ -1,0 +1,10 @@
+# Copy to config.sh and edit. config.sh is gitignored.
+WIN11_HOST=192.168.1.213
+WIN11_USER=changeme
+# Repo path on Win11. If using git-bash use /c/Users/.../roomgame.
+# If using WSL use /home/.../roomgame and set WIN11_SHELL=wsl.
+WIN11_REPO=/c/Users/changeme/roomgame
+# One of: gitbash | wsl | powershell. Picks the remote shell for `run`.
+WIN11_SHELL=gitbash
+# Optional: extra ssh args (e.g. -i ~/.ssh/id_ed25519_win11).
+WIN11_SSH_ARGS=
