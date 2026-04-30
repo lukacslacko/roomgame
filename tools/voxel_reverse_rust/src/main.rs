@@ -46,12 +46,14 @@ enum DepthSource {
 }
 
 /// Which depth cache the blend / model-only pass reads from. The
-/// on-disk layout matches `tools/cache_model_raw.py` for V2 / V3
-/// and `tools/gsplat_depth.py` for Splat:
-///   V2     → `<session>/model_raw/`
-///   V3     → `<session>/model_raw_v3/`
-///   Splat  → `<session>/model_raw_splat/`     (3DGS-rendered depth)
-/// All three caches share the same contract: an `index.json` mapping
+/// on-disk layout matches `tools/cache_model_raw.py` for V2 / V3,
+/// `tools/gsplat_depth.py` for Splat, and `tools/gsplat_train_cuda.py`
+/// for SplatCuda:
+///   V2        → `<session>/model_raw/`
+///   V3        → `<session>/model_raw_v3/`
+///   Splat     → `<session>/model_raw_splat/`        (POC, MPS / CPU)
+///   SplatCuda → `<session>/model_raw_splat_cuda/`   (proper gsplat lib)
+/// All variants share the same contract: an `index.json` mapping
 /// idx → (cw, ch) plus per-frame `frame_NNNNNN.f16` of float16 metric
 /// depth at colour-image resolution in GL row order. The only thing
 /// that differs between variants is which directory we read from and
@@ -61,14 +63,16 @@ enum ModelVersion {
     V2,
     V3,
     Splat,
+    SplatCuda,
 }
 
 impl ModelVersion {
     fn cache_subdir(self) -> &'static str {
         match self {
-            ModelVersion::V2    => "model_raw",
-            ModelVersion::V3    => "model_raw_v3",
-            ModelVersion::Splat => "model_raw_splat",
+            ModelVersion::V2        => "model_raw",
+            ModelVersion::V3        => "model_raw_v3",
+            ModelVersion::Splat     => "model_raw_splat",
+            ModelVersion::SplatCuda => "model_raw_splat_cuda",
         }
     }
 }
@@ -782,8 +786,9 @@ impl Args {
                         "v2" => ModelVersion::V2,
                         "v3" => ModelVersion::V3,
                         "splat" => ModelVersion::Splat,
+                        "splat-cuda" => ModelVersion::SplatCuda,
                         other => {
-                            eprintln!("--model-version must be 'v2', 'v3', or 'splat', got {other:?}");
+                            eprintln!("--model-version must be 'v2', 'v3', 'splat', or 'splat-cuda', got {other:?}");
                             std::process::exit(2);
                         }
                     };
@@ -813,7 +818,7 @@ impl Args {
         [--near M] [--far M] [--tol M] \\
         [--threshold R] [--min-color-count N] [--max-frames N] \\
         [--depth-source phone|blend|model] [--blend-sigma 0.03] \\
-        [--model-version v2|v3]                  # which model_raw cache to read \\
+        [--model-version v2|v3|splat|splat-cuda] # which model_raw cache to read \\
         # 'model' uses model_raw values directly as metric depth (no blend);   \\
         # only meaningful when the cache was produced by a metric model        \\
         # (V3 nested-giant outputs metres, V3 metric is post-scaled in the     \\
@@ -1066,13 +1071,15 @@ fn main() {
     //   Model + V3             → "_model_v3"         (V3 nested-giant is metric)
     //   Model + Splat          → "_model_splat"      (3DGS-rendered metric depth)
     let blend_suffix: &str = match (args.depth_source, args.model_version) {
-        (DepthSource::Phone, _)                   => "",
-        (DepthSource::Blend, ModelVersion::V2)    => "_blended",
-        (DepthSource::Blend, ModelVersion::V3)    => "_blended_v3",
-        (DepthSource::Blend, ModelVersion::Splat) => "_blended_splat",
-        (DepthSource::Model, ModelVersion::V2)    => "_model_v2",
-        (DepthSource::Model, ModelVersion::V3)    => "_model_v3",
-        (DepthSource::Model, ModelVersion::Splat) => "_model_splat",
+        (DepthSource::Phone, _)                       => "",
+        (DepthSource::Blend, ModelVersion::V2)        => "_blended",
+        (DepthSource::Blend, ModelVersion::V3)        => "_blended_v3",
+        (DepthSource::Blend, ModelVersion::Splat)     => "_blended_splat",
+        (DepthSource::Blend, ModelVersion::SplatCuda) => "_blended_splat_cuda",
+        (DepthSource::Model, ModelVersion::V2)        => "_model_v2",
+        (DepthSource::Model, ModelVersion::V3)        => "_model_v3",
+        (DepthSource::Model, ModelVersion::Splat)     => "_model_splat",
+        (DepthSource::Model, ModelVersion::SplatCuda) => "_model_splat_cuda",
     };
 
     // Treat (--session AND --frames-dir AND --out) as ad-hoc mode with

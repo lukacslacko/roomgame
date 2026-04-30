@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomgame · Splat viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    html, body.viewer { height: 100vh; max-height: 100vh; overflow: hidden; }
+    body.viewer { display: flex; flex-direction: column; background: #07070b; }
+    .toolbar {
+      display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;
+      padding: 0.55rem 1rem; background: #111; border-bottom: 1px solid #222;
+      font-size: 0.9rem;
+    }
+    .toolbar select, .toolbar input[type="number"] {
+      background: #1f1f24; color: #d8e1ff; border: 1px solid #353541;
+      border-radius: 0.3rem; padding: 0.25rem 0.4rem; font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .toolbar label { opacity: 0.7; font-size: 0.82rem; }
+    .toolbar .spacer { flex: 1; }
+    .toolbar .stat { opacity: 0.75; font-variant-numeric: tabular-nums; }
+    .toolbar .stat b { color: #6ec4ff; font-weight: 500; }
+    #stage { flex: 1 1 0; min-height: 0; position: relative; overflow: hidden; }
+    #stage canvas { display: block; width: 100% !important; height: 100% !important; }
+    #status {
+      position: absolute; left: 12px; top: 12px;
+      background: rgba(10, 10, 16, 0.8);
+      color: #d8e1ff; padding: 0.4rem 0.7rem;
+      border-radius: 0.35rem; font-size: 0.85rem;
+      pointer-events: none; max-width: 60ch;
+    }
+    .hint {
+      position: absolute; right: 12px; bottom: 12px;
+      background: rgba(10, 10, 16, 0.8);
+      color: #d8e1ff; padding: 0.5rem 0.75rem;
+      border-radius: 0.35rem; font-size: 0.78rem;
+      pointer-events: none; line-height: 1.4;
+    }
+    .hint kbd {
+      background: #1f1f24; border: 1px solid #353541;
+      border-radius: 0.2rem; padding: 0 0.3rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+    }
+  }
+  </script>
+</head>
+<body class="viewer">
+  <div class="toolbar">
+    <label for="sessionSel">session</label>
+    <select id="sessionSel"><option>(loading…)</option></select>
+    <label for="cacheSel">splat cache</label>
+    <select id="cacheSel">
+      <option value="model_raw_splat_cuda">CUDA gsplat (proper)</option>
+      <option value="model_raw_splat">POC (MPS hand-rolled)</option>
+    </select>
+    <button id="reloadBtn" class="secondary">Load</button>
+    <span class="spacer"></span>
+    <span class="stat" id="stMsg">choose a session →</span>
+  </div>
+  <div id="stage">
+    <div id="status">Initializing…</div>
+    <div class="hint">
+      <kbd>drag</kbd> orbit ·
+      <kbd>scroll</kbd> zoom ·
+      <kbd>shift+drag</kbd> pan ·
+      <kbd>R</kbd> reset
+    </div>
+  </div>
+  <script type="module">
+    import * as THREE from "three";
+    import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
+
+    const stage = document.getElementById("stage");
+    const status = document.getElementById("status");
+    const stMsg = document.getElementById("stMsg");
+    const sessionSel = document.getElementById("sessionSel");
+    const cacheSel = document.getElementById("cacheSel");
+    const reloadBtn = document.getElementById("reloadBtn");
+
+    let viewer = null;
+
+    function setStatus(msg) {
+      status.textContent = msg;
+      status.style.display = msg ? "block" : "none";
+    }
+
+    async function loadSessions() {
+      const r = await fetch("/sessions");
+      if (!r.ok) { stMsg.textContent = "no /sessions endpoint"; return; }
+      const data = await r.json();
+      const sids = (data.sessions || []).map(s => s.id || s).sort().reverse();
+      sessionSel.innerHTML = "";
+      for (const s of sids) {
+        const o = document.createElement("option");
+        o.value = s; o.textContent = s;
+        sessionSel.appendChild(o);
+      }
+      if (sids.length) sessionSel.value = sids[0];
+    }
+
+    async function disposeViewer() {
+      if (!viewer) return;
+      try { await viewer.dispose(); } catch (e) { /* best-effort */ }
+      viewer = null;
+      // Belt-and-braces: nuke stray canvases the library may have left behind.
+      stage.querySelectorAll("canvas").forEach(c => c.remove());
+    }
+
+    async function loadSplat() {
+      const session = sessionSel.value;
+      const cache = cacheSel.value;
+      if (!session) return;
+      setStatus(`Loading ${session} / ${cache}…`);
+      stMsg.textContent = `loading ${cache}`;
+      await disposeViewer();
+      const url = `/captures/${session}/splat.bin?cache=${cache}`;
+      try {
+        // Fetch metadata first so we can show byte / Gaussian count before
+        // the stream starts, and detect 404 cleanly without downloading the
+        // (possibly huge) blob just to check it exists.
+        const infoUrl = `/captures/${session}/splat-info?cache=${cache}`;
+        const probe = await fetch(infoUrl);
+        if (!probe.ok) {
+          setStatus(`No splat.bin at ${cache} (HTTP ${probe.status}). ` +
+                    `Run tools/gsplat_train_cuda.py --session ${session} ` +
+                    `--out-cache ${cache} on the compute box first.`);
+          stMsg.textContent = `not found in ${cache}`;
+          return;
+        }
+        const meta = await probe.json();
+        stMsg.textContent = `${meta.n_gaussians.toLocaleString()} Gaussians ` +
+                              `(${(meta.bytes/1e6).toFixed(1)} MB)`;
+
+        viewer = new GaussianSplats3D.Viewer({
+          rootElement: stage,
+          cameraUp: [0, 1, 0],
+          initialCameraPosition: [0, 0.6, 2.5],
+          initialCameraLookAt: [0, 0.6, 0],
+          sphericalHarmonicsDegree: 0,
+          sharedMemoryForWorkers: false,  // file:// + cross-origin safety
+        });
+        await viewer.addSplatScene(url, {
+          format: GaussianSplats3D.SceneFormat.Splat,
+          splatAlphaRemovalThreshold: 5,
+          showLoadingUI: true,
+          progressiveLoad: true,
+        });
+        viewer.start();
+        setStatus("");
+      } catch (e) {
+        console.error(e);
+        setStatus(`Load failed: ${e.message || e}`);
+        stMsg.textContent = "load error";
+      }
+    }
+
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "r" || ev.key === "R") {
+        if (viewer) viewer.resetCamera?.();
+      }
+    });
+
+    reloadBtn.addEventListener("click", loadSplat);
+    sessionSel.addEventListener("change", () => { stMsg.textContent = "press Load"; });
+    cacheSel.addEventListener("change", () => { stMsg.textContent = "press Load"; });
+
+    await loadSessions();
+    // Auto-load the most recent session if its splat.bin exists, otherwise
+    // just leave the user to pick.
+    if (sessionSel.value) {
+      const probe = await fetch(`/captures/${sessionSel.value}/splat.bin?cache=${cacheSel.value}`,
+                                  { method: "HEAD" });
+      if (probe.ok) loadSplat();
+      else setStatus(`No splat.bin at ${cacheSel.value} for the most recent session. ` +
+                      `Pick another or train one.`);
+    }
+  </script>
+</body>
+</html>

@@ -819,6 +819,46 @@ class RoomgameHandler(http.server.SimpleHTTPRequestHandler):
         purl = urlparse(self.path)
         path = purl.path or "/"
 
+        # /captures/<id>/splat.bin?cache=<dirname> — raw .splat blob exported
+        # by tools/gsplat_train_cuda.py for the in-browser splat viewer.
+        # /captures/<id>/splat-info?cache=<dirname> — JSON metadata (size,
+        # Gaussian count, info.json contents) for that same splat.
+        m = re.fullmatch(
+            r"/captures/([A-Za-z0-9_\-]{1,64})/splat(\.bin|-info)", path,
+        )
+        if m:
+            session_id, kind = m.group(1), m.group(2)
+            qs = parse_qs(purl.query)
+            cache = (qs.get("cache") or ["model_raw_splat_cuda"])[0]
+            if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", cache):
+                self.send_response(400); self.end_headers(); return
+            cache_dir = FRAMES_DIR / session_id / cache
+            f = cache_dir / "splat.bin"
+            if not f.exists() or not f.is_file():
+                self.send_response(404); self.end_headers(); return
+            if kind == "-info":
+                size = f.stat().st_size
+                info_path = cache_dir / "info.json"
+                info = {}
+                if info_path.exists():
+                    try:
+                        info = json.loads(info_path.read_text())
+                    except Exception:
+                        info = {}
+                meta = {"bytes": size, "n_gaussians": size // 32, "info": info}
+                self._send_json(200, meta); return
+            try:
+                body = f.read_bytes()
+            except OSError as e:
+                self._send_text(500, f"read failed: {e}\n"); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         # /captures/<id>/voxels_<variant>.json — kept for the voxel viewer.
         m = re.fullmatch(
             r"/captures/([A-Za-z0-9_\-]{1,64})/voxels_([A-Za-z0-9_\-]{1,32})\.json",
