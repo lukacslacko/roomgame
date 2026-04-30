@@ -35,35 +35,37 @@ source "$CONFIG"
 
 ssh_target="$WIN11_USER@$WIN11_HOST"
 # shellcheck disable=SC2206
-ssh_args=( $WIN11_SSH_ARGS )
+ssh_args=( ${WIN11_SSH_ARGS:-} )
 
-# Wrap a command line so it executes inside the repo with the right login shell.
-remote_wrap() {
-  local cmd="$*"
+# Default Win11 OpenSSH shell is cmd.exe, whose quoting rules will mangle any
+# command we try to embed as ssh args. Cleanest workaround: ssh runs the login
+# shell once, and we pipe the actual command in via stdin — no cmd.exe parsing
+# of our payload at all.
+remote_launcher() {
   case "$WIN11_SHELL" in
-    gitbash)
-      # Default Win11 OpenSSH shell is cmd.exe; explicitly invoke git-bash so
-      # forward-slash paths and POSIX tooling work.
-      printf '"C:\\Program Files\\Git\\bin\\bash.exe" -lc %q' \
-        "cd '$WIN11_REPO' && $cmd"
-      ;;
-    wsl)
-      printf 'wsl.exe bash -lc %q' "cd '$WIN11_REPO' && $cmd"
-      ;;
-    powershell)
-      printf 'powershell -NoProfile -Command %q' \
-        "Set-Location -LiteralPath '$WIN11_REPO'; $cmd"
-      ;;
+    # Full path so cmd.exe's PATH lookup doesn't pick up WSL's `bash` first.
+    gitbash)    echo '"C:\Program Files\Git\bin\bash.exe" -l' ;;
+    wsl)        echo 'wsl.exe bash -l' ;;
+    powershell) echo 'powershell -NoProfile -Command -' ;;
     *) echo "Unknown WIN11_SHELL=$WIN11_SHELL" >&2; exit 1 ;;
   esac
+}
+
+remote_exec() {
+  local payload
+  case "$WIN11_SHELL" in
+    powershell) payload="Set-Location -LiteralPath '$WIN11_REPO'; $*" ;;
+    *)          payload="cd '$WIN11_REPO' && $*" ;;
+  esac
+  # shellcheck disable=SC2086
+  ssh ${ssh_args[@]+"${ssh_args[@]}"} "$ssh_target" $(remote_launcher) <<< "$payload"
 }
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
   run)
     [[ $# -ge 1 ]] || { echo "usage: run <cmd...>" >&2; exit 1; }
-    # shellcheck disable=SC2046
-    ssh "${ssh_args[@]}" "$ssh_target" $(remote_wrap "$@")
+    remote_exec "$@"
     ;;
   py)
     [[ $# -ge 1 ]] || { echo "usage: py <script> [args...]" >&2; exit 1; }
@@ -72,8 +74,7 @@ case "$cmd" in
       wsl)        py=".venv/bin/python" ;;
       powershell) py=".venv\\Scripts\\python.exe" ;;
     esac
-    # shellcheck disable=SC2046
-    ssh "${ssh_args[@]}" "$ssh_target" $(remote_wrap "$py $*")
+    remote_exec "$py $*"
     ;;
   push)
     [[ $# -ge 1 ]] || { echo "usage: push <path> [<path>...]" >&2; exit 1; }
@@ -100,19 +101,18 @@ case "$cmd" in
     done
     ;;
   shell)
-    ssh "${ssh_args[@]}" -t "$ssh_target" \
-      $(remote_wrap "exec \$SHELL -l")
+    # shellcheck disable=SC2086
+    ssh ${ssh_args[@]+"${ssh_args[@]}"} -t "$ssh_target" $(remote_launcher)
     ;;
   check)
-    echo "[$ssh_target] uname / pwd / python / nvidia-smi"
-    # shellcheck disable=SC2046
-    ssh "${ssh_args[@]}" "$ssh_target" $(remote_wrap '
+    echo "[$ssh_target] uname / pwd / branch / python / nvidia-smi"
+    remote_exec '
       uname -a
       pwd
       git rev-parse --abbrev-ref HEAD 2>/dev/null || true
       command -v python && python --version || true
       command -v nvidia-smi >/dev/null && nvidia-smi -L || echo "(no nvidia-smi)"
-    ')
+    '
     ;;
   ""|-h|--help)
     sed -n '2,16p' "$0"
