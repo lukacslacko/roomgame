@@ -94,6 +94,21 @@
       status.style.display = msg ? "block" : "none";
     }
 
+    function urlParams() {
+      return new URLSearchParams(window.location.search);
+    }
+
+    function syncUrlFromSelectors() {
+      const p = urlParams();
+      p.set("session", sessionSel.value);
+      p.set("cache", cacheSel.value);
+      const next = `${window.location.pathname}?${p.toString()}`;
+      // pushState so the back-button is sane after switching sessions.
+      if (next !== window.location.pathname + window.location.search) {
+        window.history.pushState(null, "", next);
+      }
+    }
+
     async function loadSessions() {
       const r = await fetch("/sessions");
       if (!r.ok) { stMsg.textContent = "no /sessions endpoint"; return; }
@@ -105,7 +120,21 @@
         o.value = s; o.textContent = s;
         sessionSel.appendChild(o);
       }
-      if (sids.length) sessionSel.value = sids[0];
+      // Initial selection: URL ?session= takes precedence, else newest.
+      const want = urlParams().get("session");
+      if (want && sids.includes(want)) sessionSel.value = want;
+      else if (sids.length) sessionSel.value = sids[0];
+      // Same for cache.
+      const wantCache = urlParams().get("cache");
+      if (wantCache) {
+        // Add as an option if not already there (so out-of-list caches load).
+        if (![...cacheSel.options].some(o => o.value === wantCache)) {
+          const o = document.createElement("option");
+          o.value = wantCache; o.textContent = wantCache;
+          cacheSel.appendChild(o);
+        }
+        cacheSel.value = wantCache;
+      }
     }
 
     async function disposeViewer() {
@@ -170,19 +199,24 @@
       }
     });
 
-    reloadBtn.addEventListener("click", loadSplat);
-    sessionSel.addEventListener("change", () => { stMsg.textContent = "press Load"; });
-    cacheSel.addEventListener("change", () => { stMsg.textContent = "press Load"; });
+    reloadBtn.addEventListener("click", () => { syncUrlFromSelectors(); loadSplat(); });
+    sessionSel.addEventListener("change", () => { syncUrlFromSelectors(); loadSplat(); });
+    cacheSel.addEventListener("change", () => { syncUrlFromSelectors(); loadSplat(); });
+    window.addEventListener("popstate", () => {
+      // Back/forward navigation: sync selectors from URL and reload.
+      const p = urlParams();
+      const s = p.get("session"); const c = p.get("cache");
+      if (s) sessionSel.value = s;
+      if (c) cacheSel.value = c;
+      loadSplat();
+    });
 
     await loadSessions();
-    // Auto-load the most recent session if its splat.bin exists, otherwise
-    // just leave the user to pick.
+    // Reflect the (possibly URL-derived) selection back into the address bar
+    // so links are stable, then load.
     if (sessionSel.value) {
-      const probe = await fetch(`/captures/${sessionSel.value}/splat.bin?cache=${cacheSel.value}`,
-                                  { method: "HEAD" });
-      if (probe.ok) loadSplat();
-      else setStatus(`No splat.bin at ${cacheSel.value} for the most recent session. ` +
-                      `Pick another or train one.`);
+      syncUrlFromSelectors();
+      loadSplat();
     }
   </script>
 </body>
