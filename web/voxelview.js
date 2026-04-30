@@ -357,10 +357,48 @@ function recenter(adjustCamera) {
   sun.shadow.camera.updateProjectionMatrix();
 }
 
-reloadBtn.addEventListener("click", () => refreshSessionList().then(loadVoxels));
+// URL params keep `?session=...&variant=...` in sync with the dropdowns so a
+// link to a specific voxel run is shareable / bookmarkable. Updates are
+// pushState (back-button works); popstate re-applies the URL state.
+function urlParams() { return new URLSearchParams(window.location.search); }
+function syncUrlFromSelectors() {
+  const p = urlParams();
+  if (sessionSel.value) p.set("session", sessionSel.value); else p.delete("session");
+  if (variantSel.value) p.set("variant", variantSel.value); else p.delete("variant");
+  const next = `${window.location.pathname}?${p.toString()}`;
+  if (next !== window.location.pathname + window.location.search) {
+    window.history.pushState(null, "", next);
+  }
+}
+function applyUrlSelection() {
+  const p = urlParams();
+  const s = p.get("session"), v = p.get("variant");
+  let dirty = false;
+  if (s && [...sessionSel.options].some((o) => o.value === s) && sessionSel.value !== s) {
+    sessionSel.value = s;
+    syncVariantOptions();
+    dirty = true;
+  }
+  if (v && [...variantSel.options].some((o) => o.value === v) && variantSel.value !== v) {
+    variantSel.value = v;
+    dirty = true;
+  }
+  return dirty;
+}
+
+reloadBtn.addEventListener("click", () => refreshSessionList().then(() => {
+  applyUrlSelection(); syncUrlFromSelectors(); return loadVoxels();
+}));
 recenterBtn.addEventListener("click", () => recenter(true));
-sessionSel.addEventListener("change", () => { syncVariantOptions(); loadVoxels(); });
-variantSel.addEventListener("change", () => loadVoxels());
+sessionSel.addEventListener("change", () => {
+  syncVariantOptions(); syncUrlFromSelectors(); loadVoxels();
+});
+variantSel.addEventListener("change", () => {
+  syncUrlFromSelectors(); loadVoxels();
+});
+window.addEventListener("popstate", () => {
+  if (applyUrlSelection()) loadVoxels();
+});
 
 // "Flat" mode: kill the directional sun + hemisphere + SSAO and crank the
 // ambient up to 1.0 so each voxel renders as its captured colour without
@@ -1910,8 +1948,11 @@ sessionSel.addEventListener("change", () => {
 });
 
 // Boot: fetch the session list first so the dropdowns are populated before
-// the initial fetch picks the latest session + refined variant.
+// the initial fetch picks the latest session + refined variant. URL params
+// (?session=...&variant=...) take precedence over the auto-pick.
 refreshSessionList().then(() => {
+  applyUrlSelection();
+  syncUrlFromSelectors();
   populatePosePicker();
   refreshPcModelStatus();
   return loadVoxels();
