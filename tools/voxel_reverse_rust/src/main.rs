@@ -45,25 +45,34 @@ enum DepthSource {
     Model,
 }
 
-/// Which family of monocular-depth cache the blend pulls from. The on-disk
-/// directory layout matches `tools/cache_model_raw.py`:
-///   V2 → `<session>/model_raw/`
-///   V3 → `<session>/model_raw_v3/`
-/// The cache contract (`index.json` + per-frame `frame_NNNNNN.f16` at
-/// colour-image resolution) is identical across versions, so the only
-/// thing that changes here is which directory we read from and what
-/// suffix we apply to the output JSON files.
+/// Which depth cache the blend / model-only pass reads from. The
+/// on-disk layout matches `tools/cache_model_raw.py` for V2 / V3,
+/// `tools/gsplat_depth.py` for Splat, and `tools/gsplat_train_cuda.py`
+/// for SplatCuda:
+///   V2        → `<session>/model_raw/`
+///   V3        → `<session>/model_raw_v3/`
+///   Splat     → `<session>/model_raw_splat/`        (POC, MPS / CPU)
+///   SplatCuda → `<session>/model_raw_splat_cuda/`   (proper gsplat lib)
+/// All variants share the same contract: an `index.json` mapping
+/// idx → (cw, ch) plus per-frame `frame_NNNNNN.f16` of float16 metric
+/// depth at colour-image resolution in GL row order. The only thing
+/// that differs between variants is which directory we read from and
+/// what suffix we apply to the output JSON files.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ModelVersion {
     V2,
     V3,
+    Splat,
+    SplatCuda,
 }
 
 impl ModelVersion {
     fn cache_subdir(self) -> &'static str {
         match self {
-            ModelVersion::V2 => "model_raw",
-            ModelVersion::V3 => "model_raw_v3",
+            ModelVersion::V2        => "model_raw",
+            ModelVersion::V3        => "model_raw_v3",
+            ModelVersion::Splat     => "model_raw_splat",
+            ModelVersion::SplatCuda => "model_raw_splat_cuda",
         }
     }
 }
@@ -776,8 +785,10 @@ impl Args {
                     a.model_version = match args[i+1].as_str() {
                         "v2" => ModelVersion::V2,
                         "v3" => ModelVersion::V3,
+                        "splat" => ModelVersion::Splat,
+                        "splat-cuda" => ModelVersion::SplatCuda,
                         other => {
-                            eprintln!("--model-version must be 'v2' or 'v3', got {other:?}");
+                            eprintln!("--model-version must be 'v2', 'v3', 'splat', or 'splat-cuda', got {other:?}");
                             std::process::exit(2);
                         }
                     };
@@ -807,7 +818,7 @@ impl Args {
         [--near M] [--far M] [--tol M] \\
         [--threshold R] [--min-color-count N] [--max-frames N] \\
         [--depth-source phone|blend|model] [--blend-sigma 0.03] \\
-        [--model-version v2|v3]                  # which model_raw cache to read \\
+        [--model-version v2|v3|splat|splat-cuda] # which model_raw cache to read \\
         # 'model' uses model_raw values directly as metric depth (no blend);   \\
         # only meaningful when the cache was produced by a metric model        \\
         # (V3 nested-giant outputs metres, V3 metric is post-scaled in the     \\
@@ -1052,17 +1063,23 @@ fn main() {
     println!("rayon threads: {}", rayon::current_num_threads());
 
     // Output filename suffix per (depth_source, model_version).
-    //   Phone               → ""
-    //   Blend + V2          → "_blended"      (unchanged: keeps existing filenames)
-    //   Blend + V3          → "_blended_v3"
-    //   Model + V2          → "_model_v2"
-    //   Model + V3          → "_model_v3"     (V3 nested-giant is metric)
+    //   Phone                  → ""
+    //   Blend + V2             → "_blended"          (unchanged: keeps existing filenames)
+    //   Blend + V3             → "_blended_v3"
+    //   Blend + Splat          → "_blended_splat"
+    //   Model + V2             → "_model_v2"
+    //   Model + V3             → "_model_v3"         (V3 nested-giant is metric)
+    //   Model + Splat          → "_model_splat"      (3DGS-rendered metric depth)
     let blend_suffix: &str = match (args.depth_source, args.model_version) {
-        (DepthSource::Phone, _)                => "",
-        (DepthSource::Blend, ModelVersion::V2) => "_blended",
-        (DepthSource::Blend, ModelVersion::V3) => "_blended_v3",
-        (DepthSource::Model, ModelVersion::V2) => "_model_v2",
-        (DepthSource::Model, ModelVersion::V3) => "_model_v3",
+        (DepthSource::Phone, _)                       => "",
+        (DepthSource::Blend, ModelVersion::V2)        => "_blended",
+        (DepthSource::Blend, ModelVersion::V3)        => "_blended_v3",
+        (DepthSource::Blend, ModelVersion::Splat)     => "_blended_splat",
+        (DepthSource::Blend, ModelVersion::SplatCuda) => "_blended_splat_cuda",
+        (DepthSource::Model, ModelVersion::V2)        => "_model_v2",
+        (DepthSource::Model, ModelVersion::V3)        => "_model_v3",
+        (DepthSource::Model, ModelVersion::Splat)     => "_model_splat",
+        (DepthSource::Model, ModelVersion::SplatCuda) => "_model_splat_cuda",
     };
 
     // Treat (--session AND --frames-dir AND --out) as ad-hoc mode with
